@@ -1,6 +1,6 @@
 """
 Device-credential encryption at rest. Plaintext JSON is fine for a webhook
-HMAC secret (see timberdoodle/webhooks.py) - it's a shared signing key sent
+HMAC secret (see baler/webhooks.py) - it's a shared signing key sent
 over HTTPS to an operator-chosen URL. It's the wrong bar for a real device
 login a human types in, so this stores the password with Fernet (AES-128 +
 HMAC, the standard boring choice for "encrypt a small blob with one
@@ -10,16 +10,17 @@ deployment; a key in an env var matches how every other secret here
 (POSTGRES_PASSWORD, etc.) is already handled.
 """
 
-import os
 
 from cryptography.fernet import Fernet
 
+from windrow import legacy
+
 
 def _fernet() -> Fernet:
-    key = os.environ.get("FBF_CREDENTIAL_KEY")
+    key = legacy.env("WINDROW_CREDENTIAL_KEY")  # or pre-rename FBF_CREDENTIAL_KEY
     if not key:
         raise RuntimeError(
-            "FBF_CREDENTIAL_KEY is not set - required to store or read a device credential "
+            "WINDROW_CREDENTIAL_KEY is not set - required to store or read a device credential "
             "(generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\")"
         )
     return Fernet(key.encode())

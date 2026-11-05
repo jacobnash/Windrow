@@ -1,4 +1,4 @@
-# Comparison: the Haxall detour vs. Timberdoodle's direct path
+# Comparison: the Haxall detour vs. Baler's direct path
 
 Both paths now exist, live, for the same physical points (one BACnet AHU,
 one Modbus AHU). This is what it actually cost to build each.
@@ -6,11 +6,11 @@ one Modbus AHU). This is what it actually cost to build each.
 ## Direct path (Phase 1, unmodified, still green)
 
 ```
-device → protocol bridge → MQTT (fbf/{topic}) → Timberdoodle mqtt_listener → graph + timeseries
+device → protocol bridge → MQTT (fbf/{topic}) → Baler mqtt_listener → graph + timeseries
 ```
 
 2 hops after the bridge. No intermediate system to provision, tag, or keep
-alive. Proof: `timberdoodle/tests/test_ingest.py::test_full_round_trip_over_real_broker`
+alive. Proof: `baler/tests/test_ingest.py::test_full_round_trip_over_real_broker`
 — publishes the real envelope over the real broker, asserts the value is
 queryable in Postgres. No Haxall container involved anywhere in this test.
 
@@ -21,7 +21,7 @@ device → protocol bridge → MQTT → Haxall lib chain (ph, hx.point, hx.conn,
 hx.mqtt, hx.task) → mqttConn → obsMqtt task → axon taskExpr → Folio commit
 → Haystack tagging (site/equip/point model) → haystack_bridge.py (SCRAM
 auth, axon eval/pointWrite) → MQTT (fbf/haxall-readback/{point}[/tags]) →
-Timberdoodle mqtt_listener (+ /tags routing) → graph + timeseries
+Baler mqtt_listener (+ /tags routing) → graph + timeseries
 ```
 
 ~8 layers, none of them optional:
@@ -57,7 +57,7 @@ Proof this path works end-to-end: `test_haxall_provision.py` (idempotent
 provisioning + tagging, 3 tests) and `test_haystack_bridge.py` (read mode
 lands both value and tag messages on the real broker; write-then-readback
 round-trips a real value through Haxall's Folio) — all 8 integration tests
-pass live, no mocks, against the actual `fbf-haxall` container.
+pass live, no mocks, against the actual `windrow-haxall` container.
 
 ## The point
 

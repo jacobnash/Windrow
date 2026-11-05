@@ -11,8 +11,8 @@ from bacpypes3.basetypes import ErrorType
 from bacpypes3.pdu import Address
 from bacpypes3.primitivedata import ObjectIdentifier
 
-from fbf import tracing
-from fbf.bacnet_values import normalize_value
+from windrow import tracing
+from windrow.bacnet_values import normalize_value
 
 tracer = tracing.get_tracer(__name__)
 

@@ -19,11 +19,11 @@ from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 from cryptography.fernet import Fernet
 
-from fbf import discovery
-from fbf.api import make_handler
-from fbf.connection_manager import ConnectionManager
-from fbf.device_registry import DeviceRegistry
-from fbf.modbus_connection_manager import ModbusConnectionManager
+from windrow import discovery
+from windrow.api import make_handler
+from windrow.connection_manager import ConnectionManager
+from windrow.device_registry import DeviceRegistry
+from windrow.modbus_connection_manager import ModbusConnectionManager
 
 DEVICE_ADDRESS = "192.168.128.63:47808"
 DEVICE_INSTANCE = 3456
@@ -66,7 +66,7 @@ def test_periodic_bacnet_scan_populates_devices_then_provisioned(tmp_path, monke
     openapi.yaml's /discover description) - non-deterministic in a way
     that would make this test flaky for a reason that has nothing to do
     with whether the periodic-scan feature itself is correct."""
-    monkeypatch.setenv("FBF_CREDENTIAL_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("WINDROW_CREDENTIAL_KEY", Fernet.generate_key().decode())
     monkeypatch.setattr(
         discovery, "discover_devices", lambda app, **kwargs: _fake_discover([{"device_instance": DEVICE_INSTANCE, "address": "192.168.128.63", "vendor_id": 999}])
     )
@@ -146,7 +146,7 @@ def test_periodic_bacnet_scan_populates_devices_then_provisioned(tmp_path, monke
 
 @pytest.mark.integration
 def test_modbus_discover_create_list_delete_flow(mock_modbus_device, tmp_path, monkeypatch):
-    monkeypatch.setenv("FBF_CREDENTIAL_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("WINDROW_CREDENTIAL_KEY", Fernet.generate_key().decode())
     topic_prefix = f"fbf/modbus-api-test-{int(time.time())}"
 
     async def run():
@@ -171,7 +171,7 @@ def test_modbus_discover_create_list_delete_flow(mock_modbus_device, tmp_path, m
             status, devices = await _request("POST", f"{base}/modbus/discover", {"cidr": "127.0.0.1/32", "port": mock_modbus_device})
             assert status == 200
             assert devices == [
-                {"host": "127.0.0.1", "port": mock_modbus_device, "vendor": "FBF Mocks", "product_code": "MOCK-MB-1", "revision": "1.0"}
+                {"host": "127.0.0.1", "port": mock_modbus_device, "vendor": "Windrow Mocks", "product_code": "MOCK-MB-1", "revision": "1.0"}
             ]
 
             status, record = await _request(

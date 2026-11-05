@@ -1,13 +1,13 @@
 # Periodic discovery, the device registry, and credentials
 
 Built for new-construction commissioning: equipment shows up on the network
-over time, and a human shouldn't have to remember to click "scan." `fbf.api`
+over time, and a human shouldn't have to remember to click "scan." `windrow.api`
 now runs discovery on its own on a timer, tracks every device either scan
 has ever seen — separate from provisioned connections — and gives you
 somewhere to record a login if a device needs one.
 
 ```
-python -m fbf.api --address 192.168.128.63/24:47820 --mqtt-host localhost \
+python -m windrow.api --address 192.168.128.63/24:47820 --mqtt-host localhost \
   --bacnet-discovery-interval 300 \
   --modbus-scan-cidr 192.168.1.0/24 --modbus-scan-interval 600
 ```
@@ -74,7 +74,7 @@ which support the same `PATCH .../credential`) redacts it:
 ```
 
 Stored encrypted at rest (Fernet, via the `cryptography` package), keyed by
-the `FBF_CREDENTIAL_KEY` env var — generate one with:
+the `WINDROW_CREDENTIAL_KEY` env var — generate one with:
 
 ```
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -86,7 +86,7 @@ handshake to wire it into yet.
 
 ## 3. Default-credential check
 
-The first time a **Modbus** device is seen as `pending`, `fbf.api`
+The first time a **Modbus** device is seen as `pending`, `windrow.api`
 automatically tries a short list of common defaults (`admin/admin`,
 `admin/password`, `root/root`, …) as HTTP Basic Auth against the device's
 own address, on ports 80 and 443 — GET only, non-destructive, meant to
@@ -156,7 +156,7 @@ BACnet connections.
   that yet, and Modbus's opaque register model doesn't get much from it.
 - **No default-credential check for BACnet** — see above, not a gap so
   much as "the check has nowhere to point itself."
-- **No file locking** on `fbf-devices.json` / `fbf-modbus-connections.json`
+- **No file locking** on `windrow-devices.json` / `windrow-modbus-connections.json`
   — same accepted single-writer assumption as `connections.json`.
 
 ## Real bugs this was verified against, not just assumed to work
@@ -176,7 +176,7 @@ BACnet connections.
   before the owning `asyncio.run()` call tears down, that task doesn't
   respond to cancellation in time and the whole shutdown hangs forever.
   Reproduced reliably with two sequential `asyncio.run()` calls in one
-  process (exactly `fbf.api`'s create-a-connection-then-restart shape);
+  process (exactly `windrow.api`'s create-a-connection-then-restart shape);
   fixed with an explicit `ModbusConnectionManager.close()` called from
   `api.py`'s shutdown path (and from every test's teardown).
 - pymodbus 3.14's real method is `read_device_information(device_id=...)`,

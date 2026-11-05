@@ -9,7 +9,7 @@ import base64
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from fbf.default_credential_check import check
+from windrow.default_credential_check import check
 
 
 def _make_server():

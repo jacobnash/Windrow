@@ -1,7 +1,7 @@
 import os
 import tempfile
 
-from fbf.connection_store import load, new_connection_id, save
+from windrow.connection_store import load, new_connection_id, save
 
 
 def test_load_missing_file_returns_empty_list():

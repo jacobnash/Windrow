@@ -1,14 +1,14 @@
 # Tokens (lowercased, split on -/_/,/space) extracted from a learned BACnet
 # point's label/object_identifier/description -> Haystack marker tags. See
-# fbf/src/fbf/bacnet_tagger.py's docstring for why this exists and how it
-# hands off to Timberdoodle's existing mapping.classify_point unchanged.
+# windrow/src/windrow/bacnet_tagger.py's docstring for why this exists and how it
+# hands off to Baler's existing mapping.classify_point unchanged.
 #
 # Every `tags` list here is deliberately an exact tag set from
-# timberdoodle's rules/haystack_to_brick.yaml (not a superset/subset) - so
+# baler's rules/haystack_to_brick.yaml (not a superset/subset) - so
 # a BACnet point auto-tagged from this file gets a *direct* Brick match on
-# the Timberdoodle side, not a PROJ fallback, proving the two rule files
+# the Baler side, not a PROJ fallback, proving the two rule files
 # actually connect end to end. Every tag is a real Haystack v4 marker (see
-# the verification note at the top of timberdoodle's
+# the verification note at the top of baler's
 # rules/haystack_to_brick.yaml - same source, not re-guessed here).
 rules:
   - match: [zone, temp]

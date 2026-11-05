@@ -18,8 +18,8 @@ import asyncio
 
 import pymodbus.client as ModbusClient
 
-from fbf import connection_store, mqtt_sink, tracing
-from fbf.modbus_bridge import normalize_value
+from windrow import connection_store, mqtt_sink, tracing
+from windrow.modbus_bridge import normalize_value
 
 tracer = tracing.get_tracer(__name__)
 

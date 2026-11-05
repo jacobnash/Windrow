@@ -25,10 +25,10 @@ import pytest
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
-from fbf.api import make_handler
-from fbf.connection_manager import ConnectionManager
-from fbf.device_registry import DeviceRegistry
-from fbf.modbus_connection_manager import ModbusConnectionManager
+from windrow.api import make_handler
+from windrow.connection_manager import ConnectionManager
+from windrow.device_registry import DeviceRegistry
+from windrow.modbus_connection_manager import ModbusConnectionManager
 
 DEVICE_ADDRESS = "192.168.128.63:47808"
 DEVICE_INSTANCE = 3456

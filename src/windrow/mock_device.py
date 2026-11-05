@@ -1,5 +1,5 @@
 """
-Simulated BACnet/IP device for testing FBF without real hardware.
+Simulated BACnet/IP device for testing Windrow without real hardware.
 
 Exposes read-only points that change over time, so the bridge and the
 drift-detector both have something real to observe. Adapted from
@@ -8,7 +8,7 @@ BACpypes3's own mini-device sample (bacpypes3/samples/mini-device-revisited.py).
 Defaults to the original two hardcoded points (zone-temp, fan-status) so the
 existing live integration tests (test_discovery.py, test_connection_manager.py)
 keep working unchanged. Pass --site-spec to load a much larger generated
-object list instead - see fbf.mock_hospital, which builds one.
+object list instead - see windrow.mock_hospital, which builds one.
 """
 
 import asyncio
@@ -107,7 +107,7 @@ async def main() -> None:
     parser.add_argument(
         "--site-spec",
         default=None,
-        help="path to a JSON list of BACnet object specs (see fbf.mock_hospital); omit for the original 2-point demo device",
+        help="path to a JSON list of BACnet object specs (see windrow.mock_hospital); omit for the original 2-point demo device",
     )
     args = parser.parse_args()
     site_spec = _load_site_spec(args.site_spec) if args.site_spec else None

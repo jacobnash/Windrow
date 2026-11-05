@@ -10,7 +10,7 @@ deferred future work (see the main plan), not built here.
 ## Model
 
 ```
-FBF Demo Site (site)
+Windrow Demo Site (site)
 ├── AHU-1 (equip, ahu)
 │   ├── Zone Temp        (BACnet)  → zone, air, temp, sensor
 │   └── Fan Status       (BACnet)  → fan, run, sensor
@@ -18,7 +18,7 @@ FBF Demo Site (site)
     ├── Modbus Zone Temp (Modbus)  → zone, air, temp, sensor
     └── Modbus Fan Status(Modbus)  → fan, run, sensor
 
-FBF Write Demo (point, writable) — no equipRef, no siteRef
+Windrow Write Demo (point, writable) — no equipRef, no siteRef
 ```
 
 ## Tag choices, against Haystack convention
@@ -32,7 +32,7 @@ FBF Write Demo (point, writable) — no equipRef, no siteRef
   belongs to — the standard way Haystack links a point to its equipment.
 - **`ahu`** marker on the 2 equip recs — standard Haystack equipment marker
   for an air handling unit.
-- **`FBF Write Demo`** is deliberately outside the building model (no
+- **`Windrow Write Demo`** is deliberately outside the building model (no
   `equipRef`) and carries `writable` instead of `cur` — it exists solely so
   Phase 3's write-then-readback proof never races the live 5-second
   ingestion tasks running against the real 4 points.

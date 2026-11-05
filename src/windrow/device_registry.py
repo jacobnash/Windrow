@@ -1,10 +1,10 @@
 """
 Tracks devices found by discovery, independent of connection_store.json /
-fbf-modbus-connections.json: a discovered device has no id/topic_prefix/
+windrow-modbus-connections.json: a discovered device has no id/topic_prefix/
 points until a human provisions it, and ConnectionManager.start() already
 trusts every record in its own state file as "actively poll this" - that
 invariant stays untouched by keeping discovery bookkeeping in its own file
-(fbf-devices.json, via the same generic connection_store.load/save).
+(windrow-devices.json, via the same generic connection_store.load/save).
 
 Owns the periodic re-scan loops (BACnet Who-Is on a timer, Modbus CIDR
 sweeps on a timer) and reconciles their results against this registry plus
@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from fbf import connection_store, default_credential_check, discovery, modbus_discovery, tracing
+from windrow import connection_store, default_credential_check, discovery, modbus_discovery, tracing
 
 tracer = tracing.get_tracer(__name__)
 

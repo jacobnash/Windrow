@@ -1,5 +1,5 @@
 """
-Simulated Modbus/TCP device for testing FBF's Modbus bridge without real
+Simulated Modbus/TCP device for testing Windrow's Modbus bridge without real
 hardware. Two changing holding registers, same spirit as mock_device.py's
 BACnet analog/binary pair. Adapted from pymodbus's own
 examples/server_updating.py.
@@ -40,7 +40,7 @@ async def main() -> None:
     # revision all None.
     identity = ModbusDeviceIdentification(
         info_name={
-            "VendorName": "FBF Mocks",
+            "VendorName": "Windrow Mocks",
             "ProductCode": "MOCK-MB-1",
             "MajorMinorRevision": "1.0",
         }

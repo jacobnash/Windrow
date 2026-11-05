@@ -6,17 +6,17 @@ import hszinc
 import mqtt_test_util
 import pytest
 
-from fbf.haxall_client import connect
-from fbf.haystack_bridge import extract_tags, publish_equip_tags, run_read_mode, run_write_mode, slug, to_jsonable
+from windrow.haxall_client import connect
+from windrow.haystack_bridge import extract_tags, publish_equip_tags, run_read_mode, run_write_mode, slug, to_jsonable
 
 HAXALL_URI = "http://localhost:8180/"
 HAXALL_USER = "su"
-HAXALL_PASS = "fbf-demo-pass"
+HAXALL_PASS = "windrow-demo-pass"
 
 
 def test_slug_lowercases_and_hyphenates():
     assert slug("Zone Temp") == "zone-temp"
-    assert slug("FBF Write Demo") == "fbf-write-demo"
+    assert slug("Windrow Write Demo") == "windrow-write-demo"
 
 
 def test_to_jsonable_marker_and_singletons():

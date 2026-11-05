@@ -1,4 +1,4 @@
-from fbf.connection_manager import should_publish
+from windrow.connection_manager import should_publish
 
 
 def test_no_policy_configured_always_publishes():

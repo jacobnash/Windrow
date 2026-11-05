@@ -9,8 +9,8 @@ import asyncio
 
 import pytest
 
-from fbf import default_credential_check
-from fbf.device_registry import DeviceRegistry
+from windrow import default_credential_check
+from windrow.device_registry import DeviceRegistry
 
 
 def _run(coro):

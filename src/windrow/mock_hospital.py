@@ -8,15 +8,15 @@ literal copy of charlie's ~200 points, a bigger site built the same way.
 Two subcommands sharing one deterministic (seeded) generator, so nothing
 needs to be persisted between them:
 
-  python -m fbf.mock_hospital generate --out hospital_site_spec.json
-      writes the BACnet object list fbf.mock_device --site-spec reads.
+  python -m windrow.mock_hospital generate --out hospital_site_spec.json
+      writes the BACnet object list windrow.mock_device --site-spec reads.
 
-  python -m fbf.mock_hospital provision --device-address IP:PORT --device-instance N
-      (after mock_device.py and fbf.api are both already running) regenerates
+  python -m windrow.mock_hospital provision --device-address IP:PORT --device-instance N
+      (after mock_device.py and windrow.api are both already running) regenerates
       the same equipment/point layout and POSTs one /connections call per
-      equipment to fbf.api - the same call a human would make by hand, just
+      equipment to windrow.api - the same call a human would make by hand, just
       scripted ~80 times. This is the only place equipment identity
-      (topic_prefix) and messy point naming are decided; fbf's own
+      (topic_prefix) and messy point naming are decided; windrow's own
       connection_manager/bacnet_tagger/mqtt_sink do everything downstream
       unchanged.
 
@@ -28,7 +28,7 @@ abbreviations ("sup"/"ret" not "supply"/"return", "cmd", "fdbk") that never
 match fbf/rules/bacnet_to_haystack_tags.yaml on purpose - those equipment
 kinds, plus every equip-level class besides ahu/vav, have zero rule coverage
 today, so they're exactly the "what kind of equipment is this" cases
-timberdoodle's LLM auto-tag fallback exists to handle. See the implementation
+baler's LLM auto-tag fallback exists to handle. See the implementation
 plan (llm-proposed rules, area 3) for how that's supposed to close the gap
 over time.
 """
@@ -149,7 +149,7 @@ class _InstanceCounters:
 
 def _object_identifier_str(object_type: str, instance: int) -> str:
     # Matches bacpypes3's own str(ObjectIdentifier(...)) form, confirmed
-    # against fbf/tests/test_discovery.py ("analog-value,1"/"binary-value,1") -
+    # against windrow/tests/test_discovery.py ("analog-value,1"/"binary-value,1") -
     # not the camelCase constructor spelling used in the site-spec below.
     kind = "binary-value" if object_type == "binaryValue" else "analog-value"
     return f"{kind},{instance}"
@@ -157,7 +157,7 @@ def _object_identifier_str(object_type: str, instance: int) -> str:
 
 def generate_site(seed: int = SEED) -> tuple[list[dict], list[dict]]:
     """Returns (site_spec, equipment) - site_spec is the flat BACnet object
-    list fbf.mock_device consumes; equipment is a list of
+    list windrow.mock_device consumes; equipment is a list of
     {topic_prefix, points} ready for ConnectionManager.create_connection,
     one dict per piece of equipment. Deterministic for a given seed, so
     `generate` and `provision` (run as separate processes, possibly minutes
@@ -257,10 +257,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=SEED)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    gen = sub.add_parser("generate", help="write the BACnet object list for fbf.mock_device --site-spec")
+    gen = sub.add_parser("generate", help="write the BACnet object list for windrow.mock_device --site-spec")
     gen.add_argument("--out", default="hospital_site_spec.json")
 
-    prov = sub.add_parser("provision", help="POST one /connections call per equipment to a running fbf.api")
+    prov = sub.add_parser("provision", help="POST one /connections call per equipment to a running windrow.api")
     prov.add_argument("--api-url", default="http://localhost:8001")
     prov.add_argument("--device-address", default="192.168.128.63:47808", help="must match the running mock_device.py's --address")
     prov.add_argument("--device-instance", type=int, default=3456, help="must match the running mock_device.py's --instance")

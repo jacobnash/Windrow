@@ -1,5 +1,5 @@
 """
-FBF bridge: reads configured BACnet points on an interval, publishes
+Windrow bridge: reads configured BACnet points on an interval, publishes
 readings to MQTT as JSON. Haxall's existing open hxMqtt connector
 subscribes on the other end — no Fantom code involved.
 """
@@ -10,8 +10,8 @@ import asyncio
 from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.app import Application
 
-from fbf import mqtt_sink
-from fbf.bacnet_values import normalize_value
+from windrow import mqtt_sink
+from windrow.bacnet_values import normalize_value
 
 POLL_INTERVAL = 5.0
 

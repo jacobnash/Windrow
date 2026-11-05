@@ -1,5 +1,5 @@
 """
-Requires the live fbf-haxall container plus the mock devices/bridges
+Requires the live windrow-haxall container plus the mock devices/bridges
 already publishing to mosquitto. Running provision_haxall's steps here
 is itself the idempotency proof - the script is designed to be safe to
 rerun, and this test relies on that being true.
@@ -7,12 +7,12 @@ rerun, and this test relies on that being true.
 
 import pytest
 
-from fbf.haxall_client import connect, eval_axon
-from fbf.provision_haxall import ensure_equip, ensure_libs, ensure_point, ensure_point_tags, ensure_site, ensure_task, find_ref
+from windrow.haxall_client import connect, eval_axon
+from windrow.provision_haxall import ensure_equip, ensure_libs, ensure_point, ensure_point_tags, ensure_site, ensure_task, find_ref
 
 HAXALL_URI = "http://localhost:8180/"
 HAXALL_USER = "su"
-HAXALL_PASS = "fbf-demo-pass"
+HAXALL_PASS = "windrow-demo-pass"
 
 
 @pytest.fixture
@@ -30,16 +30,16 @@ def test_provisioning_is_idempotent_and_all_tasks_healthy(session):
     modbus_temp_ref = ensure_point(session, "Modbus Zone Temp", "Number", unit="°F")
     modbus_fan_ref = ensure_point(session, "Modbus Fan Status", "Bool")
 
-    ensure_task(session, "FBF Ingest BACnet Fan Status", conn_ref, "fbf/mock-ahu-1/binaryValue,1", bacnet_fan_ref, 'json->value == "active"')
-    ensure_task(session, "FBF Ingest Modbus Zone Temp", conn_ref, "fbf/mock-modbus-1/zone-temp", modbus_temp_ref, "json->value")
-    ensure_task(session, "FBF Ingest Modbus Fan Status", conn_ref, "fbf/mock-modbus-1/fan-status", modbus_fan_ref, "json->value == 1")
+    ensure_task(session, "Windrow Ingest BACnet Fan Status", conn_ref, "fbf/mock-ahu-1/binaryValue,1", bacnet_fan_ref, 'json->value == "active"')
+    ensure_task(session, "Windrow Ingest Modbus Zone Temp", conn_ref, "fbf/mock-modbus-1/zone-temp", modbus_temp_ref, "json->value")
+    ensure_task(session, "Windrow Ingest Modbus Fan Status", conn_ref, "fbf/mock-modbus-1/fan-status", modbus_fan_ref, "json->value == 1")
 
     tasks = eval_axon(session, "tasks()")
     expected = {
-        "FBF Ingest Zone Temp",
-        "FBF Ingest BACnet Fan Status",
-        "FBF Ingest Modbus Zone Temp",
-        "FBF Ingest Modbus Fan Status",
+        "Windrow Ingest Zone Temp",
+        "Windrow Ingest BACnet Fan Status",
+        "Windrow Ingest Modbus Zone Temp",
+        "Windrow Ingest Modbus Fan Status",
     }
     seen = {row["id"].value for row in tasks}
     assert expected.issubset(seen)
@@ -65,7 +65,7 @@ def test_all_four_points_have_live_typed_values(session):
 
 @pytest.mark.integration
 def test_tagging_model_is_idempotent_and_filterable(session):
-    site_ref = ensure_site(session, "FBF Demo Site")
+    site_ref = ensure_site(session, "Windrow Demo Site")
     ahu1_ref = ensure_equip(session, "AHU-1", site_ref, markers=["ahu"])
     ahu2_ref = ensure_equip(session, "AHU-2", site_ref, markers=["ahu"])
 
@@ -77,14 +77,14 @@ def test_tagging_model_is_idempotent_and_filterable(session):
     ensure_point_tags(session, bacnet_fan_ref, ["fan", "run", "sensor"], ahu1_ref)
     ensure_point_tags(session, modbus_temp_ref, ["zone", "air", "temp", "sensor"], ahu2_ref)
     ensure_point_tags(session, modbus_fan_ref, ["fan", "run", "sensor"], ahu2_ref)
-    ensure_point(session, "FBF Write Demo", "Number", cur=False)
+    ensure_point(session, "Windrow Write Demo", "Number", cur=False)
 
     assert len(eval_axon(session, "readAll(ahu)")) == 2
     assert len(eval_axon(session, "readAll(zone and air and temp and sensor)")) == 2
     assert len(eval_axon(session, "readAll(fan and run and sensor)")) == 2
     assert len(eval_axon(session, f"readAll(point and equipRef->siteRef==@{site_ref})")) >= 4
 
-    write_demo = eval_axon(session, 'readAll(point and dis=="FBF Write Demo")')
+    write_demo = eval_axon(session, 'readAll(point and dis=="Windrow Write Demo")')
     assert len(write_demo) == 1
     assert write_demo[0].get("writable") is not None
     assert write_demo[0].get("equipRef") is None

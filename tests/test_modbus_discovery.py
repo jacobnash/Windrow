@@ -1,5 +1,5 @@
 """
-Live against a real fbf.mock_modbus_device subprocess on loopback (spawned
+Live against a real windrow.mock_modbus_device subprocess on loopback (spawned
 by the mock_modbus_device fixture in conftest.py).
 """
 
@@ -8,7 +8,7 @@ import socket
 
 import pytest
 
-from fbf.modbus_discovery import sweep
+from windrow.modbus_discovery import sweep
 
 
 @pytest.mark.integration
@@ -18,7 +18,7 @@ def test_sweep_finds_device_and_reads_identity(mock_modbus_device):
     assert len(devices) == 1
     assert devices[0]["host"] == "127.0.0.1"
     assert devices[0]["port"] == mock_modbus_device
-    assert devices[0]["vendor"] == "FBF Mocks"
+    assert devices[0]["vendor"] == "Windrow Mocks"
     assert devices[0]["product_code"] == "MOCK-MB-1"
 
 

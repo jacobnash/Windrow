@@ -5,7 +5,7 @@ points, create a connection with the ones you want — no hand-typed BACnet
 object identifiers anywhere in the flow.
 
 ```
-python -m fbf.api --address 192.168.128.63/24:47820 --mqtt-host localhost
+python -m windrow.api --address 192.168.128.63/24:47820 --mqtt-host localhost
 ```
 
 (`--address` is bacpypes3's own local-BACnet-address arg, same as
@@ -131,7 +131,7 @@ curl -X DELETE localhost:8001/connections/<id>
 ```
 
 Deleting stops the poll task and removes it from the persisted
-`connections.json` — restarting `fbf.api` with connections left in place
+`connections.json` — restarting `windrow.api` with connections left in place
 resumes polling them with zero new API calls.
 
 ## Known v1 limitations
@@ -146,7 +146,7 @@ resumes polling them with zero new API calls.
   connection exists, nothing notices until a human re-learns and
   recreates the connection. Matches SkySpark's own model — discovery is
   user-triggered, not continuously reconciled.
-- **No file locking** on `connections.json` — one `fbf.api` process per
+- **No file locking** on `connections.json` — one `windrow.api` process per
   `--state-file` is an assumption, not enforced.
 
 ## Real bugs this was verified against, not just assumed to work

@@ -1,5 +1,5 @@
 """
-Live against the already-running mock device (fbf.mock_device, instance
+Live against the already-running mock device (windrow.mock_device, instance
 3456 at 192.168.128.63:47808) - no bacpypes3 mocking. Uses directed
 discovery (address=...) rather than global broadcast: a locally-originated
 broadcast isn't delivered back to another process on the *same* machine
@@ -15,7 +15,7 @@ import pytest
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
-from fbf.discovery import discover_devices, learn_points
+from windrow.discovery import discover_devices, learn_points
 
 DEVICE_ADDRESS = "192.168.128.63:47808"
 DEVICE_INSTANCE = 3456

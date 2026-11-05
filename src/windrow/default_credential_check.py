@@ -24,7 +24,7 @@ import time
 
 import requests
 
-from fbf import tracing
+from windrow import tracing
 
 tracer = tracing.get_tracer(__name__)
 

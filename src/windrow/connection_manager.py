@@ -15,8 +15,8 @@ import time
 
 from bacpypes3.app import Application
 
-from fbf import bacnet_tagger, connection_store, discovery, mqtt_sink, tracing
-from fbf.bacnet_values import normalize_value
+from windrow import bacnet_tagger, connection_store, discovery, mqtt_sink, tracing
+from windrow.bacnet_values import normalize_value
 
 tracer = tracing.get_tracer(__name__)
 
@@ -136,7 +136,7 @@ class ConnectionManager:
 
     def _publish_equip_membership(self, topic_prefix: str, points: list[dict]) -> None:
         """One message per connection, {prefix}/equip/tags - equipment
-        identity is the connection's own topic_prefix (Timberdoodle's
+        identity is the connection's own topic_prefix (Baler's
         ingest.topic_prefix_to_equip_uri), deliberately not the BACnet
         device_instance: a human already draws the "this is one piece of
         equipment" boundary at connection-creation time by choosing which
@@ -157,9 +157,9 @@ class ConnectionManager:
     def _tag_points(self, topic_prefix: str, points: list[dict]) -> None:
         """Publishes {prefix}/{label}/tags once per point at connection
         creation, same wire convention haystack_bridge.py already uses on
-        the Haystack-source side - Timberdoodle's mqtt_listener ->
+        the Haystack-source side - Baler's mqtt_listener ->
         ingest_tags -> mapping.classify_point needs no changes to pick
-        these up, retained=True means a later fbf.api restart doesn't need
+        these up, retained=True means a later windrow.api restart doesn't need
         to republish (connection_manager.start() just resumes polling,
         same as today). Auto-derived only from whatever driver metadata
         the caller included per point (label/object_identifier/description);

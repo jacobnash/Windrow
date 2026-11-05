@@ -1,5 +1,5 @@
 """
-Connection persistence - the one genuinely new piece FBF needed for this
+Connection persistence - the one genuinely new piece Windrow needed for this
 feature (no config file or DB existed anywhere in this project before).
 A JSON file, not sqlite3: every write already funnels through a single
 asyncio loop thread (see connection_manager.py), so there's no

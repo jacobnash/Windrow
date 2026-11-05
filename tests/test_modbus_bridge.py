@@ -1,4 +1,4 @@
-from fbf.modbus_bridge import normalize_value, parse_points
+from windrow.modbus_bridge import normalize_value, parse_points
 
 
 def test_single_register_passthrough():

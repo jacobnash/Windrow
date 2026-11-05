@@ -3,7 +3,7 @@ bacnet_tagger.py in isolation - no live BACnet device or MQTT needed, just
 token matching over plain dicts shaped like discovery.learn_points' output.
 """
 
-from fbf.bacnet_tagger import load_rules, tag_point
+from windrow.bacnet_tagger import load_rules, tag_point
 
 RULES_PATH = "rules/bacnet_to_haystack_tags.yaml"
 RULES = load_rules(RULES_PATH)
@@ -39,6 +39,6 @@ def test_tag_point_returns_empty_dict_for_no_match():
 def test_tag_point_prefers_most_specific_rule():
     """"zone-temp-setpoint" satisfies both the 2-token zone/temp rule and
     the 3-token zone/temp/setpoint rule - the longer match must win, same
-    tie-break as timberdoodle's classify_point."""
+    tie-break as baler's classify_point."""
     point = {"object_identifier": "analog-value,3", "label": "zone-temp-setpoint"}
     assert tag_point(point, RULES) == {"zone": True, "air": True, "temp": True, "sp": True}

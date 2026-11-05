@@ -7,7 +7,7 @@ pure-function testing of should_publish).
 
 import json
 
-from fbf.connection_manager import ConnectionManager
+from windrow.connection_manager import ConnectionManager
 
 
 class FakeMqttClient:

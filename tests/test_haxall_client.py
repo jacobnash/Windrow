@@ -1,12 +1,12 @@
-"""Requires the live fbf-haxall container (localhost:8180)."""
+"""Requires the live windrow-haxall container (localhost:8180)."""
 
 import pytest
 
-from fbf.haxall_client import connect, eval_axon
+from windrow.haxall_client import connect, eval_axon
 
 HAXALL_URI = "http://localhost:8180/"
 HAXALL_USER = "su"
-HAXALL_PASS = "fbf-demo-pass"
+HAXALL_PASS = "windrow-demo-pass"
 
 
 @pytest.fixture

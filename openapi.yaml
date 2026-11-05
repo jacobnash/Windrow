@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: FBF BACnet & Modbus Discovery, Connections & Devices API
+  title: Windrow BACnet & Modbus Discovery, Connections & Devices API
   version: "1.1.0"
   description: |
     The "SkySpark-easy, but via API" surface: discover BACnet devices,
@@ -23,7 +23,7 @@ info:
     other route, not maintained as a separate promise about the code.
 servers:
   - url: http://localhost:8001
-    description: Local dev default (see `python -m fbf.api --help`)
+    description: Local dev default (see `python -m windrow.api --help`)
 paths:
   /discover:
     post:
@@ -135,7 +135,7 @@ paths:
                     - { "object_identifier": "binary-value,1", "label": "fan-status" }
       responses:
         "201":
-          description: Created. Polling has already started - publishes land on `{topic_prefix}/{label}` per point, on the frozen `{point, value, ts}` envelope every FBF bridge uses.
+          description: Created. Polling has already started - publishes land on `{topic_prefix}/{label}` per point, on the frozen `{point, value, ts}` envelope every Windrow bridge uses.
           content:
             application/json:
               schema:
@@ -164,7 +164,7 @@ paths:
     delete:
       operationId: deleteConnection
       summary: Stop and remove a connection
-      description: Cancels the poll task and removes it from persisted state - a restarted `fbf.api` process will not resume it.
+      description: Cancels the poll task and removes it from persisted state - a restarted `windrow.api` process will not resume it.
       parameters:
         - name: id
           in: path
@@ -189,7 +189,7 @@ paths:
         gateway needs (e.g. its own local web UI). Stored encrypted at
         rest. The response shows the plaintext password once, at set time
         only - every later `GET /connections` redacts it to `null`, same
-        pattern as `/webhooks`'s `secret` in timberdoodle's fault API.
+        pattern as `/webhooks`'s `secret` in baler's fault API.
       parameters:
         - name: id
           in: path
@@ -274,7 +274,7 @@ paths:
                   points: { "zone-temp": 0, "fan-status": 1 }
       responses:
         "201":
-          description: Created. Polling has already started - publishes land on `{topic_prefix}/{label}` per point, on the frozen `{point, value, ts}` envelope every FBF bridge uses.
+          description: Created. Polling has already started - publishes land on `{topic_prefix}/{label}` per point, on the frozen `{point, value, ts}` envelope every Windrow bridge uses.
           content:
             application/json:
               schema:
@@ -301,7 +301,7 @@ paths:
     delete:
       operationId: deleteModbusConnection
       summary: Stop and remove a Modbus connection
-      description: Cancels the poll task and removes it from persisted state - a restarted `fbf.api` process will not resume it.
+      description: Cancels the poll task and removes it from persisted state - a restarted `windrow.api` process will not resume it.
       parameters:
         - name: id
           in: path
@@ -622,7 +622,7 @@ components:
           example: admin
         password:
           type: string
-          description: Stored encrypted at rest (Fernet, keyed by the FBF_CREDENTIAL_KEY env var) - never returned in plaintext again after this call's response.
+          description: Stored encrypted at rest (Fernet, keyed by the WINDROW_CREDENTIAL_KEY env var) - never returned in plaintext again after this call's response.
           example: sup3r-secret
     CredentialResponse:
       type: object

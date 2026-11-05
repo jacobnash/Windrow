@@ -1,6 +1,6 @@
 from bacpypes3.basetypes import BinaryPV
 
-from fbf.bacnet_values import normalize_value
+from windrow.bacnet_values import normalize_value
 
 
 def test_enumerated_becomes_string_not_raw_int():

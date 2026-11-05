@@ -3,9 +3,9 @@
 Bidirectional Haystack HTTP API bridge - the connector a Haystack-speaking
 source (Haxall or SkySpark) gets bridged through. Read mode polls the
 Phase 2 tagging model and republishes through the exact same mqtt_sink
-envelope every other bridge uses, so Timberdoodle's existing fbf/#
+envelope every other bridge uses, so Baler's existing fbf/#
 listener needs zero changes to pick it up. Write mode proves round-trip
-control against the dedicated "FBF Write Demo" fixture point (never the
+control against the dedicated "Windrow Write Demo" fixture point (never the
 live 4 points, which race a real 5-second ingestion task) - see
 docs/haystack-tagging-model.md.
 """
@@ -17,9 +17,9 @@ import time
 
 import hszinc
 
-from fbf import mqtt_sink, tracing
-from fbf.haxall_client import connect, eval_axon, point_write
-from fbf.provision_haxall import find_ref
+from windrow import mqtt_sink, tracing
+from windrow.haxall_client import connect, eval_axon, point_write
+from windrow.provision_haxall import find_ref
 
 tracer = tracing.get_tracer(__name__)
 
@@ -120,11 +120,11 @@ def publish_equip_tags(session, client, topic_prefix: str) -> int:
     """readAll(equip or site) once, publishing each rec's own tags to
     {topic_prefix}/equip/{haystackRef}/tags - the equip-side half of
     hasPoint/isPointOf linking (see docs/haystack-tagging-model.md and
-    timberdoodle's ingest.link_equip_ref, which resolves a point's
+    baler's ingest.link_equip_ref, which resolves a point's
     equipRef against exactly this identity). Points don't need re-reading
     here: each point's own equipRef tag (already carried losslessly by
-    read_once's extract_tags -> Timberdoodle's HAYSTACK:equipRef triple)
-    is what does the resolving, on the Timberdoodle side, once both
+    read_once's extract_tags -> Baler's HAYSTACK:equipRef triple)
+    is what does the resolving, on the Baler side, once both
     messages have landed - so publish order between this and read_once
     doesn't matter."""
     with tracer.start_as_current_span("haystack_bridge.equip_tags_cycle") as span:
@@ -157,7 +157,7 @@ def run_read_mode(session, client, topic_prefix: str, interval: float, once: boo
 
 def run_write_mode(session, client, topic_prefix: str, value: float) -> float | None:
     with tracer.start_as_current_span("haystack_bridge.write") as span:
-        ref = find_ref(session, 'point and dis=="FBF Write Demo"')
+        ref = find_ref(session, 'point and dis=="Windrow Write Demo"')
         span.set_attribute("point_ref", ref)
         span.set_attribute("value", value)
 
@@ -166,7 +166,7 @@ def run_write_mode(session, client, topic_prefix: str, value: float) -> float | 
         readback = to_jsonable(row.get("writeVal"))
 
         span.set_attribute("success", readback == value)
-        mqtt_sink.publish_reading(client, topic_prefix, slug("FBF Write Demo"), readback)
+        mqtt_sink.publish_reading(client, topic_prefix, slug("Windrow Write Demo"), readback)
         return readback
 
 
@@ -174,16 +174,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--haxall-uri", default="http://localhost:8180/")
     parser.add_argument("--haxall-user", default="su")
-    parser.add_argument("--haxall-pass", default="fbf-demo-pass")
+    parser.add_argument("--haxall-pass", default="windrow-demo-pass")
     parser.add_argument("--mqtt-host", default="localhost")
     parser.add_argument("--mqtt-port", type=int, default=1883)
     parser.add_argument("--topic-prefix", default="fbf/haxall-readback")
     parser.add_argument("--interval", type=float, default=5.0)
     parser.add_argument("--once", action="store_true", help="read mode: one cycle then exit")
-    parser.add_argument("--write-value", type=float, default=None, help="write mode: one-shot write to the FBF Write Demo point, then exit")
+    parser.add_argument("--write-value", type=float, default=None, help="write mode: one-shot write to the Windrow Write Demo point, then exit")
     args = parser.parse_args()
 
-    tracing.init_tracing("fbf-haystack-bridge")
+    tracing.init_tracing("windrow-haystack-bridge")
     session = connect(args.haxall_uri, args.haxall_user, args.haxall_pass)
     client = mqtt_sink.connect(args.mqtt_host, args.mqtt_port)
 

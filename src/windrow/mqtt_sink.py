@@ -7,8 +7,8 @@ Also owns the local spool: if the client isn't connected when a reading
 is taken (the uplink from an on-site host to the broker is down, but this
 process is still polling BACnet/Modbus locally), the reading is appended
 to a JSONL file instead of dropped, and replayed on the next on_connect.
-Idempotent replay relies on Timberdoodle's ingest_reading() being
-idempotent on (point_uri, ts) - see timberdoodle's ingest.py.
+Idempotent replay relies on Baler's ingest_reading() being
+idempotent on (point_uri, ts) - see baler's ingest.py.
 """
 
 import json
@@ -17,6 +17,8 @@ import threading
 import time
 
 import paho.mqtt.client as mqtt
+
+from windrow import legacy
 
 MAX_SPOOL_ROWS = 10_000
 # ponytail: fixed 10k-row ring buffer, no dynamic sizing by outage length or
@@ -28,7 +30,7 @@ _spool_lock = threading.Lock()
 
 
 def _spool_path() -> str:
-    return os.environ.get("FBF_SPOOL_FILE", "fbf-spool.jsonl")
+    return legacy.adopt_state_file(legacy.env("WINDROW_SPOOL_FILE") or "windrow-spool.jsonl")
 
 
 def _read_spool(path: str) -> list[dict]:
@@ -136,7 +138,7 @@ def _publish(client: mqtt.Client, topic_prefix: str, point: str, value, ts: floa
 def publish_reading(client: mqtt.Client, topic_prefix: str, point: str, value, ts: float | None = None) -> str:
     """Publishes {"point", "value", "ts"} to f"{topic_prefix}/{point}",
     retained. This exact shape is the frozen wire contract every consumer
-    (Haxall's task engine, Timberdoodle's mqtt_listener) parses by name.
+    (Haxall's task engine, Baler's mqtt_listener) parses by name.
 
     If the client isn't currently connected, the reading is spooled to
     disk instead of dropped, and replayed automatically once the

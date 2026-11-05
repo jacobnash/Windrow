@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from fbf.api import _make_on_command
+from windrow.api import _make_on_command
 
 
 class FakeManager:

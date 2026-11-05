@@ -1,6 +1,6 @@
 # Adding a new source
 
-FBF's whole design is that "port Haxall's connector breadth" is a
+Windrow's whole design is that "port Haxall's connector breadth" is a
 repeatable recipe, not one-off work per protocol. This is that recipe.
 
 ## The wire contract (frozen, don't redesign this without a strong reason)
@@ -12,7 +12,7 @@ repeatable recipe, not one-off work per protocol. This is that recipe.
 - **Payload** (JSON): `{"point": <str>, "value": <int|float|str|bool|null>, "ts": <unix epoch float>}`.
 - **`retain=True`** on every publish — a fresh subscriber immediately gets
   the last known value per point instead of waiting for the next poll.
-- Every bridge imports `fbf.mqtt_sink` (`connect()`, `publish_reading()`)
+- Every bridge imports `windrow.mqtt_sink` (`connect()`, `publish_reading()`)
   for this — never re-derive the envelope/publish logic per bridge.
 
 Nothing that consumes this cares which protocol produced it. That's what
@@ -32,7 +32,7 @@ mqtt_sink.publish_reading(client, topic_prefix, f"{point_label}/tags", json.dump
 ```
 
 This is still a valid instance of the frozen envelope — `value` is just a
-JSON string instead of a scalar. On the consumer side, Timberdoodle's
+JSON string instead of a scalar. On the consumer side, Baler's
 `mqtt_listener.on_message` checks for the `/tags` suffix, strips it to
 recover the real point's topic (so it resolves to the *same* `point_uri`
 the value-topic would produce), and routes to `ingest_tags()` instead of
@@ -80,7 +80,7 @@ bridge next, each following the recipe above:
 
 | Protocol/API | Likely client library | Notes |
 |---|---|---|
-| Modbus | `pymodbus` | Done — see `modbus_bridge.py` for the static CLI bridge (still the simplest path if you already know the device's register addresses), or `modbus_discovery.py` + `modbus_connection_manager.py` (exposed via `fbf.api`'s `/modbus/*` routes, see `openapi.yaml`) for the CIDR-sweep→create-connection API when you don't. Modbus has no self-describing object list like BACnet's, so there's no `/modbus/learn` - a human supplies `{label: register_address}` points directly. |
+| Modbus | `pymodbus` | Done — see `modbus_bridge.py` for the static CLI bridge (still the simplest path if you already know the device's register addresses), or `modbus_discovery.py` + `modbus_connection_manager.py` (exposed via `windrow.api`'s `/modbus/*` routes, see `openapi.yaml`) for the CIDR-sweep→create-connection API when you don't. Modbus has no self-describing object list like BACnet's, so there's no `/modbus/learn` - a human supplies `{label: register_address}` points directly. |
 | BACnet | `bacpypes3` | Done — see `bridge.py` for the static CLI bridge (still the simplest path if you already know the device's object identifiers), or `docs/bacnet-discovery-api.md` for the discover→learn→create-connection API when you don't. `normalize_value()` now lives in `bacnet_values.py`, shared by both. |
 | SQL | `psycopg` (Postgres) or similar | Poll rows, map columns to points |
 | oBIX | raw XML+HTTP, or an `obix` client if one's actively maintained | Check for one before hand-rolling |
@@ -93,19 +93,19 @@ tiny field-mapping shim (not a full bridge) is enough.
 
 ## Periodic discovery, the device registry, and credentials
 
-`fbf.api` runs a periodic BACnet Who-Is scan by default
+`windrow.api` runs a periodic BACnet Who-Is scan by default
 (`--bacnet-discovery-interval`, 300s), and one periodic Modbus CIDR sweep
 per `--modbus-scan-cidr` flag if any are configured (off by default - no
 safe subnet to guess). Both feed `device_registry.DeviceRegistry`, which
 tracks every device either scan has ever seen (`GET /devices`) whether or
 not a human has provisioned a connection for it yet - separate from
-`connections.json`/`fbf-modbus-connections.json`, since a bare discovery
+`connections.json`/`windrow-modbus-connections.json`, since a bare discovery
 result has no `id`/`topic_prefix`/`points` and those files' own invariant
 ("every record here is actively being polled") shouldn't have to make room
 for records that aren't.
 
 Credentials (`credentials.py`, Fernet-encrypted, keyed by
-`FBF_CREDENTIAL_KEY`) are pure bookkeeping - neither BACnet nor Modbus has
+`WINDROW_CREDENTIAL_KEY`) are pure bookkeeping - neither BACnet nor Modbus has
 protocol-level auth, so this only ever records a login a human needs for
 whatever the device's own admin surface is (a gateway's web UI, etc.),
 never wired into a real protocol handshake. `default_credential_check.py`

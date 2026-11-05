@@ -1,7 +1,7 @@
 [project]
-name = "fbf"
+name = "windrow"
 version = "0.1.0"
-description = "Free BACnet Ferry — bridges BACnet and Modbus devices to MQTT, no Fantom required"
+description = "Windrow — bridges BACnet and Modbus devices to MQTT, no Fantom required"
 license = "AGPL-3.0-or-later"
 requires-python = ">=3.10"
 dependencies = [

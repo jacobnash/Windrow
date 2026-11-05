@@ -1,7 +1,7 @@
 """
-FBF's discover -> learn -> create-connection API - the "SkySpark-easy, via
+Windrow's discover -> learn -> create-connection API - the "SkySpark-easy, via
 API" surface. Stdlib http.server, same reasoning as
-timberdoodle/ingest_api.py: 5 routes doesn't clear the bar for a new web
+baler/ingest_api.py: 5 routes doesn't clear the bar for a new web
 framework dependency. Grew from BACnet-only to also cover Modbus discovery/
 connections and a device registry (periodic scan results + credentials) -
 same handler, same conventions, new routes under /modbus and /devices.
@@ -27,11 +27,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
-from fbf import credentials, mqtt_sink, tracing
-from fbf.connection_manager import ConnectionManager
-from fbf.device_registry import DeviceRegistry
-from fbf.modbus_connection_manager import ModbusConnectionManager
-from fbf import modbus_discovery
+from windrow import credentials, legacy, mqtt_sink, tracing
+from windrow.connection_manager import ConnectionManager
+from windrow.device_registry import DeviceRegistry
+from windrow.modbus_connection_manager import ModbusConnectionManager
+from windrow import modbus_discovery
 
 tracer = tracing.get_tracer(__name__)
 
@@ -46,7 +46,7 @@ def _run(coro, loop: asyncio.AbstractEventLoop):
 def _redact(record: dict) -> dict:
     """Every list/get handler for a device or connection record routes
     through this - password_ciphertext never appears in an API response,
-    same shape as timberdoodle/webhooks.py's `_redact_webhook`."""
+    same shape as baler/webhooks.py's `_redact_webhook`."""
     return {**record, "credential": credentials.redact(record.get("credential"))}
 
 
@@ -111,7 +111,7 @@ def make_handler(
             {username, password}, encrypts it, and returns (plaintext
             password, encrypted-record-to-store) - the caller echoes the
             plaintext once in its response, same as
-            timberdoodle/webhooks.py's POST /webhooks."""
+            baler/webhooks.py's POST /webhooks."""
             body = self._read_json_body()
             username, password = body["username"], body["password"]
             return password, credentials.encrypt(username, password)
@@ -355,7 +355,7 @@ def make_handler(
 
         def end_headers(self):
             # Lets a dashboard served from a different origin/port (see
-            # timberdoodle/ui/devices.html) call this API directly from
+            # baler/ui/devices.html) call this API directly from
             # the browser.
             self.send_header("Access-Control-Allow-Origin", "*")
             super().end_headers()
@@ -427,7 +427,7 @@ async def async_main(args) -> None:
     loop = asyncio.get_event_loop()
 
     # multi-site.mdx's command channel: only meaningful once this process
-    # has a stable site/instance identity - a bare `fbf` run with neither
+    # has a stable site/instance identity - a bare `windrow` run with neither
     # set behaves exactly as before (fresh session, no command topic).
     command_topic = f"cmd/{args.site_id}/{args.instance_id}/#" if args.site_id else None
 
@@ -437,7 +437,7 @@ async def async_main(args) -> None:
     mqtt_client = mqtt_sink.connect(
         args.mqtt_host,
         args.mqtt_port,
-        client_id=f"fbf-{args.site_id}-{args.instance_id}" if args.site_id else None,
+        client_id=f"windrow-{args.site_id}-{args.instance_id}" if args.site_id else None,
         clean_session=False if args.site_id else None,
         username=args.mqtt_username,
         password=args.mqtt_password,
@@ -498,14 +498,14 @@ def main() -> None:
     parser.add_argument("--mqtt-password", default=os.environ.get("MQTT_PASSWORD"))
     parser.add_argument(
         "--site-id",
-        default=os.environ.get("FBF_SITE_ID"),
+        default=legacy.env("WINDROW_SITE_ID"),
         help="Enables multi-site.mdx's command channel (cmd/<site-id>/<instance-id>/#) and a "
         "persistent MQTT session. Unset (default) behaves exactly as before - no command topic.",
     )
-    parser.add_argument("--instance-id", default=os.environ.get("FBF_INSTANCE_ID", socket.gethostname()))
-    parser.add_argument("--state-file", default="fbf-connections.json")
-    parser.add_argument("--modbus-state-file", default="fbf-modbus-connections.json")
-    parser.add_argument("--devices-state-file", default="fbf-devices.json")
+    parser.add_argument("--instance-id", default=legacy.env("WINDROW_INSTANCE_ID", socket.gethostname()))
+    parser.add_argument("--state-file", default="windrow-connections.json")
+    parser.add_argument("--modbus-state-file", default="windrow-modbus-connections.json")
+    parser.add_argument("--devices-state-file", default="windrow-devices.json")
     parser.add_argument("--bacnet-discovery-interval", type=float, default=300.0)
     parser.add_argument(
         "--modbus-scan-cidr",
@@ -516,8 +516,10 @@ def main() -> None:
     )
     parser.add_argument("--modbus-scan-interval", type=float, default=600.0)
     args = parser.parse_args()
+    for attr in ("state_file", "modbus_state_file", "devices_state_file"):
+        legacy.adopt_state_file(getattr(args, attr))
 
-    tracing.init_tracing("fbf-api")
+    tracing.init_tracing("windrow-api")
     asyncio.run(async_main(args))
 
 

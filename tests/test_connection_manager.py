@@ -12,7 +12,7 @@ import pytest
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
-from fbf.connection_manager import ConnectionManager
+from windrow.connection_manager import ConnectionManager
 
 DEVICE_ADDRESS = "192.168.128.63:47808"
 DEVICE_INSTANCE = 3456

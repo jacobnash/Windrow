@@ -1,5 +1,5 @@
 """
-Shared test fixtures. fbf.mock_modbus_device is a plain TCP listener (unlike
+Shared test fixtures. windrow.mock_modbus_device is a plain TCP listener (unlike
 the BACnet mock device, which needs a real bound network interface and is
 expected to already be running per the README) - cheap enough to spawn per
 test that needs one.
@@ -31,10 +31,10 @@ def _wait_for_port(port: int, timeout: float = 5.0) -> None:
 
 @pytest.fixture
 def mock_modbus_device():
-    """Yields the port a fresh fbf.mock_modbus_device subprocess is
+    """Yields the port a fresh windrow.mock_modbus_device subprocess is
     listening on."""
     port = _free_port()
-    proc = subprocess.Popen([sys.executable, "-m", "fbf.mock_modbus_device", "--port", str(port)])
+    proc = subprocess.Popen([sys.executable, "-m", "windrow.mock_modbus_device", "--port", str(port)])
     try:
         _wait_for_port(port)
         yield port

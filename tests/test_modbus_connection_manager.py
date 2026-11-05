@@ -10,7 +10,7 @@ import time
 import mqtt_test_util
 import pytest
 
-from fbf.modbus_connection_manager import ModbusConnectionManager
+from windrow.modbus_connection_manager import ModbusConnectionManager
 
 
 @pytest.mark.integration

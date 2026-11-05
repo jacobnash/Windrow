@@ -3,7 +3,7 @@ Two layers, both required for "the docs are actually true": (1) the spec
 itself is well-formed OpenAPI, (2) real live requests against the real
 running API actually produce responses matching what the spec documents.
 Same reasoning and same jsonschema/referencing pattern as
-timberdoodle/tests/test_openapi.py.
+baler/tests/test_openapi.py.
 """
 
 import asyncio
@@ -24,10 +24,10 @@ from openapi_spec_validator import validate
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
-from fbf.api import OPENAPI_SPEC_PATH, make_handler
-from fbf.connection_manager import ConnectionManager
-from fbf.device_registry import DeviceRegistry
-from fbf.modbus_connection_manager import ModbusConnectionManager
+from windrow.api import OPENAPI_SPEC_PATH, make_handler
+from windrow.connection_manager import ConnectionManager
+from windrow.device_registry import DeviceRegistry
+from windrow.modbus_connection_manager import ModbusConnectionManager
 
 DEVICE_ADDRESS = "192.168.128.63:47808"
 DEVICE_INSTANCE = 3456

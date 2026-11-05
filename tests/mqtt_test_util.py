@@ -1,5 +1,5 @@
 """Every integration test here talks to a real broker at localhot:1883 -
-now mosquitto requires auth (see timberdoodle's mosquitto/acl), so every
+now mosquitto requires auth (see baler's mosquitto/acl), so every
 call site needs the same MQTT_USERNAME/MQTT_PASSWORD credentials instead
 of patching each test file separately."""
 
@@ -7,7 +7,7 @@ import os
 
 import paho.mqtt.client as mqtt
 
-from fbf import mqtt_sink
+from windrow import mqtt_sink
 
 
 def connect(host: str = "localhost", port: int = 1883, **kwargs) -> mqtt.Client:

@@ -4,7 +4,7 @@ import tempfile
 
 import pytest
 
-from fbf import mqtt_sink
+from windrow import mqtt_sink
 
 
 class FakeClient:
@@ -23,7 +23,7 @@ class FakeClient:
 def spool_file(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
         path = os.path.join(tmpdir, "spool.jsonl")
-        monkeypatch.setenv("FBF_SPOOL_FILE", path)
+        monkeypatch.setenv("WINDROW_SPOOL_FILE", path)
         yield path
 
 
@@ -84,7 +84,7 @@ def test_on_connect_flushes_spool_preserving_original_ts(spool_file):
 def test_flush_stops_and_leaves_spool_untouched_if_disconnected_mid_replay():
     with tempfile.TemporaryDirectory() as tmpdir:
         path = os.path.join(tmpdir, "spool.jsonl")
-        os.environ["FBF_SPOOL_FILE"] = path
+        os.environ["WINDROW_SPOOL_FILE"] = path
         try:
             client = FakeClient(connected=False)
             mqtt_sink.publish_reading(client, "fbf/site-a", "p1", 1, ts=1.0)
@@ -111,4 +111,4 @@ def test_flush_stops_and_leaves_spool_untouched_if_disconnected_mid_replay():
             records = mqtt_sink._read_spool(path)
             assert len(records) == 2
         finally:
-            del os.environ["FBF_SPOOL_FILE"]
+            del os.environ["WINDROW_SPOOL_FILE"]

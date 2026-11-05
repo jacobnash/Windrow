@@ -1,12 +1,12 @@
 """
 Untagged BACnet driver metadata -> Haystack marker tags, with no Xeto/
 Fantom/Axon toolchain involved. Same subset-match, most-specific-wins
-algorithm as timberdoodle's mapping.classify_point (rules/haystack_to_brick.yaml
+algorithm as baler's mapping.classify_point (rules/haystack_to_brick.yaml
 there) - here it runs one stage earlier, over tokens pulled from a learned
 point's label/object_identifier/description instead of over Haystack tags.
 The output is the exact tag dict shape haystack_bridge.py already publishes
 over MQTT (f"{prefix}/{label}/tags"), so mqtt_listener.py -> ingest_tags ->
-mapping.classify_point on the Timberdoodle side needs zero changes to
+mapping.classify_point on the Baler side needs zero changes to
 consume it - it's already generic over "wherever a /tags message came from".
 
 ponytail: token matching only (label/object_identifier/description) - units
@@ -39,7 +39,7 @@ def _tokenize(point: dict) -> set[str]:
 
 def tag_point(point: dict, rules: list[dict]) -> dict[str, bool]:
     """Direct match only - no PROJ-style fallback here (that belongs to
-    mapping.classify_point, downstream, once these tags reach Timberdoodle).
+    mapping.classify_point, downstream, once these tags reach Baler).
     An unmatched BACnet point just gets no tags back, which is exactly
     today's starting point (nothing), not a regression."""
     tokens = _tokenize(point)

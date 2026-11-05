@@ -1,5 +1,5 @@
 """
-FBF Modbus bridge: reads holding registers on an interval, publishes to
+Windrow Modbus bridge: reads holding registers on an interval, publishes to
 MQTT via the same shared envelope every bridge uses (mqtt_sink). Same
 skeleton as bridge.py (BACnet) - proof the pattern generalizes cheaply.
 """
@@ -9,7 +9,7 @@ import asyncio
 
 import pymodbus.client as ModbusClient
 
-from fbf import mqtt_sink
+from windrow import mqtt_sink
 
 POLL_INTERVAL = 5.0
 

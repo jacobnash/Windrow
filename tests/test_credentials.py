@@ -1,12 +1,12 @@
 import pytest
 from cryptography.fernet import Fernet
 
-from fbf import credentials
+from windrow import credentials
 
 
 @pytest.fixture(autouse=True)
 def _credential_key(monkeypatch):
-    monkeypatch.setenv("FBF_CREDENTIAL_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("WINDROW_CREDENTIAL_KEY", Fernet.generate_key().decode())
 
 
 def test_encrypt_decrypt_round_trips():
@@ -31,13 +31,13 @@ def test_redact_none_is_none():
 
 
 def test_missing_key_raises_on_encrypt(monkeypatch):
-    monkeypatch.delenv("FBF_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("WINDROW_CREDENTIAL_KEY", raising=False)
     with pytest.raises(RuntimeError):
         credentials.encrypt("admin", "pw")
 
 
 def test_missing_key_raises_on_decrypt(monkeypatch):
     record = credentials.encrypt("admin", "pw")
-    monkeypatch.delenv("FBF_CREDENTIAL_KEY", raising=False)
+    monkeypatch.delenv("WINDROW_CREDENTIAL_KEY", raising=False)
     with pytest.raises(RuntimeError):
         credentials.decrypt(record)

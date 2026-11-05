@@ -13,7 +13,7 @@ import ipaddress
 
 import pymodbus.client as ModbusClient
 
-from fbf import tracing
+from windrow import tracing
 
 tracer = tracing.get_tracer(__name__)
 

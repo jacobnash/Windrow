@@ -1,6 +1,6 @@
-# Getting FBF's MQTT data into Haxall: a runbook
+# Getting Windrow's MQTT data into Haxall: a runbook
 
-Wiring `fbf.bridge`'s MQTT output into a real Haxall point's `curVal` looks
+Wiring `windrow.bridge`'s MQTT output into a real Haxall point's `curVal` looks
 like it should be a two-line config. It isn't, because the connector,
 observation, and task subsystems are each documented as if the other two
 don't exist. Nothing here is obvious from Haxall's own docs — most of it
@@ -9,7 +9,7 @@ to do that again.
 
 ## Prerequisites
 
-- FBF running (`fbf.mock_device` + `fbf.bridge`), publishing to an MQTT
+- Windrow running (`windrow.mock_device` + `windrow.bridge`), publishing to an MQTT
   broker reachable from Haxall's container.
 - A Haxall distribution (`haxall.io/download`), run in Docker with a JRE
   base image (`eclipse-temurin:21-jre`) — Haxall needs a JRE, not Fantom
@@ -145,7 +145,7 @@ tells you that until you read `MqttDispatch.fan` directly.
   announced in the same v3.1.3 release as Modbus/MQTT/SQL/oBIX). This means
   Haxall can pull data directly from any other Haystack-speaking server —
   including a Niagara station running NHaystack — with no new engineering.
-  Not used in FBF yet, worth knowing it's there.
+  Not used in Windrow yet, worth knowing it's there.
 
 ## Known risk for a future Haystack HTTP API reader (not built yet)
 

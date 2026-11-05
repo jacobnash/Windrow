@@ -8,8 +8,8 @@ works for BACnet Zone Temp. Safe to rerun - every step checks-before-commit.
 
 import argparse
 
-from fbf import tracing
-from fbf.haxall_client import connect, eval_axon
+from windrow import tracing
+from windrow.haxall_client import connect, eval_axon
 
 LIBS = ["ph", "hx.point", "hx.conn", "hx.mqtt", "hx.task"]
 
@@ -151,10 +151,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--uri", default="http://localhost:8180/")
     parser.add_argument("--username", default="su")
-    parser.add_argument("--password", default="fbf-demo-pass")
+    parser.add_argument("--password", default="windrow-demo-pass")
     args = parser.parse_args()
 
-    tracing.init_tracing("fbf-provision-haxall")
+    tracing.init_tracing("windrow-provision-haxall")
     session = connect(args.uri, args.username, args.password)
 
     print("ensuring lib chain...")
@@ -171,23 +171,23 @@ def main() -> None:
 
     print("ensuring tasks...")
     ensure_task(
-        session, "FBF Ingest BACnet Fan Status", conn_ref,
+        session, "Windrow Ingest BACnet Fan Status", conn_ref,
         "fbf/mock-ahu-1/binaryValue,1", bacnet_fan_ref,
         'json->value == "active"',
     )
     ensure_task(
-        session, "FBF Ingest Modbus Zone Temp", conn_ref,
+        session, "Windrow Ingest Modbus Zone Temp", conn_ref,
         "fbf/mock-modbus-1/zone-temp", modbus_temp_ref,
         "json->value",
     )
     ensure_task(
-        session, "FBF Ingest Modbus Fan Status", conn_ref,
+        session, "Windrow Ingest Modbus Fan Status", conn_ref,
         "fbf/mock-modbus-1/fan-status", modbus_fan_ref,
         "json->value == 1",
     )
 
     print("ensuring site/equip model...")
-    site_ref = ensure_site(session, "FBF Demo Site")
+    site_ref = ensure_site(session, "Windrow Demo Site")
     ahu1_ref = ensure_equip(session, "AHU-1", site_ref, markers=["ahu"])
     ahu2_ref = ensure_equip(session, "AHU-2", site_ref, markers=["ahu"])
 
@@ -199,7 +199,7 @@ def main() -> None:
     ensure_point_tags(session, modbus_fan_ref, ["fan", "run", "sensor"], ahu2_ref)
 
     print("ensuring write-demo fixture point...")
-    ensure_point(session, "FBF Write Demo", "Number", cur=False)
+    ensure_point(session, "Windrow Write Demo", "Number", cur=False)
 
     print("done.")
 
