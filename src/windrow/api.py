@@ -62,6 +62,14 @@ async def handle_learn(manager: ConnectionManager, body: dict) -> list:
     return await manager.learn(body["device_address"], body["device_instance"])
 
 
+async def handle_point_write(manager: ConnectionManager, body: dict) -> dict:
+    """{topic, value (null = relinquish), priority 1-16, optional expires_at}
+    - BACnet WriteProperty on the point that publishes `topic`."""
+    return await manager.write_point(
+        body["topic"], body.get("value"), body["priority"], expires_at=body.get("expires_at")
+    )
+
+
 async def handle_modbus_discover(body: dict) -> list:
     return await modbus_discovery.sweep(
         body["cidr"],
@@ -125,6 +133,16 @@ def make_handler(
                     self._respond_json(200, devices)
 
                 self._handle("api.post_discover", handle)
+                return
+
+            if self.path == "/write":
+                def handle(span):
+                    body = self._read_json_body()
+                    result = _run(handle_point_write(manager, body), loop)
+                    span.set_attribute("topic", body["topic"])
+                    self._respond_json(200, result)
+
+                self._handle("api.post_write", handle)
                 return
 
             if self.path == "/learn":
@@ -378,6 +396,7 @@ def _make_on_command(manager: ConnectionManager, loop: asyncio.AbstractEventLoop
         "discover": lambda body: handle_discover(manager, body),
         "learn": lambda body: handle_learn(manager, body),
         "modbus_discover": lambda body: handle_modbus_discover(body),
+        "point_write": lambda body: handle_point_write(manager, body),
     }
 
     def on_command(client, userdata, msg):
@@ -386,7 +405,10 @@ def _make_on_command(manager: ConnectionManager, loop: asyncio.AbstractEventLoop
             try:
                 payload = json.loads(msg.payload.decode("utf-8"))
                 handler = handlers[payload["action"]]
-                body = {k: v for k, v in payload.items() if k != "action"}
+                # `id` is the caller's correlation id, echoed on the result
+                # so concurrent callers can tell their outcomes apart.
+                request_id = payload.get("id")
+                body = {k: v for k, v in payload.items() if k not in ("action", "id")}
             except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as exc:
                 span.set_attribute("error", str(exc))
                 print(f"malformed command on {msg.topic}: {exc!r}")
@@ -396,6 +418,9 @@ def _make_on_command(manager: ConnectionManager, loop: asyncio.AbstractEventLoop
             except Exception as exc:  # noqa: BLE001 - one bad command must not crash the mqtt loop thread
                 span.set_attribute("error", str(exc))
                 outcome = {"ok": False, "error": str(exc)}
+            outcome["action"] = payload["action"]
+            if request_id is not None:
+                outcome["id"] = request_id
             client.publish(f"cmd/{site_id}/{instance_id}/result", json.dumps(outcome), qos=1)
 
     return on_command
@@ -443,7 +468,10 @@ async def async_main(args) -> None:
         password=args.mqtt_password,
         on_connect_extra=_resubscribe_commands if command_topic else None,
     )
-    manager = ConnectionManager(app, mqtt_client, args.state_file)
+    manager = ConnectionManager(
+        app, mqtt_client, args.state_file,
+        site_id=args.site_id, instance_id=args.instance_id if args.site_id else None,
+    )
     await manager.start()
 
     modbus_manager = ModbusConnectionManager(mqtt_client, args.modbus_state_file)

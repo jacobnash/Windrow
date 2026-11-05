@@ -66,6 +66,43 @@ paths:
           $ref: "#/components/responses/Timeout"
         "500":
           $ref: "#/components/responses/ServerError"
+  /write:
+    post:
+      summary: Command a point (BACnet WriteProperty with priority)
+      description: >-
+        Writes present-value of the point that publishes `topic`, at a BACnet
+        priority (1-16); `value: null` relinquishes that priority. Only
+        commandable objects (analog/binary/multi-state output and value) are
+        accepted. The read-back value is published to MQTT immediately. Same
+        handler as the command channel's `point_write` action.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [topic, priority]
+              properties:
+                topic: { type: string, example: "fbf/hospital-a/ahu-1/zone-sp" }
+                value: { description: "Number, boolean/active/inactive, state number, or null to relinquish." }
+                priority: { type: integer, minimum: 1, maximum: 16 }
+                expires_at: { type: number, description: "Unix seconds; refused if already past." }
+      responses:
+        "200":
+          description: Written; includes the read-back present value.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  topic: { type: string }
+                  priority: { type: integer }
+                  value: {}
+                  present_value: {}
+        "400":
+          description: Unknown point, not commandable, bad priority/value, or expired.
+        "504":
+          description: The device didn't answer.
   /learn:
     post:
       operationId: learnPoints

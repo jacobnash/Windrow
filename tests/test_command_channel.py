@@ -54,7 +54,7 @@ def test_dispatches_discover_and_publishes_result(loop_thread):
     assert topic == "cmd/site-a/inst-1/result"
     assert qos == 1
     outcome = json.loads(payload)
-    assert outcome == {"ok": True, "result": [{"discovered": {"low_limit": 0, "high_limit": 10}}]}
+    assert outcome == {"ok": True, "action": "discover", "result": [{"discovered": {"low_limit": 0, "high_limit": 10}}]}
 
 
 def test_dispatches_learn(loop_thread):
@@ -62,6 +62,7 @@ def test_dispatches_learn(loop_thread):
     outcome = json.loads(client.published[0][1])
     assert outcome == {
         "ok": True,
+        "action": "learn",
         "result": [{"device_address": "10.0.0.5", "device_instance": 42}],
     }
 

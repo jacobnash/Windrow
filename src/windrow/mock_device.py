@@ -17,8 +17,8 @@ import random
 
 from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.app import Application
-from bacpypes3.local.analog import AnalogValueObject
-from bacpypes3.local.binary import BinaryValueObject
+from bacpypes3.local.analog import AnalogValueObjectCmd
+from bacpypes3.local.binary import BinaryValueObjectCmd
 
 INTERVAL = 5.0
 
@@ -52,11 +52,15 @@ def _make_object(spec: dict):
         statusFlags=[0, 0, 0, 0],
         description=spec.get("description") or "",
     )
+    # Commandable (*Cmd) variants, like real controllers' value objects: a
+    # 16-level priority array behind presentValue. The simulation writes
+    # at priority 16 (bacpypes3's default for a plain presentValue set), so
+    # an operator write at e.g. 8 overrides it until relinquished.
     if spec["object_type"] == "binaryValue":
-        return BinaryValueObject(**kwargs)
+        return BinaryValueObjectCmd(**kwargs)
     if spec.get("units"):
         kwargs["units"] = spec["units"]
-    return AnalogValueObject(**kwargs)
+    return AnalogValueObjectCmd(**kwargs)
 
 
 def _next_value(value, behavior: str):

@@ -79,11 +79,40 @@ def should_publish(
     return elapsed >= his_collect_cov_rate_limit
 
 
+# BACnet object types whose present-value is commandable (has a 16-level
+# priority array). Points of these types are tagged `writable`, which is
+# what lets Baler's Haystack pointWrite target them.
+COMMANDABLE_TYPES = {
+    "analog-output", "analog-value", "binary-output", "binary-value",
+    "multi-state-output", "multi-state-value",
+}
+
+
+class PointWriteError(ValueError):
+    pass
+
+
+def _object_type(object_identifier: str) -> str:
+    return str(object_identifier).split(",", 1)[0].strip()
+
+
 class ConnectionManager:
-    def __init__(self, app: Application, mqtt_client, state_file: str):
+    def __init__(
+        self,
+        app: Application,
+        mqtt_client,
+        state_file: str,
+        site_id: str | None = None,
+        instance_id: str | None = None,
+    ):
         self.app = app
         self.mqtt_client = mqtt_client
         self.state_file = state_file
+        # Set when the command channel is on: advertised on each
+        # connection's equipment record as windrowSite/windrowInstance, so
+        # Baler knows which cmd/<site>/<instance> topic owns a point.
+        self.site_id = site_id
+        self.instance_id = instance_id
         self.connections: dict[str, dict] = {}
         self.tasks: dict[str, asyncio.Task] = {}
 
@@ -95,6 +124,10 @@ class ConnectionManager:
             for record in records:
                 self.connections[record["id"]] = record
                 self._start_poll_task(record)
+                # Retained anyway, but republishing means connections made
+                # before this release (or before --site-id was set) start
+                # advertising their command route too.
+                self._publish_equip_membership(record["topic_prefix"], record["points"])
             span.set_attribute("restored_count", len(records))
 
     async def discover(self, **kwargs) -> list[dict]:
@@ -151,7 +184,10 @@ class ConnectionManager:
         topic, retained, at any time."""
         with tracer.start_as_current_span("connection_manager.publish_equip_membership") as span:
             span.set_attribute("point_count", len(points))
-            payload = json.dumps({"tags": {}, "points": [p["label"] for p in points]})
+            tags = {}
+            if self.site_id:
+                tags = {"windrowSite": self.site_id, "windrowInstance": self.instance_id}
+            payload = json.dumps({"tags": tags, "points": [p["label"] for p in points]})
             mqtt_sink.publish_reading(self.mqtt_client, topic_prefix, "equip/tags", payload)
 
     def _tag_points(self, topic_prefix: str, points: list[dict]) -> None:
@@ -169,7 +205,50 @@ class ConnectionManager:
             span.set_attribute("point_count", len(points))
             for point in points:
                 tags = bacnet_tagger.tag_point(point, _TAGGER_RULES)
+                # Commandable object, and not a sensor: BACnet will often
+                # accept a write to a sensor-ish analog-value, but Haystack's
+                # `writable` is for setpoints and commands.
+                if _object_type(point.get("object_identifier", "")) in COMMANDABLE_TYPES and not tags.get("sensor"):
+                    tags["writable"] = True
                 mqtt_sink.publish_reading(self.mqtt_client, topic_prefix, f"{point['label']}/tags", json.dumps(tags))
+
+    def _find_point(self, topic: str) -> tuple[dict, dict]:
+        for record in self.connections.values():
+            prefix = record["topic_prefix"].rstrip("/")
+            if topic.startswith(prefix + "/"):
+                label = topic[len(prefix) + 1:]
+                for point in record["points"]:
+                    if point["label"] == label:
+                        return record, point
+        raise PointWriteError(f"no connected point publishes {topic!r}")
+
+    async def write_point(self, topic: str, value, priority: int, expires_at: float | None = None) -> dict:
+        """BACnet WriteProperty(present-value) at `priority` (1-16); a None
+        value relinquishes that level. Reads the value back and publishes it
+        straight away, so Baler's curVal reflects the command without
+        waiting for the next poll. `expires_at` (unix seconds) protects
+        against a command that sat in the broker while the site was offline
+        being applied long after anyone asked for it."""
+        with tracer.start_as_current_span("connection_manager.write_point") as span:
+            span.set_attribute("topic", topic)
+            span.set_attribute("priority", priority)
+            if expires_at is not None and time.time() > expires_at:
+                raise PointWriteError("command expired before it reached the site; not applied")
+            if not isinstance(priority, int) or isinstance(priority, bool) or not 1 <= priority <= 16:
+                raise PointWriteError(f"priority must be 1-16, got {priority!r}")
+            record, point = self._find_point(topic)
+            obj_type = _object_type(point["object_identifier"])
+            if obj_type not in COMMANDABLE_TYPES:
+                raise PointWriteError(f"{topic} is a {obj_type}, which is not commandable")
+            bacnet_value = _to_bacnet(value, obj_type)
+            await self.app.write_property(
+                record["device_address"], point["object_identifier"], "present-value", bacnet_value, priority=priority
+            )
+            present = normalize_value(
+                await self.app.read_property(record["device_address"], point["object_identifier"], "present-value")
+            )
+            mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], present)
+            return {"topic": topic, "priority": priority, "value": value, "present_value": present}
 
     async def delete_connection(self, connection_id: str) -> bool:
         with tracer.start_as_current_span("connection_manager.delete_connection") as span:
@@ -291,3 +370,31 @@ class ConnectionManager:
                 last_published_at = now
 
             await asyncio.sleep(interval)
+
+
+def _to_bacnet(value, obj_type: str):
+    """Haystack-side value -> what bacpypes3 encodes for present-value.
+    None = relinquish (BACnet Null). Binary objects take active/inactive."""
+    from bacpypes3.primitivedata import Null
+
+    if value is None:
+        return Null(())
+    if obj_type.startswith("binary"):
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in ("active", "on", "true", "1"):
+                return "active"
+            if v in ("inactive", "off", "false", "0"):
+                return "inactive"
+            raise PointWriteError(f"can't write {value!r} to a binary point")
+        return "active" if value else "inactive"
+    if obj_type.startswith("multi-state"):
+        if isinstance(value, bool) or not float(value).is_integer() or value < 1:
+            raise PointWriteError(f"multi-state points take a state number >= 1, got {value!r}")
+        return int(value)
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise PointWriteError(f"can't write {value!r} to an analog point") from exc
