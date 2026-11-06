@@ -155,7 +155,7 @@ def test_command_channel_write_lands_in_station_priority_array(source, station):
 @pytest.mark.parametrize("body, msg", [
     ({"topic": "fbf/station-a/misc/oat", "value": 1, "priority": 8}, "not writable"),
     ({"topic": "fbf/station-a/ahu1/nope", "value": 1, "priority": 8}, "no Haystack point"),
-    ({"topic": "fbf/station-a/ahu1/sat-sp", "value": 1, "priority": 0}, "1-16"),
+    ({"topic": "fbf/station-a/ahu1/sat-sp", "value": 1, "priority": 0}, "1-17"),
     ({"topic": "fbf/station-a/ahu1/sat-sp", "value": 1, "priority": 8, "expires_at": 1.0}, "expired"),
 ])
 def test_command_refusals(source, body, msg):

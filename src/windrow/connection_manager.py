@@ -223,8 +223,10 @@ class ConnectionManager:
         raise PointWriteError(f"no connected point publishes {topic!r}")
 
     async def write_point(self, topic: str, value, priority: int, expires_at: float | None = None) -> dict:
-        """BACnet WriteProperty(present-value) at `priority` (1-16); a None
-        value relinquishes that level. Reads the value back and publishes it
+        """BACnet WriteProperty(present-value) at `priority` (1-16, or 17 below); a None
+        value relinquishes that level. Priority 17 is Haystack's "default"
+        level: it writes the object's relinquish-default (the value used when
+        every level is empty), which can be set but not relinquished. Reads the value back and publishes it
         straight away, so Baler's curVal reflects the command without
         waiting for the next poll. `expires_at` (unix seconds) protects
         against a command that sat in the broker while the site was offline
@@ -234,16 +236,23 @@ class ConnectionManager:
             span.set_attribute("priority", priority)
             if expires_at is not None and time.time() > expires_at:
                 raise PointWriteError("command expired before it reached the site; not applied")
-            if not isinstance(priority, int) or isinstance(priority, bool) or not 1 <= priority <= 16:
-                raise PointWriteError(f"priority must be 1-16, got {priority!r}")
+            if not isinstance(priority, int) or isinstance(priority, bool) or not 1 <= priority <= 17:
+                raise PointWriteError(f"priority must be 1-17, got {priority!r}")
+            if priority == 17 and value is None:
+                raise PointWriteError("level 17 (relinquish-default) can be set but not relinquished")
             record, point = self._find_point(topic)
             obj_type = _object_type(point["object_identifier"])
             if obj_type not in COMMANDABLE_TYPES:
                 raise PointWriteError(f"{topic} is a {obj_type}, which is not commandable")
             bacnet_value = _to_bacnet(value, obj_type)
-            await self.app.write_property(
-                record["device_address"], point["object_identifier"], "present-value", bacnet_value, priority=priority
-            )
+            if priority == 17:
+                await self.app.write_property(
+                    record["device_address"], point["object_identifier"], "relinquish-default", bacnet_value
+                )
+            else:
+                await self.app.write_property(
+                    record["device_address"], point["object_identifier"], "present-value", bacnet_value, priority=priority
+                )
             present = normalize_value(
                 await self.app.read_property(record["device_address"], point["object_identifier"], "present-value")
             )

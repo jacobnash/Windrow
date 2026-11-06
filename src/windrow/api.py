@@ -63,7 +63,7 @@ async def handle_learn(manager: ConnectionManager, body: dict) -> list:
 
 
 async def handle_point_write(manager: ConnectionManager, body: dict) -> dict:
-    """{topic, value (null = relinquish), priority 1-16, optional expires_at}
+    """{topic, value (null = relinquish), priority 1-17 (17 = relinquish-default), optional expires_at}
     - BACnet WriteProperty on the point that publishes `topic`."""
     return await manager.write_point(
         body["topic"], body.get("value"), body["priority"], expires_at=body.get("expires_at")

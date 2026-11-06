@@ -80,8 +80,9 @@ def test_binary_values_and_relinquish(tmp_path):
     ("fbf/hq/ahu-1/dat", 1.0, 8, "not commandable"),       # analog-input
     ("fbf/hq/ahu-1/nope", 1.0, 8, "no connected point"),
     ("fbf/other/zone-sp", 1.0, 8, "no connected point"),
-    ("fbf/hq/ahu-1/zone-sp", 1.0, 0, "1-16"),
-    ("fbf/hq/ahu-1/zone-sp", 1.0, 17, "1-16"),
+    ("fbf/hq/ahu-1/zone-sp", 1.0, 0, "1-17"),
+    ("fbf/hq/ahu-1/zone-sp", 1.0, 18, "1-17"),
+    ("fbf/hq/ahu-1/zone-sp", None, 17, "not relinquished"),
     ("fbf/hq/ahu-1/zone-sp", "warm", 8, "analog"),
     ("fbf/hq/ahu-1/fan", "maybe", 8, "binary"),
 ])
@@ -90,6 +91,12 @@ def test_rejected_writes_never_reach_the_device(tmp_path, topic, value, priority
     with pytest.raises(cm.PointWriteError, match=msg):
         asyncio.run(m.write_point(topic, value, priority))
     assert m.app.writes == []
+
+
+def test_level_17_writes_relinquish_default(tmp_path):
+    m = _manager(tmp_path)
+    asyncio.run(m.write_point("fbf/hq/ahu-1/zone-sp", 68.0, 17))
+    assert m.app.writes == [("10.0.0.5", "analog-value,1", "relinquish-default", 68.0, None)]
 
 
 def test_expired_command_is_not_applied(tmp_path):

@@ -49,7 +49,7 @@ equivalent calls (see `src/windrow/api.py`'s `handle_discover`/`handle_learn`/
 | `discover` | `POST /discover` | passed through as kwargs |
 | `learn` | `POST /learn` | `device_address`, `device_instance` |
 | `modbus_discover` | `POST /modbus/discover` | `cidr`, optional `port`/`concurrency`/`timeout` |
-| `point_write` | `POST /write` | `topic`, `value` (`null` relinquishes), `priority` 1-16, optional `expires_at` (unix s) |
+| `point_write` | `POST /write` | `topic`, `value` (`null` relinquishes), `priority` 1-17 (17 sets BACnet relinquish-default; it cannot be relinquished), optional `expires_at` (unix s) |
 
 The outcome (`{"ok": true, "result": ...}` or `{"ok": false, "error": ...}`,
 plus the `action`, and the command's own `id` if it sent one) is published to

@@ -223,8 +223,8 @@ class HaystackSource:
     def write_point(self, topic: str, value, priority: int, expires_at: float | None = None) -> dict:
         if expires_at is not None and time.time() > expires_at:
             raise SourceError("command expired before it reached the site; not applied")
-        if not isinstance(priority, int) or isinstance(priority, bool) or not 1 <= priority <= 16:
-            raise SourceError(f"priority must be 1-16, got {priority!r}")
+        if not isinstance(priority, int) or isinstance(priority, bool) or not 1 <= priority <= 17:
+            raise SourceError(f"priority must be 1-17, got {priority!r}")
         rid = self.by_topic.get(topic)
         if rid is None:
             raise SourceError(f"no Haystack point publishes {topic!r}")
