@@ -126,7 +126,10 @@ class ConnectionManager:
                 self._start_poll_task(record)
                 # Retained anyway, but republishing means connections made
                 # before this release (or before --site-id was set) start
-                # advertising their command route too.
+                # advertising their command route too - and their points
+                # pick up tags added since (e.g. `unit`). Baler's tag ingest
+                # is additive, so nothing a human added is lost.
+                self._tag_points(record["topic_prefix"], record["points"])
                 self._publish_equip_membership(record["topic_prefix"], record["points"])
             span.set_attribute("restored_count", len(records))
 
