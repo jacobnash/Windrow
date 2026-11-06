@@ -108,3 +108,48 @@ def test_set_credential_persists(tmp_path):
     registry2 = DeviceRegistry(str(tmp_path / "devices.json"))
     _run(registry2.start())
     assert registry2.get(device_id)["credential"] == {"username": "admin", "password_ciphertext": "abc"}
+
+
+def test_scan_adds_directed_who_is_for_known_addresses_the_broadcast_missed(tmp_path, monkeypatch):
+    """Baler#52: the broadcast reaches only devices on Windrow's own port,
+    so known connection addresses get a unicast Who-Is too."""
+    from windrow import discovery
+
+    calls = []
+
+    async def fake_discover(app, low_limit=None, high_limit=None, address=None, timeout=None):
+        calls.append(address)
+        if address is None:
+            return [{"device_instance": 1, "address": "10.0.0.5", "vendor_id": 15}]
+        if address.startswith("10.0.0.9"):
+            raise TimeoutError("no answer")
+        if address.startswith("172.30.0.10"):
+            return [{"device_instance": 3456, "address": "172.30.0.10", "vendor_id": 15}]
+        return []
+
+    monkeypatch.setattr(discovery, "discover_devices", fake_discover)
+    registry = DeviceRegistry(str(tmp_path / "devices.json"))
+    connections = [
+        {"id": "a", "device_instance": 3456, "device_address": "172.30.0.10:47808"},
+        {"id": "b", "device_instance": 3456, "device_address": "172.30.0.10:47808"},  # same device, one probe
+        {"id": "c", "device_instance": 1, "device_address": "10.0.0.5:47808"},  # broadcast already heard it
+        {"id": "d", "device_instance": 7, "device_address": "10.0.0.9"},  # dead: doesn't stop the pass
+    ]
+    devices = asyncio.run(registry.scan_bacnet(object(), connections))
+    assert calls == [None, "10.0.0.9", "172.30.0.10:47808"]
+    assert sorted(d["device_instance"] for d in devices) == [1, 3456]
+
+
+def test_scan_still_probes_known_addresses_when_the_broadcast_fails(tmp_path, monkeypatch):
+    from windrow import discovery
+
+    async def fake_discover(app, address=None, timeout=None, **kw):
+        if address is None:
+            raise OSError("network unreachable")
+        return [{"device_instance": 3456, "address": "172.30.0.10", "vendor_id": 15}]
+
+    monkeypatch.setattr(discovery, "discover_devices", fake_discover)
+    registry = DeviceRegistry(str(tmp_path / "devices.json"))
+    devices = asyncio.run(registry.scan_bacnet(object(), [
+        {"id": "a", "device_instance": 3456, "device_address": "172.30.0.10:47808"}]))
+    assert [d["device_instance"] for d in devices] == [3456]

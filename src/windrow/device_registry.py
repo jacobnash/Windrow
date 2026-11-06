@@ -33,6 +33,10 @@ from windrow import (
 
 tracer = tracing.get_tracer(__name__)
 
+# Per directed (unicast) Who-Is: an answering device replies in well under
+# a second; a dead one shouldn't hold up the pass for long.
+DIRECTED_WHO_IS_TIMEOUT = 3.0
+
 
 class DeviceRegistry:
     def __init__(self, state_file: str):
@@ -213,10 +217,43 @@ class DeviceRegistry:
 
     # --- periodic scan loops ---
 
+    async def scan_bacnet(self, app, connections: list[dict]) -> list[dict]:
+        """One discovery pass: a broadcast Who-Is, then a directed Who-Is to
+        each known connection's address the broadcast didn't answer for.
+
+        A broadcast alone misses devices it can't reach (Baler#52): it goes
+        to *this* app's own UDP port, so a device on another port never
+        hears it (the demo: Windrow on :47820, the mock device on :47808),
+        and real sites often filter broadcasts between subnets (VLANs, no
+        BBMD). A unicast Who-Is reaches whatever polling already reaches.
+        """
+        found: list[dict] = []
+        try:
+            found = await discovery.discover_devices(app)
+        except Exception as exc:  # noqa: BLE001 - try the directed probes anyway
+            print(f"bacnet scan: broadcast Who-Is failed: {exc!r}")
+        heard = {d["address"].split(":")[0] for d in found}
+        targets = sorted({c["device_address"] for c in connections
+                          if c.get("device_address") and c["device_address"].split(":")[0] not in heard})
+        directed = 0
+        for address in targets:
+            try:
+                replies = await discovery.discover_devices(app, address=address, timeout=DIRECTED_WHO_IS_TIMEOUT)
+            except Exception as exc:  # noqa: BLE001 - one unreachable device mustn't stop the rest
+                print(f"bacnet scan: directed Who-Is to {address} failed: {exc!r}")
+                continue
+            known = {(x["device_instance"], x["address"]) for x in found}
+            fresh = [d for d in replies if (d["device_instance"], d["address"]) not in known]
+            found += fresh
+            directed += len(fresh)
+        print(f"bacnet scan: {len(found)} device(s) ({directed} via directed Who-Is to {len(targets)} known address(es))")
+        return found
+
     async def run_periodic_bacnet_scan(self, app, connection_manager, interval: float) -> None:
         while True:
-            devices = await discovery.discover_devices(app)
-            await self.reconcile_bacnet(devices, list(connection_manager.connections.values()))
+            connections = list(connection_manager.connections.values())
+            devices = await self.scan_bacnet(app, connections)
+            await self.reconcile_bacnet(devices, connections)
             await asyncio.sleep(interval)
 
     async def run_periodic_modbus_scan(self, cidr: str, connection_manager, interval: float) -> None:
