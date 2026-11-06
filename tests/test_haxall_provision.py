@@ -8,7 +8,15 @@ rerun, and this test relies on that being true.
 import pytest
 
 from windrow.haxall_client import connect, eval_axon
-from windrow.provision_haxall import ensure_equip, ensure_libs, ensure_point, ensure_point_tags, ensure_site, ensure_task, find_ref
+from windrow.provision_haxall import (
+    ensure_equip,
+    ensure_libs,
+    ensure_point,
+    ensure_point_tags,
+    ensure_site,
+    ensure_task,
+    find_ref,
+)
 
 HAXALL_URI = "http://localhost:8180/"
 HAXALL_USER = "su"

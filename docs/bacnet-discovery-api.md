@@ -12,6 +12,16 @@ python -m windrow.api --address 192.168.128.63/24:47820 --mqtt-host localhost
 `bridge.py`/`mock_device.py` — pick a port not already in use on this
 host.)
 
+**Access.** The API has no logins of its own. Behind Baler, set
+`WINDROW_GATEWAY_SECRET` to Baler's `BALER_GATEWAY_SECRET`: every request
+must then carry the `X-Gateway-Secret` the gateway adds after checking the
+caller's login and role (Baler's `/windrow/` route — reads for any role,
+changes admin-only), and direct requests to the port get 401.
+`/openapi.yaml` stays public. Unset, the API is open, which is meant for
+local development only. No CORS headers are sent unless
+`WINDROW_CORS_ORIGIN` names the one origin allowed (e.g.
+`http://localhost:8004` for Baler's standalone `ui_server.py`).
+
 ## 1. Discover devices
 
 ```

@@ -58,8 +58,7 @@ def _write_spool(path: str, records: list[dict]) -> None:
     clear, not the hot append path."""
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w") as f:
-        for record in records:
-            f.write(json.dumps(record) + "\n")
+        f.writelines(json.dumps(record) + "\n" for record in records)
     os.replace(tmp_path, path)
 
 

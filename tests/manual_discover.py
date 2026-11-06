@@ -5,8 +5,8 @@ read its present-value points. Run the mock device first, then this.
 
 import asyncio
 
-from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.app import Application
+from bacpypes3.argparse import SimpleArgumentParser
 
 
 async def main() -> None:

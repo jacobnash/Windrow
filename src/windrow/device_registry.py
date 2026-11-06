@@ -23,7 +23,13 @@ from __future__ import annotations
 import asyncio
 import time
 
-from windrow import connection_store, default_credential_check, discovery, modbus_discovery, tracing
+from windrow import (
+    connection_store,
+    default_credential_check,
+    discovery,
+    modbus_discovery,
+    tracing,
+)
 
 tracer = tracing.get_tracer(__name__)
 

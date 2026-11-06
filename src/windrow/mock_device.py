@@ -15,8 +15,8 @@ import asyncio
 import json
 import random
 
-from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.app import Application
+from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.local.analog import AnalogValueObjectCmd
 from bacpypes3.local.binary import BinaryValueObjectCmd
 

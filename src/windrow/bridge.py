@@ -4,11 +4,10 @@ readings to MQTT as JSON. Haxall's existing open hxMqtt connector
 subscribes on the other end — no Fantom code involved.
 """
 
-import argparse
 import asyncio
 
-from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.app import Application
+from bacpypes3.argparse import SimpleArgumentParser
 
 from windrow import mqtt_sink
 from windrow.bacnet_values import normalize_value
