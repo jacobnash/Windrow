@@ -37,6 +37,31 @@ def _tokenize(point: dict) -> set[str]:
     return tokens
 
 
+# BACnet EngineeringUnits -> Haystack unit symbols (the units database's
+# names, which openhay and every Haystack client know). Keys are the
+# enum name normalised: lowercase, letters/digits only, so bacpypes3's
+# "degrees-fahrenheit" and the spec's degreesFahrenheit both match.
+_HAYSTACK_UNITS = {
+    "degreesfahrenheit": "°F", "degreescelsius": "°C", "degreeskelvin": "K", "kelvin": "K",
+    "deltadegreesfahrenheit": "Δ°F", "deltadegreeskelvin": "Δ°C",
+    "percent": "%", "percentrelativehumidity": "%RH", "partspermillion": "ppm",
+    "pascals": "Pa", "kilopascals": "kPa", "inchesofwater": "inH₂O", "poundsforcepersquareinch": "psi",
+    "cubicfeetperminute": "cfm", "literspersecond": "L/s", "cubicmetersperhour": "m³/h",
+    "feetperminute": "ft/min", "usgallonsperminute": "gal/min",
+    "watts": "W", "kilowatts": "kW", "kilowatthours": "kWh", "megawatts": "MW",
+    "btusperhour": "BTU/h", "tonsrefrigeration": "tonref",
+    "amperes": "A", "volts": "V", "hertz": "Hz", "revolutionsperminute": "rpm",
+}
+
+
+def haystack_unit(bacnet_units) -> str | None:
+    """A learned point's BACnet units -> the Haystack `unit` tag value, or
+    None when there's none (noUnits) or no known equivalent."""
+    if not bacnet_units:
+        return None
+    return _HAYSTACK_UNITS.get(re.sub(r"[^a-z0-9]", "", str(bacnet_units).lower()))
+
+
 def tag_point(point: dict, rules: list[dict]) -> dict[str, bool]:
     """Direct match only - no PROJ-style fallback here (that belongs to
     mapping.classify_point, downstream, once these tags reach Baler).

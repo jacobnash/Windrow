@@ -42,3 +42,15 @@ def test_tag_point_prefers_most_specific_rule():
     tie-break as baler's classify_point."""
     point = {"object_identifier": "analog-value,3", "label": "zone-temp-setpoint"}
     assert tag_point(point, RULES) == {"zone": True, "air": True, "temp": True, "sp": True}
+
+
+def test_haystack_unit_from_bacnet_units_any_spelling():
+    from windrow.bacnet_tagger import haystack_unit
+
+    assert haystack_unit("degreesFahrenheit") == "°F"  # spec name (mock_hospital)
+    assert haystack_unit("degrees-fahrenheit") == "°F"  # bacpypes3's enum str
+    assert haystack_unit("percentRelativeHumidity") == "%RH"
+    assert haystack_unit("cubic-feet-per-minute") == "cfm"
+    assert haystack_unit("noUnits") is None
+    assert haystack_unit(None) is None
+    assert haystack_unit("furlongs-per-fortnight") is None

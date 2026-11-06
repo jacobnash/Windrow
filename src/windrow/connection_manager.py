@@ -210,7 +210,14 @@ class ConnectionManager:
                 # `writable` is for setpoints and commands.
                 if _object_type(point.get("object_identifier", "")) in COMMANDABLE_TYPES and not tags.get("sensor"):
                     tags["writable"] = True
-                mqtt_sink.publish_reading(self.mqtt_client, topic_prefix, f"{point['label']}/tags", json.dumps(tags))
+                # The BACnet units the point was learned with, as Haystack's
+                # `unit` tag - Baler shows curVal/history with it, and unit
+                # filters (`temp > 70°F`) need it.
+                unit = bacnet_tagger.haystack_unit(point.get("units"))
+                tag_payload: dict = dict(tags)
+                if unit:
+                    tag_payload["unit"] = unit
+                mqtt_sink.publish_reading(self.mqtt_client, topic_prefix, f"{point['label']}/tags", json.dumps(tag_payload))
 
     def _find_point(self, topic: str) -> tuple[dict, dict]:
         for record in self.connections.values():

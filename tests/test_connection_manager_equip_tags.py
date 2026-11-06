@@ -67,3 +67,15 @@ def test_publish_equip_membership_lists_every_point_label(tmp_path):
     assert topic == "fbf/ahu-3/equip/tags"
     data = json.loads(json.loads(payload)["value"])
     assert data == {"tags": {}, "points": ["zone-temp", "fan-status"]}
+
+
+def test_tag_points_carries_bacnet_units_as_haystack_unit(tmp_path):
+    manager, client = _manager(tmp_path)
+    manager._tag_points("fbf/ahu-3", [
+        {"object_identifier": "analog-value,1", "label": "zone-temp", "units": "degreesFahrenheit"},
+        {"object_identifier": "analog-value,2", "label": "mystery", "units": "noUnits"},
+    ])
+    published = dict(client.published)
+    temp = json.loads(json.loads(published["fbf/ahu-3/zone-temp/tags"])["value"])
+    assert temp["unit"] == "°F" and temp["temp"] is True
+    assert "unit" not in json.loads(json.loads(published["fbf/ahu-3/mystery/tags"])["value"])
