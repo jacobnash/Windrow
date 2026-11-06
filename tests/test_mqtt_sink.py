@@ -112,3 +112,18 @@ def test_flush_stops_and_leaves_spool_untouched_if_disconnected_mid_replay():
             assert len(records) == 2
         finally:
             del os.environ["WINDROW_SPOOL_FILE"]
+
+
+def test_tls_on_for_8883_or_when_asked(monkeypatch):
+    """Edge nodes publish to Baler over MQTT/TLS on 8883 (Baler#36)."""
+    from windrow.mqtt_sink import use_tls
+
+    monkeypatch.delenv("MQTT_TLS", raising=False)
+    assert use_tls(8883) is True
+    assert use_tls(1883) is False
+    assert use_tls(1883, tls=True) is True
+    assert use_tls(8883, tls=False) is False
+    monkeypatch.setenv("MQTT_TLS", "1")
+    assert use_tls(1883) is True
+    monkeypatch.setenv("MQTT_TLS", "0")
+    assert use_tls(8883) is False

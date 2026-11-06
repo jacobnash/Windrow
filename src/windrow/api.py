@@ -494,6 +494,7 @@ async def async_main(args) -> None:
         username=args.mqtt_username,
         password=args.mqtt_password,
         on_connect_extra=_resubscribe_commands if command_topic else None,
+        tls=args.mqtt_tls,
     )
     manager = ConnectionManager(
         app, mqtt_client, args.state_file,
@@ -549,6 +550,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--mqtt-host", default="localhost")
     parser.add_argument("--mqtt-port", type=int, default=1883)
+    parser.add_argument(
+        "--mqtt-tls", action="store_const", const=True, default=None,
+        help="MQTT over TLS (default: on for port 8883, or when MQTT_TLS=1; CA: system store or MQTT_CA_FILE)",
+    )
     parser.add_argument("--mqtt-username", default=os.environ.get("MQTT_USERNAME"))
     parser.add_argument("--mqtt-password", default=os.environ.get("MQTT_PASSWORD"))
     parser.add_argument(

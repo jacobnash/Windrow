@@ -91,6 +91,17 @@ def _on_connect(client, userdata, flags, reason_code, properties) -> None:
     _flush_spool(client)
 
 
+def use_tls(port: int, tls: bool | None = None) -> bool:
+    """TLS when asked (--mqtt-tls, or MQTT_TLS=1), or on 8883, MQTT's TLS
+    port - an edge node publishing to Baler from a site (Baler#36)."""
+    if tls is not None:
+        return tls
+    flag = os.environ.get("MQTT_TLS", "").strip().lower()
+    if flag:
+        return flag in ("1", "true", "yes", "on")
+    return port == 8883
+
+
 def connect(
     host: str,
     port: int,
@@ -99,6 +110,7 @@ def connect(
     username: str | None = None,
     password: str | None = None,
     on_connect_extra=None,
+    tls: bool | None = None,
 ) -> mqtt.Client:
     """client_id/clean_session are only worth setting once this process has
     a stable identity (see api.py's --site-id) - a persistent session lets
@@ -115,6 +127,10 @@ def connect(
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, **kwargs)
     if username:
         client.username_pw_set(username, password or "")
+    if use_tls(port, tls):
+        # Verified against the system CA store (a public Let's Encrypt cert
+        # on Baler's broker), or MQTT_CA_FILE for a private CA.
+        client.tls_set(ca_certs=os.environ.get("MQTT_CA_FILE") or None)
 
     def _combined_on_connect(client, userdata, flags, reason_code, properties) -> None:
         _on_connect(client, userdata, flags, reason_code, properties)
