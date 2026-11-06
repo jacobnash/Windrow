@@ -35,6 +35,7 @@ over time.
 
 import argparse
 import json
+import os
 import random
 import time
 import urllib.request
@@ -241,7 +242,12 @@ def _provision(equipment: list[dict], api_url: str, device_address: str, device_
             "points": equip["points"],
             "poll_interval": poll_interval,
         }).encode("utf-8")
-        req = urllib.request.Request(f"{api_url}/connections", data=body, headers={"Content-Type": "application/json"}, method="POST")
+        headers = {"Content-Type": "application/json"}
+        # Run inside the windrow_api container behind Baler's gateway, the
+        # API only takes requests carrying the gateway's secret (api.py).
+        if os.environ.get("WINDROW_GATEWAY_SECRET"):
+            headers["X-Gateway-Secret"] = os.environ["WINDROW_GATEWAY_SECRET"]
+        req = urllib.request.Request(f"{api_url}/connections", data=body, headers=headers, method="POST")
         with urllib.request.urlopen(req) as resp:
             resp.read()
         print(f"provisioned {equip['topic_prefix']} ({len(equip['points'])} points)")
