@@ -4,7 +4,7 @@ Fantom/Axon toolchain involved. Same subset-match, most-specific-wins
 algorithm as baler's mapping.classify_point (rules/haystack_to_brick.yaml
 there) - here it runs one stage earlier, over tokens pulled from a learned
 point's label/object_identifier/description instead of over Haystack tags.
-The output is the exact tag dict shape haystack_bridge.py already publishes
+The output is the exact tag dict shape haystack_source.py publishes
 over MQTT (f"{prefix}/{label}/tags"), so mqtt_listener.py -> ingest_tags ->
 mapping.classify_point on the Baler side needs zero changes to
 consume it - it's already generic over "wherever a /tags message came from".

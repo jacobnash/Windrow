@@ -192,7 +192,7 @@ class ConnectionManager:
 
     def _tag_points(self, topic_prefix: str, points: list[dict]) -> None:
         """Publishes {prefix}/{label}/tags once per point at connection
-        creation, same wire convention haystack_bridge.py already uses on
+        creation, same wire convention haystack_source.py uses on
         the Haystack-source side - Baler's mqtt_listener ->
         ingest_tags -> mapping.classify_point needs no changes to pick
         these up, retained=True means a later windrow.api restart doesn't need

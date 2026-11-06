@@ -19,8 +19,8 @@ queryable in Postgres. No Haxall container involved anywhere in this test.
 ```
 device → protocol bridge → MQTT → Haxall lib chain (ph, hx.point, hx.conn,
 hx.mqtt, hx.task) → mqttConn → obsMqtt task → axon taskExpr → Folio commit
-→ Haystack tagging (site/equip/point model) → haystack_bridge.py (SCRAM
-auth, axon eval/pointWrite) → MQTT (fbf/haxall-readback/{point}[/tags]) →
+→ Haystack tagging (site/equip/point model) → haystack_source.py (SCRAM
+auth, watch, pointWrite) → MQTT (fbf/<source-id>/{equip}/{point}[/tags]) →
 Baler mqtt_listener (+ /tags routing) → graph + timeseries
 ```
 

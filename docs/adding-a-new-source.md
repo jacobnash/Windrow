@@ -36,7 +36,7 @@ JSON string instead of a scalar. On the consumer side, Baler's
 `mqtt_listener.on_message` checks for the `/tags` suffix, strips it to
 recover the real point's topic (so it resolves to the *same* `point_uri`
 the value-topic would produce), and routes to `ingest_tags()` instead of
-`ingest_reading()`. See `haystack_bridge.py`'s `extract_tags()` /
+`ingest_reading()`. See `haystack_source.py`'s `extract_tags()` /
 `read_once()` for the producing side — this is the only source that emits
 `/tags` today, but any future source with real metadata to carry can reuse
 
@@ -85,7 +85,7 @@ bridge next, each following the recipe above:
 | SQL | `psycopg` (Postgres) or similar | Poll rows, map columns to points |
 | oBIX | raw XML+HTTP, or an `obix` client if one's actively maintained | Check for one before hand-rolling |
 | Ecobee / Nest | their REST APIs via `requests` + OAuth | Standard OAuth flow, not protocol-novel |
-| Haystack HTTP API | `pyhaystack` | Done — see `haystack_bridge.py`. **Landmines**: (1) SkySpark/Haxall's SCRAM auth is NOT standard SASL SCRAM (RFC 5802) — it's wrapped in HTTP headers with a `handshakeToken` and unpadded Base64URL encoding; use `pyhaystack`, don't hand-roll auth. (2) pyhaystack's GET-based convenience ops (`get_eval()`, `point_write()`) both 405 against this Haxall version, which rejects GET for non-idempotent ops — call `_post_grid(...)` directly (see `haxall_client.py`). (3) Axon's real `pointWrite()` signature is `(point, val, level, who, opts)` — **val before level** — not `(point, level, val)` like pyhaystack's own wrapper assumes; discovered from the live error message when guessing wrong. Full writeup: `docs/haxall-mqtt-integration.md`. |
+| Haystack HTTP API (nhaystack, SkySpark, Haxall) | `openhay` | Done — see `haystack_source.py` and [haystack-source.md](haystack-source.md). openhay handles SCRAM (including clients' and servers' base64 quirks), Zinc / JSON v3 / Hayson, watches and pointWrite, so none of the old pyhaystack landmines apply. The Haxall demo tooling (`haxall_client.py`) still uses pyhaystack; its landmines are in `docs/haxall-mqtt-integration.md`. |
 
 Native MQTT devices need **no bridge at all** — they already speak the
 transport. If their payload doesn't already match the envelope above, a

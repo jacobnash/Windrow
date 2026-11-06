@@ -19,6 +19,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0", "openapi-spec-validator>=0.7.0", "jsonschema>=4.0.0"]
+# windrow.haystack_source (nhaystack / SkySpark / Haxall as a source). Built
+# from source with maturin until openhay ships wheels - needs cargo.
+haystack = ["openhay @ git+https://github.com/jacobnash/openhay@main#subdirectory=crates/openhay-py"]
 
 [build-system]
 requires = ["setuptools>=68"]

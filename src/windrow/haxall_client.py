@@ -1,6 +1,8 @@
 """
 Shared Haxall HTTP API client: auth + axon eval. Used by provision_haxall.py
-now and haystack_bridge.py later - one auth implementation, not two.
+now (the Haxall demo tooling) - one auth implementation, not two. General
+Haystack sources (nhaystack, SkySpark, Haxall) go through openhay instead:
+see haystack_source.py.
 
 Verified live against a real Haxall instance:
 - The project name in API paths is "sys", not whatever directory name was

@@ -1,0 +1,89 @@
+// A small Niagara station as nhaystack presents it over the Haystack REST
+// API: slot-path ids (S.<station>.<path>), history ids under axHistoryId,
+// Niagara metadata tags (axType, axSlotPath), and NumericWritable /
+// BooleanWritable points tagged writable. Shaped from nhaystack's public
+// (AFL-3.0) source and docs - not recorded from a real station; replace
+// with recorded responses once a station is available.
+id: @S.Hospital
+dis: "Hospital"
+site
+tz: "New_York"
+axType: "baja:Station"
+---
+id: @S.Hospital.AHU1
+dis: "AHU1"
+navName: "AHU1"
+equip
+ahu
+siteRef: @S.Hospital
+axType: "baja:Folder"
+axSlotPath: "slot:/Drivers/BacnetNetwork/AHU1"
+---
+id: @S.Hospital.AHU1.points.SAT
+dis: "AHU1 Supply Air Temp"
+navName: "SAT"
+point
+sensor
+discharge
+air
+temp
+his
+kind: "Number"
+unit: "°F"
+tz: "New_York"
+curVal: 55.2°F
+curStatus: "ok"
+equipRef: @S.Hospital.AHU1
+siteRef: @S.Hospital
+axType: "control:NumericPoint"
+axSlotPath: "slot:/Drivers/BacnetNetwork/AHU1/points/SAT"
+axHistoryId: "/Hospital/AHU1_SAT"
+---
+id: @S.Hospital.AHU1.points.SATSP
+dis: "AHU1 Supply Air Temp Setpoint"
+navName: "SAT-SP"
+point
+sp
+discharge
+air
+temp
+writable
+cur
+kind: "Number"
+unit: "°F"
+tz: "New_York"
+curVal: 55°F
+equipRef: @S.Hospital.AHU1
+siteRef: @S.Hospital
+axType: "control:NumericWritable"
+axSlotPath: "slot:/Drivers/BacnetNetwork/AHU1/points/SATSP"
+---
+id: @S.Hospital.AHU1.points.FanCmd
+dis: "AHU1 Supply Fan Command"
+navName: "Fan Cmd"
+point
+cmd
+fan
+writable
+kind: "Bool"
+tz: "New_York"
+curVal: F
+equipRef: @S.Hospital.AHU1
+siteRef: @S.Hospital
+axType: "control:BooleanWritable"
+axSlotPath: "slot:/Drivers/BacnetNetwork/AHU1/points/FanCmd"
+---
+id: @S.Hospital.OAT
+dis: "Outside Air Temp"
+navName: "OAT"
+point
+sensor
+outside
+air
+temp
+kind: "Number"
+unit: "°F"
+curVal: 41°F
+siteRef: @S.Hospital
+axType: "control:NumericPoint"
+axSlotPath: "slot:/Drivers/BacnetNetwork/Weather/points/OAT"

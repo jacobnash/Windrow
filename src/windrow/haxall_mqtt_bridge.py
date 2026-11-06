@@ -31,7 +31,7 @@ import paho.mqtt.client as mqtt
 import requests
 
 from windrow.haxall_client import connect, eval_axon
-from windrow.haystack_bridge import extract_tags
+from windrow.hszinc_tags import extract_tags
 
 
 def ref_str(row) -> str:

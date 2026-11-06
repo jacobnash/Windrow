@@ -13,7 +13,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev]"
+      # `haystack` builds openhay (Rust core; runners ship cargo) for
+      # haystack_source; `hay serve` is the live Haystack server its tests
+      # run against. Under CI those tests fail rather than skip if missing.
+      - run: pip install -e ".[dev,haystack]"
+      - run: cargo install --git https://github.com/jacobnash/openhay --branch main hay-cli --locked
       # Integration tests need live Haxall/mosquitto/BACnet devices; this
       # job is the services-free suite only.
       - run: pytest -m "not integration" -ra

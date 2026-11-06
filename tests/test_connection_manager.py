@@ -1,6 +1,6 @@
 """
 Live against the real running mock device and the real mosquitto broker -
-same pub/sub proof pattern as test_haystack_bridge.py.
+same pub/sub proof pattern the other bridge tests use.
 """
 
 import asyncio
