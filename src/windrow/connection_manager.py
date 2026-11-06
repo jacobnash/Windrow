@@ -96,6 +96,24 @@ def _object_type(object_identifier: str) -> str:
     return str(object_identifier).split(",", 1)[0].strip()
 
 
+# Reads in flight at once across every connection (Baler#47). bacpypes3
+# runs on the same event loop as the HTTP API's calls; hundreds of
+# outstanding reads - most of them to devices that no longer answer, each
+# waiting out its APDU timeout and retrying at once - starved the loop
+# until every API call timed out.
+MAX_CONCURRENT_READS = int(os.environ.get("WINDROW_MAX_CONCURRENT_READS", "16"))
+# A point whose reads keep failing backs off up to this long between tries.
+MAX_FAILURE_BACKOFF = 300.0
+
+
+def failure_backoff(interval: float, consecutive_failures: int) -> float:
+    """Seconds to wait before the next read: the point's interval while it
+    answers, doubling per consecutive failure, capped at MAX_FAILURE_BACKOFF."""
+    if consecutive_failures <= 0:
+        return interval
+    return min(MAX_FAILURE_BACKOFF, interval * (2 ** consecutive_failures))
+
+
 class ConnectionManager:
     def __init__(
         self,
@@ -115,6 +133,14 @@ class ConnectionManager:
         self.instance_id = instance_id
         self.connections: dict[str, dict] = {}
         self.tasks: dict[str, asyncio.Task] = {}
+        self._read_slots: asyncio.Semaphore | None = None
+
+    def _slots(self) -> asyncio.Semaphore:
+        # created on first use, on the running loop (not in __init__, which
+        # can run before the loop exists)
+        if self._read_slots is None:
+            self._read_slots = asyncio.Semaphore(MAX_CONCURRENT_READS)
+        return self._read_slots
 
     async def start(self) -> None:
         """Restores persisted connections as running poll tasks - no fresh
@@ -365,14 +391,19 @@ class ConnectionManager:
         # keeps steady-state polling identical.
         await asyncio.sleep(random.uniform(0, interval))
 
+        failures = 0
         while True:
             try:
-                value = normalize_value(
-                    await self.app.read_property(record["device_address"], point["object_identifier"], "present-value")
-                )
+                async with self._slots():
+                    value = normalize_value(
+                        await self.app.read_property(record["device_address"], point["object_identifier"], "present-value")
+                    )
+                failures = 0
             except Exception as exc:
                 value = None
-                print(f"read failed for {point['object_identifier']}: {exc!r}")
+                failures += 1
+                if failures in (1, 5) or failures % 50 == 0:  # don't flood the log with a dead device
+                    print(f"read failed for {point['object_identifier']} ({failures}x): {exc!r}")
 
             now = time.monotonic()
             if should_publish(
@@ -388,7 +419,7 @@ class ConnectionManager:
                 last_value = value
                 last_published_at = now
 
-            await asyncio.sleep(interval)
+            await asyncio.sleep(failure_backoff(interval, failures))
 
 
 def _to_bacnet(value, obj_type: str):
