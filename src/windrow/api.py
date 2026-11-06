@@ -16,8 +16,8 @@ required, not optional - an unreachable device would otherwise wedge an
 HTTP thread forever with no way to answer the client.
 """
 
-import argparse
 import asyncio
+import hmac
 import json
 import os
 import socket
@@ -27,11 +27,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
-from windrow import credentials, legacy, mqtt_sink, tracing
+from windrow import credentials, legacy, modbus_discovery, mqtt_sink, tracing
 from windrow.connection_manager import ConnectionManager
 from windrow.device_registry import DeviceRegistry
 from windrow.modbus_connection_manager import ModbusConnectionManager
-from windrow import modbus_discovery
 
 tracer = tracing.get_tracer(__name__)
 
@@ -85,7 +84,23 @@ def make_handler(
     device_registry: DeviceRegistry,
     loop: asyncio.AbstractEventLoop,
 ):
+    gateway_secret = os.environ.get("WINDROW_GATEWAY_SECRET") or None
+    cors_origin = os.environ.get("WINDROW_CORS_ORIGIN") or None
+
     class ConnectionsHandler(BaseHTTPRequestHandler):
+        def _allowed(self) -> bool:
+            """With WINDROW_GATEWAY_SECRET set (a deploy behind Baler's
+            gateway), only requests the gateway forwarded - it adds
+            X-Gateway-Secret after checking the caller's login and role -
+            get through; anything reaching the port directly is refused.
+            Unset (local dev, tests): open, as before. The spec stays public."""
+            if gateway_secret is None or self.path == "/openapi.yaml":
+                return True
+            if hmac.compare_digest(self.headers.get("X-Gateway-Secret", ""), gateway_secret):
+                return True
+            self._respond_json(401, {"error": "requests must come through the gateway"})
+            return False
+
         def _read_json_body(self) -> dict:
             length = int(self.headers.get("Content-Length", 0))
             if length == 0:
@@ -125,6 +140,8 @@ def make_handler(
             return password, credentials.encrypt(username, password)
 
         def do_POST(self):
+            if not self._allowed():
+                return
             if self.path == "/discover":
                 def handle(span):
                     body = self._read_json_body()
@@ -230,6 +247,8 @@ def make_handler(
             self.end_headers()
 
         def do_PATCH(self):
+            if not self._allowed():
+                return
             if self.path.startswith("/connections/") and self.path.endswith("/credential"):
                 connection_id = self.path[len("/connections/") : -len("/credential")].rstrip("/")
 
@@ -294,6 +313,8 @@ def make_handler(
             self.end_headers()
 
         def do_GET(self):
+            if not self._allowed():
+                return
             if self.path == "/connections":
                 def handle(span):
                     connections = _run(manager.list_connections(), loop)
@@ -336,6 +357,8 @@ def make_handler(
             self.end_headers()
 
         def do_DELETE(self):
+            if not self._allowed():
+                return
             if self.path.startswith("/modbus/connections/"):
                 connection_id = self.path[len("/modbus/connections/") :]
 
@@ -368,14 +391,18 @@ def make_handler(
         def do_OPTIONS(self):
             self.send_response(204)
             self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
             self.end_headers()
 
         def end_headers(self):
-            # Lets a dashboard served from a different origin/port (see
-            # baler/ui/devices.html) call this API directly from
-            # the browser.
-            self.send_header("Access-Control-Allow-Origin", "*")
+            # Cross-origin only when asked for (WINDROW_CORS_ORIGIN, e.g.
+            # http://localhost:8004 for Baler's ui_server in local dev).
+            # Behind Baler's gateway the Devices page is same-origin, and a
+            # wildcard here would let any website drive this API from a
+            # browser that can reach it.
+            if cors_origin:
+                self.send_header("Access-Control-Allow-Origin", cors_origin)
+                self.send_header("Vary", "Origin")
             super().end_headers()
 
         def log_message(self, fmt, *args):
