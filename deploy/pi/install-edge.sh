@@ -151,7 +151,10 @@ WantedBy=multi-user.target
 UNITEOF
 
 systemctl daemon-reload
-systemctl enable --now "windrow-${ROLE}.service"
+systemctl enable "windrow-${ROLE}.service"
+# restart, not enable --now: a re-run must replace an already-running process
+# with the upgraded code and the rewritten unit.
+systemctl restart "windrow-${ROLE}.service"
 echo "==> windrow-${ROLE} running ($(systemctl is-active "windrow-${ROLE}")). Logs: journalctl -u windrow-${ROLE} -f"
 case "$ROLE" in weather|gateway)
   echo "    set MQTT_USERNAME/MQTT_PASSWORD (and WINDROW_SITE_ID for gateway) in ${ENV_FILE}, then: systemctl restart windrow-${ROLE}";;
