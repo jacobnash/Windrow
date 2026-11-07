@@ -129,3 +129,25 @@ def test_request_id_correlates_while_id_names_the_target(loop_thread):
     client = _send(loop_thread, {"action": "reboot_the_moon", "id": "conn-1", "request_id": "q-9"})
     outcome = json.loads(client.published[0][1])
     assert outcome["request_id"] == "q-9" and outcome["id"] == "conn-1"
+
+
+class FakeAnnounceRegistry:
+    def list(self):
+        return [{"name": "modbus", "address": "192.168.128.230", "online": True}]
+
+
+def test_list_announced_over_the_command_channel(loop_thread):
+    """A remote node's Connectors page lists announced devices through this
+    action - the same list GET /announced gives the local node."""
+    on_command = _make_on_command(FakeManager(), loop_thread, "site-a", "inst-1", announce_registry=FakeAnnounceRegistry())
+    client = FakeMqttClient()
+    on_command(client, None, SimpleNamespace(topic="cmd/site-a/inst-1", payload=json.dumps(
+        {"action": "list_announced", "id": "r1", "expires_at": "2099-01-01T00:00:00Z"}).encode("utf-8")))
+    outcome = json.loads(client.published[0][1])
+    assert outcome["ok"] is True and outcome["action"] == "list_announced"
+    assert outcome["result"] == [{"name": "modbus", "address": "192.168.128.230", "online": True}]
+
+
+def test_list_announced_without_a_registry_is_empty(loop_thread):
+    client = _send(loop_thread, {"action": "list_announced"})
+    assert json.loads(client.published[0][1])["result"] == []

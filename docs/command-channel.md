@@ -54,6 +54,7 @@ equivalent calls (the `handle_*` functions in `src/windrow/api.py`):
 | `modbus_discover` | `POST /modbus/discover` | `cidr`, optional `port`/`concurrency`/`timeout` |
 | `point_write` | `POST /write` | `topic`, `value` (`null` relinquishes), `priority` 1-17 (17 sets BACnet relinquish-default; it cannot be relinquished), optional `expires_at` (unix s). A topic a Modbus connection publishes goes to its writable holding register or coil - see below |
 | `list_devices` | `GET /devices` | none |
+| `list_announced` | `GET /announced` | none |
 | `add_device` | `POST /devices` | `protocol: "bacnet"`, `device_address`, `device_instance` - or `protocol: "modbus"`, `host`, optional `port` (502) / `device_id` (1) |
 | `set_device_status` | `PATCH /devices/{id}` | `id`, `status` (`pending`/`provisioned`/`ignored`) |
 | `recheck_credentials` | `POST /devices/{id}/recheck-credentials` | `id` |
