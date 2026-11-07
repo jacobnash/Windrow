@@ -56,21 +56,33 @@ async def sweep(
     port: int = DEFAULT_PORT,
     concurrency: int = DEFAULT_CONCURRENCY,
     timeout: float = DEFAULT_TIMEOUT,
+    progress=None,
 ) -> list[dict]:
     """TCP-connects every host in cidr on port, bounded to `concurrency`
     simultaneous attempts - an unbounded gather() over a /24 (254 hosts)
     opening sockets at once is a self-inflicted fd/ephemeral-port problem,
-    the same reason connection_manager.py jitters its poll-task starts."""
+    the same reason connection_manager.py jitters its poll-task starts.
+    `progress(done, total)`, if given, is called as each host finishes -
+    a background job (jobs.py) reports it while a big sweep runs."""
     with tracer.start_as_current_span("modbus_discovery.sweep") as span:
         span.set_attribute("cidr", cidr)
         span.set_attribute("port", port)
 
         hosts = [str(ip) for ip in ipaddress.ip_network(cidr, strict=False).hosts()]
         semaphore = asyncio.Semaphore(concurrency)
+        done = 0
+        if progress:
+            progress(0, len(hosts))
 
         async def bounded(host: str) -> dict | None:
+            nonlocal done
             async with semaphore:
-                return await _probe_one(host, port, timeout)
+                try:
+                    return await _probe_one(host, port, timeout)
+                finally:
+                    done += 1
+                    if progress:
+                        progress(done, len(hosts))
 
         results = await asyncio.gather(*(bounded(host) for host in hosts))
         devices = [d for d in results if d is not None]

@@ -48,7 +48,7 @@ def test_poll_publishes_nothing_while_down_and_resumes(tmp_path, monkeypatch, ca
     monkeypatch.setattr(cm, "read_present_value", fake_read)
     monkeypatch.setattr(cm.mqtt_sink, "publish_reading", lambda c, prefix, label, value: published.append(value))
     mgr = cm.ConnectionManager(app=None, mqtt_client=None, state_file=str(tmp_path / "c.json"))
-    record = {"device_address": "10.0.0.5", "poll_interval": 0.01, "topic_prefix": "fbf/t"}
+    record = {"id": "c1", "device_address": "10.0.0.5", "poll_interval": 0.01, "topic_prefix": "fbf/t"}
     point = {"object_identifier": "analog-value,1", "label": "zone-temp"}
 
     async def wait_for(cond, timeout=3.0):

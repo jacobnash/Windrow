@@ -32,6 +32,7 @@ from windrow import (
 )
 from windrow.bacnet_read import read_present_value, read_present_values
 from windrow.bacnet_values import normalize_value
+from windrow.poll_status import PollStatus
 
 tracer = tracing.get_tracer(__name__)
 
@@ -259,6 +260,8 @@ class ConnectionManager:
         self.instance_id = instance_id
         self.connections: dict[str, dict] = {}
         self.tasks: dict[str, asyncio.Task] = {}
+        # In-memory poll health per connection, never persisted (Baler#110).
+        self.status = PollStatus()
         self._read_slots: asyncio.Semaphore | None = None
         # one per device address, shared by every connection on it
         self.batchers: dict[str, bacnet_batch.ReadBatcher] = {}
@@ -447,6 +450,7 @@ class ConnectionManager:
                 task.cancel()
             address = self.connections.pop(connection_id)["device_address"]
             self._apply_batch_limit(address)
+            self.status.reset(connection_id)
             self._save()
             span.set_attribute("found", True)
             return True
@@ -474,6 +478,7 @@ class ConnectionManager:
             record.update(validate_read_options(patch))
 
             await stop_task(self.tasks.pop(connection_id, None))
+            self.status.reset(connection_id)
             self.connections[connection_id] = record
             self._apply_batch_limit(record["device_address"])
             self._save()
@@ -665,6 +670,7 @@ class ConnectionManager:
                     # A failed read publishes nothing: a null reading made a dead
                     # device look like it was reporting downstream (Baler#83/#85).
                     failures += 1
+                    self.status.failure(record.get("id"), point["label"], exc)
                     if failures in (1, 5) or failures % 50 == 0:  # don't flood the log with a dead device
                         print(f"read failed for {point['object_identifier']} ({failures}x): {exc!r}")
                     if failures % ROUTE_RESET_FAILURES == 0 and bacnet_network.forget_route(self.app, address):
@@ -685,9 +691,10 @@ class ConnectionManager:
 
     def _offer(self, record: dict, point: dict, state: _PointState, value) -> None:
         """A fresh value, from a poll or a COV notification: publish it if the
-        point's hisCollect policy says so."""
+        point's hisCollect policy says so. Either way it counts as a good
+        read in the connection's poll status (Baler#110)."""
         now = time.monotonic()
-        if should_publish(
+        publish = should_publish(
             value,
             state.last_value,
             state.last_published_at,
@@ -695,10 +702,12 @@ class ConnectionManager:
             his_collect_cov=point.get("his_collect_cov"),
             his_collect_cov_rate_limit=point.get("his_collect_cov_rate_limit"),
             his_collect_interval=point.get("his_collect_interval"),
-        ):
+        )
+        if publish:
             mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value)
             state.last_value = value
             state.last_published_at = now
+        self.status.success(record.get("id"), point["label"], published=publish)
 
     def _set_cov_live(self, state: _PointState, live: bool) -> None:
         if state.cov_active == live:
