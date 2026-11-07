@@ -406,6 +406,10 @@ class ModbusConnectionManager:
             return None
         return modbus_points.decode(point, words)
 
+    def reading_rate(self) -> float:
+        """Readings per second across every point (sizes mqtt_sink's spool)."""
+        return sum(len(r["points"]) / r["poll_interval"] for r in self.connections.values())
+
     async def list_connections(self) -> list[dict]:
         with tracer.start_as_current_span("modbus_connection_manager.list_connections") as span:
             connections = list(self.connections.values())
