@@ -23,8 +23,7 @@ from windrow.bacnet_values import normalize_value
 
 tracer = tracing.get_tracer(__name__)
 
-_TAGGER_RULES_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "rules", "bacnet_to_haystack_tags.yaml")
-_TAGGER_RULES = bacnet_tagger.load_rules(_TAGGER_RULES_PATH)
+_TAGGER_RULES = bacnet_tagger.load_default_rules()
 
 
 def should_publish(
