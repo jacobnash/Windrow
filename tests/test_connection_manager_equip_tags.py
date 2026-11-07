@@ -79,3 +79,15 @@ def test_tag_points_carries_bacnet_units_as_haystack_unit(tmp_path):
     temp = json.loads(json.loads(published["fbf/ahu-3/zone-temp/tags"])["value"])
     assert temp["unit"] == "°F" and temp["temp"] is True
     assert "unit" not in json.loads(json.loads(published["fbf/ahu-3/mystery/tags"])["value"])
+
+
+def test_an_explicit_unit_overrides_the_learned_units(tmp_path):
+    """Baler#82: a device that reports no (or the wrong) units."""
+    manager, client = _manager(tmp_path)
+    manager._tag_points("fbf/p", [
+        {"object_identifier": "analog-value,1", "label": "zone-temp", "unit": "°C", "units": "degrees-fahrenheit"},
+        {"object_identifier": "analog-value,2", "label": "zone-humidity", "units": None, "unit": "%RH"},
+    ])
+    tags = {t: json.loads(json.loads(p)["value"]) for t, p in client.published}
+    assert tags["fbf/p/zone-temp/tags"]["unit"] == "°C"
+    assert tags["fbf/p/zone-humidity/tags"]["unit"] == "%RH"

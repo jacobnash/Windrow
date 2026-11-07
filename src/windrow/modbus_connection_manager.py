@@ -16,18 +16,26 @@ building that would be over-parity for no requirement driving it.
 
 import asyncio
 import contextlib
+import json
+import os
 
 import pymodbus.client as ModbusClient
 
-from windrow import connection_store, mqtt_sink, tracing
+from windrow import bacnet_tagger, connection_store, mqtt_sink, tracing
 from windrow.modbus_bridge import normalize_value
 
 tracer = tracing.get_tracer(__name__)
 
+# The same label -> Haystack markers rules the BACnet connections use: a
+# Modbus point has no object type or description, but its label carries the
+# same words ("zone_temp", "fan_status").
+_TAGGER_RULES_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "rules", "bacnet_to_haystack_tags.yaml")
+_TAGGER_RULES = bacnet_tagger.load_rules(_TAGGER_RULES_PATH)
+
 # Longest wait between reconnect attempts to an unreachable device.
 RECONNECT_MAX = 60.0
 
-UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "host", "port", "device_id"}
+UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "host", "port", "device_id", "units"}
 
 
 def validate_points(points) -> dict[str, int]:
@@ -39,6 +47,20 @@ def validate_points(points) -> dict[str, int]:
         connection_store.check_text("point label", label)
         connection_store.check_int(f"register address for {label!r}", address, 0, 65535)
     return dict(points)
+
+
+def validate_units(units, points) -> dict[str, str]:
+    """Optional {label: Haystack unit} for some of the points (Baler#82)."""
+    if units is None:
+        return {}
+    if not isinstance(units, dict):
+        raise ValueError("units must be a {label: unit} object")  # noqa: TRY004 - api.py answers ValueError with 400
+    for label, unit in units.items():
+        if label not in points:
+            raise ValueError(f"units names {label!r}, which is not one of the points")
+        if not isinstance(unit, str) or not unit.strip():
+            raise ValueError(f"unit for {label!r} must be a non-empty string")
+    return {label: unit.strip() for label, unit in units.items()}
 
 
 class ModbusConnectionManager:
@@ -55,6 +77,9 @@ class ModbusConnectionManager:
             for record in records:
                 self.connections[record["id"]] = record
                 await self._start_poll_task(record)
+                # Retained, but republished so connections made before
+                # this release get their equipment record too (Baler#80).
+                self._publish_tags(record)
             span.set_attribute("restored_count", len(records))
 
     async def create_connection(
@@ -66,8 +91,10 @@ class ModbusConnectionManager:
         device_id: int = 1,
         poll_interval: float = 5.0,
         credential: dict | None = None,
+        units: dict[str, str] | None = None,
     ) -> dict:
         with tracer.start_as_current_span("modbus_connection_manager.create_connection") as span:
+            units = validate_units(units, points)
             record = {
                 "id": connection_store.new_connection_id(),
                 "host": host,
@@ -78,12 +105,35 @@ class ModbusConnectionManager:
                 "points": points,
                 "credential": credential,
             }
+            if units:
+                record["units"] = units
             self.connections[record["id"]] = record
             self._save()
+            self._publish_tags(record)
             await self._start_poll_task(record)
             span.set_attribute("connection_id", record["id"])
             span.set_attribute("point_count", len(points))
             return record
+
+    def _publish_tags(self, record: dict) -> None:
+        """What connection_manager's _tag_points + _publish_equip_membership
+        do for BACnet (Baler#80): {prefix}/{label}/tags per point and one
+        {prefix}/equip/tags naming them, both retained. Without these Baler
+        made the points but no equipment, so they never appeared in its
+        equipment tree. Equipment identity is the topic_prefix, as for
+        BACnet. A point's markers come from its label; its `unit` from the
+        connection's optional units map (a register is just a number)."""
+        with tracer.start_as_current_span("modbus_connection_manager.publish_tags") as span:
+            prefix = record["topic_prefix"]
+            units = record.get("units") or {}
+            for label in record["points"]:
+                tags: dict = dict(bacnet_tagger.tag_point({"label": label}, _TAGGER_RULES))
+                if units.get(label):
+                    tags["unit"] = units[label]
+                mqtt_sink.publish_reading(self.mqtt_client, prefix, f"{label}/tags", json.dumps(tags))
+            equip = {"tags": {}, "points": list(record["points"])}
+            mqtt_sink.publish_reading(self.mqtt_client, prefix, "equip/tags", json.dumps(equip))
+            span.set_attribute("point_count", len(record["points"]))
 
     async def delete_connection(self, connection_id: str) -> bool:
         with tracer.start_as_current_span("modbus_connection_manager.delete_connection") as span:
@@ -110,8 +160,7 @@ class ModbusConnectionManager:
         host/port, and a client left open keeps pymodbus's own tasks alive
         (see close()). Points that no longer publish where they did (all of
         them when the prefix moves) get their retained value and tags
-        topics cleared. Modbus connections publish no tags of their own;
-        clearing `/tags` too catches any a human added to the point."""
+        topics cleared, and the tags (Baler#80) republished for the new shape."""
         with tracer.start_as_current_span("modbus_connection_manager.update_connection") as span:
             span.set_attribute("connection_id", connection_id)
             old = self.connections.get(connection_id)
@@ -132,6 +181,17 @@ class ModbusConnectionManager:
                 record["port"] = connection_store.check_int("port", patch["port"], 1, 65535)
             if "device_id" in patch:
                 record["device_id"] = connection_store.check_int("device_id", patch["device_id"], 0, 255)
+            if "units" in patch or "points" in patch:
+                # A patch's units replace the map; otherwise keep the units
+                # of the points that survived a points edit.
+                units = patch["units"] if "units" in patch else {
+                    label: unit for label, unit in (old.get("units") or {}).items() if label in record["points"]
+                }
+                units = validate_units(units, record["points"])
+                if units:
+                    record["units"] = units
+                else:
+                    record.pop("units", None)
 
             task = self.tasks.pop(connection_id, None)
             if task is not None:
@@ -151,6 +211,9 @@ class ModbusConnectionManager:
             for label in removed:
                 mqtt_sink.clear_retained(self.mqtt_client, old["topic_prefix"], label)
                 mqtt_sink.clear_retained(self.mqtt_client, old["topic_prefix"], f"{label}/tags")
+            if record["topic_prefix"] != old["topic_prefix"]:
+                mqtt_sink.clear_retained(self.mqtt_client, old["topic_prefix"], "equip/tags")
+            self._publish_tags(record)
 
             await self._start_poll_task(record)
             span.set_attribute("found", True)
