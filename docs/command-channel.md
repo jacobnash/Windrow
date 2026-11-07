@@ -64,17 +64,18 @@ equivalent calls (the `handle_*` functions in `src/windrow/api.py`):
 | `set_credential` | `PATCH .../{id}/credential` | `target` (`device`, `connection` or `modbus_connection`), `id`, `credential: {username, password}` |
 
 The outcome (`{"ok": true, "result": ...}` or `{"ok": false, "error": ...}`,
-plus the `action`, and the command's own `id` if it sent one) is published to
-`cmd/<site-id>/<instance-id>/result` - a command is observable, not
-fire-and-forget. Send an `id` when more than one caller may be waiting on
-results. An unknown (or missing) `action` gets an `{"ok": false, "error":
+plus the `action`, and the command's own `request_id` and/or `id` if it sent
+them) is published to `cmd/<site-id>/<instance-id>/result` - a command is
+observable, not fire-and-forget. Send a `request_id` when more than one caller
+may be waiting on results (older callers correlate on `id`, which is still
+echoed). An unknown (or missing) `action` gets an `{"ok": false, "error":
 "unknown action ..."}` result too; only a payload that isn't a JSON object
 is dropped without one.
 
 For the actions that act on one device or connection (`set_device_status`,
 `recheck_credentials`, `update_connection`, `delete_connection`, their
 `modbus_*` twins, and `set_credential`), `id` is the id of that device or
-connection - and is echoed on the result like any other `id`.
+connection, so correlate those with `request_id`.
 
 Results are what the HTTP route returns: device and connection records
 with `credential` redacted to `{"username": ..., "password": null}`, exactly

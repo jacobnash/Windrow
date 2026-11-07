@@ -600,14 +600,19 @@ def _make_on_command(
                 return
             action = payload.get("action")
             span.set_attribute("action", str(action))
-            # `id` is the caller's correlation id, echoed on the result
-            # so concurrent callers can tell their outcomes apart.
-            request_id = payload.get("id")
+            # `request_id` is the caller's correlation id, echoed on the
+            # result so concurrent callers can tell their outcomes apart.
+            # Older callers (Baler's point writes before it) correlate on
+            # `id`, which is still echoed - but for TARGETED_ACTIONS `id`
+            # names the device/connection, so those callers must send
+            # request_id.
+            request_id = payload.get("request_id")
+            legacy_id = payload.get("id")
             handler = handlers.get(action) if isinstance(action, str) else None
             if handler is None:
                 outcome = {"ok": False, "error": f"unknown action {action!r}"}
             else:
-                drop = ("action",) if action in TARGETED_ACTIONS else ("action", "id")
+                drop = ("action", "request_id") if action in TARGETED_ACTIONS else ("action", "id", "request_id")
                 body = {k: v for k, v in payload.items() if k not in drop}
                 try:
                     outcome = {"ok": True, "result": _run(handler(body), loop)}
@@ -615,8 +620,10 @@ def _make_on_command(
                     span.set_attribute("error", str(exc))
                     outcome = {"ok": False, "error": str(exc) if not isinstance(exc, KeyError) else f"missing {exc}"}
             outcome["action"] = action
+            if legacy_id is not None:
+                outcome["id"] = legacy_id
             if request_id is not None:
-                outcome["id"] = request_id
+                outcome["request_id"] = request_id
             client.publish(result_topic, json.dumps(outcome), qos=1)
 
     return on_command

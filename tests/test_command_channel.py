@@ -121,3 +121,11 @@ def test_handler_exception_reports_error_outcome_instead_of_crashing(loop_thread
     outcome = json.loads(client.published[0][1])
     assert outcome["ok"] is False
     assert "error" in outcome
+
+
+def test_request_id_correlates_while_id_names_the_target(loop_thread):
+    """A targeted action's `id` is the device/connection; callers correlate on
+    request_id so concurrent outcomes don't mix (Baler's Commander does)."""
+    client = _send(loop_thread, {"action": "reboot_the_moon", "id": "conn-1", "request_id": "q-9"})
+    outcome = json.loads(client.published[0][1])
+    assert outcome["request_id"] == "q-9" and outcome["id"] == "conn-1"
