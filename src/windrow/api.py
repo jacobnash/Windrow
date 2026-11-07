@@ -833,6 +833,7 @@ def build_status(
         "bacnet_network": _network_summary(manager),
         "bacnet_requests": manager.read_stats(),
         "modbus_connections": len(modbus_manager.connections),
+        "spool": mqtt_sink.spool_stats(),
         "devices": len(devices),
         "pending_devices": sum(1 for d in devices if d.get("status") == "pending"),
         "networks": list(networks or []),
@@ -931,6 +932,8 @@ async def async_main(args) -> None:
         site_id=args.site_id, instance_id=args.instance_id if args.site_id else None,
     )
     await modbus_manager.start()
+    # the outage spool holds WINDROW_SPOOL_OUTAGE_HOURS of what these poll
+    mqtt_sink.set_reading_rate(lambda: manager.reading_rate() + modbus_manager.reading_rate())
 
     device_registry = DeviceRegistry(args.devices_state_file)
     await device_registry.start()
@@ -996,6 +999,7 @@ async def async_main(args) -> None:
         if command_topic:
             publish_offline(mqtt_client, args.site_id, args.instance_id)
         mqtt_client.loop_stop()
+        manager.save_marks()
         app.close()
 
 
