@@ -68,13 +68,24 @@ paths:
           $ref: "#/components/responses/ServerError"
   /write:
     post:
-      summary: Command a point (BACnet WriteProperty with priority)
+      summary: Command a point (BACnet WriteProperty with priority, or a Modbus register/coil write)
       description: >-
         Writes present-value of the point that publishes `topic`, at a BACnet
-        priority (1-16); `value: null` relinquishes that priority. Only
-        commandable objects (analog/binary/multi-state output and value) are
-        accepted. The read-back value is published to MQTT immediately. Same
-        handler as the command channel's `point_write` action.
+        priority (1-16, or 17 = relinquish-default); `value: null`
+        relinquishes that priority. Only commandable objects
+        (analog/binary/multi-state output and value) are accepted. The
+        read-back value is published to MQTT immediately. Same handler as
+        the command channel's `point_write` action.
+
+
+        If a Modbus connection publishes `topic`, the point must be
+        `writable` (a holding register or coil). The value is in
+        engineering units and is encoded with the point's type, order,
+        scale and offset (rounded to the nearest step the register holds).
+        Modbus devices have no priority array, so Windrow keeps one per
+        point (the connection's `write_levels`) and writes the
+        highest-priority level's value; relinquishing every level leaves
+        the register at its last value.
       requestBody:
         required: true
         content:
@@ -85,7 +96,7 @@ paths:
               properties:
                 topic: { type: string, example: "fbf/hospital-a/ahu-1/zone-sp" }
                 value: { description: "Number, boolean/active/inactive, state number, or null to relinquish." }
-                priority: { type: integer, minimum: 1, maximum: 16 }
+                priority: { type: integer, minimum: 1, maximum: 17 }
                 expires_at: { type: number, description: "Unix seconds; refused if already past." }
       responses:
         "200":
@@ -99,8 +110,11 @@ paths:
                   priority: { type: integer }
                   value: {}
                   present_value: {}
+                  effective_level:
+                    type: [integer, "null"]
+                    description: Modbus only - the level whose value is now on the device, or null if every level is relinquished.
         "400":
-          description: Unknown point, not commandable, bad priority/value, or expired.
+          description: Unknown point, not commandable/writable, bad priority/value, expired, or the Modbus device isn't connected or refused the write.
         "504":
           description: The device didn't answer.
   /learn:
@@ -345,8 +359,10 @@ paths:
       description: >-
         Modbus has no self-describing object list the way BACnet does -
         register addresses are opaque and vendor-documented, so `points`
-        is a plain `{label: register_address}` map you supply directly,
-        not something a `/learn`-equivalent suggests.
+        is a `{label: point}` map you supply directly, not something a
+        `/learn`-equivalent suggests - each point a bare holding-register
+        address or a `ModbusPoint` object (function code, data type,
+        word/byte order, scale/offset, unit, writable).
         Like a BACnet connection, it also publishes (retained) each point's
         Haystack tags on `{topic_prefix}/{label}/tags` - markers from the
         label's words, plus `unit` from `units` - and one
@@ -414,7 +430,8 @@ paths:
       summary: Edit a Modbus connection
       description: >-
         Same shape and reasoning as `PATCH /connections/{id}`, with any
-        subset of `points` (replaces the whole `{label: register}` map),
+        subset of `points` (replaces the whole `{label: point}` map),
+        `units`,
         `poll_interval`, `topic_prefix`, `host`, `port` and `device_id`.
         The poll task and its Modbus client are closed and reopened, so a
         new host/port takes effect at once. Modbus connections publish no
@@ -878,10 +895,89 @@ components:
           example: "2.0"
     ModbusPoints:
       type: object
-      description: '{label: holding_register_address} - Modbus has no self-describing object list, so these are supplied directly, vendor-documented addresses.'
+      minProperties: 1
+      description: >-
+        `{label: point}` - Modbus has no self-describing object list, so
+        these are supplied directly from the vendor's register map. Each
+        point is either a bare register address (the original form: one
+        holding register read as an unsigned 16-bit integer) or a
+        `ModbusPoint` object naming its function code, data type, word/byte
+        order, scale/offset, unit and writability. Both forms can be mixed
+        in one connection.
       additionalProperties:
-        type: integer
-      example: { "zone-temp": 0, "fan-status": 1 }
+        oneOf:
+          - type: integer
+            minimum: 0
+            maximum: 65535
+            description: Holding register address (0-based), read as uint16.
+          - $ref: "#/components/schemas/ModbusPoint"
+      example:
+        zone-temp: 0
+        discharge-air-temp: { "register": 2, "type": "float32", "scale": 1.8, "offset": 32, "unit": "°F" }
+        zone-temp-sp: { "register": 4, "type": "int16", "scale": 0.1, "unit": "°F", "writable": true }
+        outside-air-temp: { "register": 0, "function": "input", "type": "int16", "scale": 0.1, "unit": "°C" }
+        fan-cmd: { "register": 0, "function": "coil", "writable": true }
+    ModbusPoint:
+      type: object
+      required: [register]
+      additionalProperties: false
+      description: >-
+        One Modbus point. Unknown fields, and options that don't apply to
+        the function (type/order/scale/offset on a coil or discrete input,
+        `writable` on an input register or discrete input, `word_order` on a
+        16-bit type), are refused with a 400 rather than ignored. The
+        published value is `raw * scale + offset`; coils and discrete inputs
+        publish `true`/`false`.
+      properties:
+        register:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: >-
+            0-based protocol address, not the 1-based "Modicon" number some
+            register maps print: holding register 40001 is `register: 0`,
+            input register 30010 is `function: input, register: 9`, coil
+            00001 is `function: coil, register: 0`. A 32-bit type spans
+            `register` and `register + 1`.
+        function:
+          type: string
+          enum: [holding, input, coil, discrete]
+          default: holding
+          description: Read with FC3 (holding), FC4 (input registers), FC1 (coils) or FC2 (discrete inputs).
+        type:
+          type: string
+          enum: [int16, uint16, int32, uint32, float32]
+          default: uint16
+          description: Register types only.
+        word_order:
+          type: string
+          enum: [big, little]
+          default: big
+          description: 32-bit types only. `big` = high word in the lower register (Modbus convention); `little` = word-swapped.
+        byte_order:
+          type: string
+          enum: [big, little]
+          default: big
+          description: Byte order within each 16-bit register. `little` = byte-swapped.
+        scale:
+          type: number
+          default: 1
+          not: { const: 0 }
+        offset:
+          type: number
+          default: 0
+        unit:
+          type: string
+          minLength: 1
+          description: Haystack unit, published as the point's `unit` tag. Don't also name this point in the connection's `units`.
+        writable:
+          type: boolean
+          default: false
+          description: >-
+            Holding registers and coils only. Tags the point `writable` so
+            Baler accepts a pointWrite to it, and lets `POST /write` /
+            `point_write` command it (FC6 for one register, FC16 for two,
+            FC5 for a coil).
     CreateModbusConnectionRequest:
       type: object
       required: [host, topic_prefix, points]
@@ -908,7 +1004,7 @@ components:
           $ref: "#/components/schemas/ModbusPoints"
         units:
           type: object
-          description: Optional Haystack unit symbol per point label (a register is just a number). Published as each point's `unit` tag on `{topic_prefix}/{label}/tags`.
+          description: Optional Haystack unit symbol per point label (a register is just a number). Published as each point's `unit` tag on `{topic_prefix}/{label}/tags`. A point object can carry its own `unit` instead; naming one point in both is a 400.
           additionalProperties:
             type: string
           example: { "zone-temp": "°F" }
@@ -925,6 +1021,17 @@ components:
               type: string
             credential:
               $ref: "#/components/schemas/RedactedCredential"
+            write_levels:
+              type: object
+              description: >-
+                Read-only. The priority levels commanded on each writable
+                point through `POST /write`, as `{label: {level: value}}`
+                (levels as strings). Modbus devices have no priority array,
+                so Windrow keeps this one and writes the highest level's
+                value. Absent when nothing is commanded.
+              additionalProperties:
+                type: object
+                additionalProperties: {}
         - $ref: "#/components/schemas/CreateModbusConnectionRequest"
     UpdateConnectionRequest:
       type: object
@@ -950,6 +1057,11 @@ components:
       properties:
         points:
           $ref: "#/components/schemas/ModbusPoints"
+        units:
+          type: object
+          description: "Replaces the `{label: unit}` map."
+          additionalProperties:
+            type: string
         poll_interval:
           type: number
           exclusiveMinimum: 0

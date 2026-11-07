@@ -92,3 +92,54 @@ def test_update_republishes_tags_and_keeps_surviving_units(manager):
     assert "unit" not in client.published["fbf/home/mb2/zone_temp/tags"]
     with pytest.raises(ValueError):
         asyncio.run(mgr.update_connection(rec["id"], {"units": {"nope": "°F"}}))
+
+
+def test_point_objects_publish_unit_writable_and_site_route(tmp_path, monkeypatch):
+    """Baler#128: a point object's own unit and writable flag reach its
+    tags, and with the command channel on the equipment record names the
+    site/instance Baler routes its pointWrite to."""
+    client = FakeMqttClient()
+    mgr = mcm.ModbusConnectionManager(client, str(tmp_path / "m.json"), site_id="site-a", instance_id="i1")
+
+    async def no_poll(record):
+        mgr.tasks[record["id"]] = None
+
+    monkeypatch.setattr(mgr, "_start_poll_task", no_poll)
+    asyncio.run(mgr.create_connection(host="h", topic_prefix="fbf/x", points={
+        "zone_temp_sp": {"register": 4, "type": "int16", "scale": 0.1, "unit": "°F", "writable": True},
+        "discharge_air_temp": {"register": 2, "type": "float32"},
+    }, units={"discharge_air_temp": "°C"}))
+    assert client.published["fbf/x/zone_temp_sp/tags"]["unit"] == "°F"
+    assert client.published["fbf/x/zone_temp_sp/tags"]["writable"] is True
+    assert client.published["fbf/x/discharge_air_temp/tags"]["unit"] == "°C"
+    assert "writable" not in client.published["fbf/x/discharge_air_temp/tags"]
+    assert client.published["fbf/x/equip/tags"]["tags"] == {"windrowSite": "site-a", "windrowInstance": "i1"}
+
+
+@pytest.mark.parametrize("points, units", [
+    ({"t": {"register": 1, "unit": "°F"}}, {"t": "°C"}),  # unit in two places
+    ({"t": {"register": 1, "type": "double"}}, None),
+    ({"t": "1"}, None),
+    ({"t#": 1}, None),
+    ({}, None),
+])
+def test_bad_points_are_rejected_at_create(manager, points, units):
+    mgr, _ = manager
+    with pytest.raises(ValueError):
+        asyncio.run(mgr.create_connection(host="h", topic_prefix="fbf/x", points=points, units=units))
+    assert mgr.connections == {}
+
+
+def test_update_keeps_write_levels_only_for_surviving_writable_points(manager):
+    mgr, _ = manager
+    rec = asyncio.run(mgr.create_connection(host="h", topic_prefix="fbf/x", points={
+        "a": {"register": 1, "writable": True}, "b": {"register": 2, "writable": True}, "c": 3,
+    }, units={"a": "°F"}))
+    mgr.connections[rec["id"]]["write_levels"] = {"a": {"8": 70}, "b": {"8": 1}}
+    out = asyncio.run(mgr.update_connection(rec["id"], {"points": {
+        "a": {"register": 1, "writable": True, "unit": "°C"}, "b": 2,
+    }}))
+    assert out["write_levels"] == {"a": {"8": 70}}
+    assert "units" not in out  # a's unit moved onto the point; the old map entry is dropped, not a conflict
+    out = asyncio.run(mgr.update_connection(rec["id"], {"points": {"b": 2}}))
+    assert "write_levels" not in out
