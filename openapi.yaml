@@ -415,6 +415,43 @@ paths:
                 $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/ServerError"
+  /connections/{id}/alarms:
+    get:
+      operationId: getConnectionAlarms
+      summary: The connection's device's active alarms, read now (GetEventInformation)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Every object on the device not in a normal event state, or with a transition not yet acknowledged.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [object, event_state]
+                  properties:
+                    object: { type: string, example: "analog-value,1" }
+                    event_state: { type: string, example: high-limit }
+                    acked:
+                      type: object
+                      properties:
+                        to_offnormal: { type: boolean }
+                        to_fault: { type: boolean }
+                        to_normal: { type: boolean }
+                    notify_type: { type: string, example: alarm }
+                    timestamps: { type: array, items: { type: ["string", "null"] } }
+        "404":
+          description: No connection with that id.
+        "504":
+          $ref: "#/components/responses/Timeout"
+        "500":
+          $ref: "#/components/responses/ServerError"
   /connections/{id}/schedules:
     get:
       operationId: getConnectionSchedules
@@ -1175,6 +1212,26 @@ components:
               name: { type: ["string", "null"] }
               present_value: { type: boolean }
               dates: { type: array, items: { $ref: "#/components/schemas/SchedulePeriod" } }
+    AlarmEvent:
+      type: object
+      description: >-
+        The `value` of a message on `{topic_prefix}/{label}/alarm` (retained).
+        From an EventNotification, or - with `source: summary` and
+        `event_state` instead of the transition fields - from the
+        GetEventInformation read when the connection starts.
+      properties:
+        object: { type: string, example: "analog-value,1" }
+        device: { type: ["string", "null"], example: "device,3456" }
+        event_type: { type: ["string", "null"], example: out-of-range }
+        from_state: { type: ["string", "null"], example: normal }
+        to_state: { type: ["string", "null"], example: high-limit }
+        notify_type: { type: ["string", "null"], example: alarm }
+        priority: { type: ["integer", "null"], example: 3 }
+        ack_required: { type: ["boolean", "null"] }
+        message: { type: ["string", "null"] }
+        notification_class: { type: ["integer", "null"], example: 1 }
+        device_timestamp: { type: ["string", "null"], description: "The device's own timestamp: a date-time, a time of day, or `#n` for a sequence number." }
+        ts: { type: number, description: When Windrow received it (unix seconds). }
     CreateConnectionRequest:
       type: object
       required: [device_address, device_instance, topic_prefix, points]
@@ -1250,6 +1307,21 @@ components:
           exclusiveMinimum: 0
           default: 300
           description: Seconds between the safety-net polls of a point whose COV subscription is live.
+        forward_alarms:
+          type: boolean
+          default: false
+          description: >-
+            Forward the device's intrinsic-reporting alarms (Baler#164).
+            Windrow adds itself to the recipient-list of every
+            notification-class object on the device (this changes the
+            controller's configuration, hence opt-in), re-checks that every
+            WINDROW_ALARM_REFRESH seconds (default 3600), and reads the active
+            alarms at start. Each event notification is published retained on
+            `{topic_prefix}/{label}/alarm` for a point of this connection, or
+            `{topic_prefix}/alarms/{type}-{instance}` for another object, as
+            the usual `{point, value, ts}` envelope whose `value` is the
+            event (see AlarmEvent). Turning it off or deleting the connection
+            removes Windrow's recipient entries again.
         backfill_window:
           type: number
           minimum: 0
@@ -1633,6 +1705,8 @@ components:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/cov_lifetime"
         cov_poll_interval:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/cov_poll_interval"
+        forward_alarms:
+          $ref: "#/components/schemas/CreateConnectionRequest/properties/forward_alarms"
         backfill_window:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/backfill_window"
     UpdateModbusConnectionRequest:

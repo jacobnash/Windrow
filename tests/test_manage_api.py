@@ -404,6 +404,12 @@ def test_every_action_tolerates_the_full_command_envelope(harness, monkeypatch):
 
     monkeypatch.setattr(connection_manager.bacnet_schedules, "read_device_schedules", fake_schedules)
 
+    async def fake_alarms(connection_id):
+        calls["connection_alarms"] = connection_id
+        return []
+
+    monkeypatch.setattr(harness.manager, "active_alarms", fake_alarms)
+
     bacnet = harness.send({"action": "create_connection", **BACNET_CONN})["result"]
     modbus = harness.send({"action": "modbus_create_connection", **MODBUS_CONN})["result"]
     device = harness.send({"action": "add_device", "protocol": "modbus", "host": "10.0.0.7"})["result"]
@@ -423,6 +429,7 @@ def test_every_action_tolerates_the_full_command_envelope(harness, monkeypatch):
         "list_connections": {},
         "read_schedules": {"device_address": "10.0.0.5", "device_instance": 5},
         "connection_schedules": {"id": bacnet["id"]},
+        "connection_alarms": {"id": bacnet["id"]},
         "create_connection": {**BACNET_CONN, "topic_prefix": "fbf/ahu-2"},
         "update_connection": {"id": bacnet["id"], "poll_interval": 9},
         "modbus_list_connections": {},
@@ -450,6 +457,7 @@ def test_every_action_tolerates_the_full_command_envelope(harness, monkeypatch):
     assert calls["discover"] == {}
     assert calls["discover_routers"] == (5, 1)
     assert [c[:2] for c in calls["schedules"]] == [("10.0.0.5", 5), (BACNET_CONN["device_address"], BACNET_CONN["device_instance"])]
+    assert calls["connection_alarms"] == bacnet["id"]
     assert calls["point_write"] == expires_at  # the one action that takes it
 
 

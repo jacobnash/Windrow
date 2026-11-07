@@ -277,6 +277,38 @@ same as `read_schedules` and `connection_schedules`.
 calendar exception and an early close on the fourth Thursday of November) driving the first binary
 object, and `calendar,1`.
 
+## 3f. Alarms (intrinsic reporting)
+
+With `"forward_alarms": true` on a connection, a controller's own alarms -
+an analog point past its high/low limit, a binary point in its alarm state,
+a fault - reach Baler:
+
+- Windrow adds itself (its address, or its device id for a device behind a
+  router) to the recipient-list of every `notification-class` object on the
+  device, for all three transitions, as confirmed notifications. This
+  changes the controller's configuration, which is why it's opt-in. It
+  re-checks every `WINDROW_ALARM_REFRESH` seconds (default 3600), so a
+  controller restored from a backup gets the entry back. Turning
+  `forward_alarms` off, or deleting the connection, removes the entry.
+- Each event notification is published, retained, on
+  `{topic_prefix}/{label}/alarm` when the object is one of the connection's
+  points, else on `{topic_prefix}/alarms/{type}-{instance}`. The `value` is
+  the event: `object`, `event_type`, `from_state`, `to_state`,
+  `notify_type`, `priority`, `ack_required`, `message`, `device_timestamp`,
+  and `ts` (when Windrow got it).
+- When the connection starts (including after a restart), the device's
+  active alarms are read with GetEventInformation and published the same
+  way, with `source: "summary"` and `event_state`. That way an alarm raised
+  while Windrow was down isn't missed.
+- `GET /connections/{id}/alarms` (command `connection_alarms`) reads the
+  active alarms on demand.
+
+Baler doesn't ingest `/alarm` topics into its alarm console yet; that's a
+Baler change. `python -m windrow.mock_device --intrinsic-reporting` makes
+the mock's analog objects alarm 10 either side of their start value, through
+notification-class,1. Write present-value past a limit at priority 8 to
+raise an alarm, and relinquish it to clear the alarm.
+
 ## 4. List / delete
 
 ```
