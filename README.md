@@ -1,4 +1,4 @@
-# Windrow — Windrow
+# Windrow
 
 Bridges BACnet devices to MQTT. No Fantom, no license fee, no walled garden.
 
@@ -13,7 +13,43 @@ already knows how to ingest. No native Haxall connector, no Fantom code.
 
 ## Status
 
-Early scaffold. See `plan.md` for the phased build plan.
+Windrow runs in production behind [Baler](https://github.com/jacobnash/Baler),
+which pins it as a git submodule.
+
+**Works today:**
+
+- **BACnet/IP reads**: polls `present-value` per point on a fixed interval
+  (`windrow.connection_manager`) and publishes to MQTT.
+- **BACnet writes**: `WriteProperty(present-value)` at priority 1-16, with
+  relinquish and timed overrides, from the HTTP API or Baler's command
+  channel.
+- **Modbus TCP reads**: holding registers, one 16-bit register per point
+  (`windrow.modbus_connection_manager`).
+- **Discovery**: periodic BACnet Who-Is and Modbus subnet scans, a registry
+  of every device seen, and optional per-device credentials
+  ([docs/periodic-discovery-and-credentials.md](docs/periodic-discovery-and-credentials.md)).
+- **Command channel**: Baler can trigger scans, learn device point lists and
+  write points on a site over the same outbound MQTT connection
+  ([docs/command-channel.md](docs/command-channel.md)).
+- **Raspberry Pi edge nodes**: `deploy/pi/install-edge.sh` sets up a Pi as a
+  gateway (or as a mock BACnet/Modbus/weather device). Readings taken while
+  the broker is unreachable are spooled to disk and replayed on reconnect ([docs/edge-nodes.md](docs/edge-nodes.md)).
+- **Haystack servers as a source** (nhaystack, SkySpark, Haxall)
+  ([docs/haystack-source.md](docs/haystack-source.md)).
+
+**Not yet** (tracked in Baler's issue tracker):
+
+- BACnet across subnets and MS/TP: no BBMD, foreign-device registration or
+  router support, so Windrow only sees devices on its own broadcast domain
+  (jacobnash/Baler#126).
+- ReadPropertyMultiple and COV subscriptions: one ReadProperty per point,
+  poll only (jacobnash/Baler#127).
+- Modbus beyond holding registers: no input registers, coils, 32-bit/float
+  data types, scale/offset, word order, or writes (jacobnash/Baler#128).
+- BACnet trend logs, alarms (intrinsic reporting) and schedules
+  (jacobnash/Baler#129).
+
+Adding a new connector kind: [docs/adding-a-new-source.md](docs/adding-a-new-source.md).
 
 ## Setup
 
@@ -44,7 +80,7 @@ python -m windrow.mock_hospital provision --device-address 192.168.128.63:47808 
 
 (Adjust `--address`/`--device-address` to your own host's interface -
 they're bacpypes3's own local-BACnet-address arg, same as
-`docs/bacnet-discovery-api.md`.) From there, baler's
+`docs/bacnet-discovery-api.md`.) From there, Baler's
 `mqtt_listener.py` picks the readings/tags up unchanged.
 
 `windrow.api` also runs periodic BACnet/Modbus discovery on its own and tracks
@@ -58,6 +94,6 @@ trigger a scan remotely, over the same outbound MQTT connection - see
 ## License
 
 AGPLv3 — see [LICENSE](LICENSE). Same terms as
-[Baler](https://github.com/jacobnash/baler): self-host
+[Baler](https://github.com/jacobnash/Baler): self-host
 freely, but a modified version run as a network service for others must
 make its source available to them too.
