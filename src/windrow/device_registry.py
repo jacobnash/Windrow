@@ -24,6 +24,7 @@ import asyncio
 import time
 
 from windrow import (
+    bacnet_network,
     connection_store,
     default_credential_check,
     discovery,
@@ -118,19 +119,21 @@ class DeviceRegistry:
 
     def _add_bacnet(self, body: dict, connections: list[dict]) -> dict:
         address = connection_store.check_text("device_address", body.get("device_address")).strip()
+        bacnet_network.parse_device_address(address)  # a routed net:mac is fine; a broadcast or garbage isn't
         instance = connection_store.check_int("device_instance", body.get("device_instance"), 0, MAX_BACNET_INSTANCE)
         # Discovery reports a bare host when the device answers on the
         # standard port; keep a non-standard one, since that's the only
         # way "Create connection" can reach the device later.
         host, _, port = address.partition(":")
-        if port == str(BACNET_PORT):
+        if port == str(BACNET_PORT) and "." in host:  # not a routed net:mac
             address = host
         existing = self._find("bacnet", (instance, address))
         if existing is not None:
             return existing
         connection_id = next(
             (c["id"] for c in connections
-             if c.get("device_instance") == instance and c.get("device_address", "").split(":")[0] == host),
+             if c.get("device_instance") == instance
+             and bacnet_network.address_key(c.get("device_address", "")) == bacnet_network.address_key(address)),
             None,
         )
         now = time.time()
@@ -198,13 +201,14 @@ class DeviceRegistry:
             # device_address is whatever a human typed when creating it and
             # commonly does include one (e.g. "192.168.128.63:47808",
             # matching every worked example in this codebase) - stripped
-            # here so both sides of the key compare on host alone.
+            # here so both sides of the key compare on host alone. A routed
+            # `net:mac` address is kept whole (bacnet_network.address_key).
             connection_by_key = {
-                (c["device_instance"], c["device_address"].split(":")[0]): c["id"] for c in connections
+                (c["device_instance"], bacnet_network.address_key(c["device_address"])): c["id"] for c in connections
             }
             now = time.time()
             for device in devices:
-                key = (device["device_instance"], device["address"])
+                key = (device["device_instance"], bacnet_network.address_key(device["address"]))
                 existing = self._find("bacnet", key)
                 connection_id = connection_by_key.get(key)
 
@@ -304,7 +308,10 @@ class DeviceRegistry:
     def _find(self, protocol: str, key: tuple) -> dict | None:
         if protocol == "bacnet":
             for record in self.records.values():
-                if record["protocol"] == "bacnet" and (record["device_instance"], record["address"]) == key:
+                if record["protocol"] == "bacnet" and (
+                    (record["device_instance"], bacnet_network.address_key(record["address"]))
+                    == (key[0], bacnet_network.address_key(key[1]))
+                ):
                     return record
         else:
             for record in self.records.values():
@@ -332,9 +339,9 @@ class DeviceRegistry:
             found = await discovery.discover_devices(app)
         except Exception as exc:  # noqa: BLE001 - try the directed probes anyway
             print(f"bacnet scan: broadcast Who-Is failed: {exc!r}")
-        heard = {d["address"].split(":")[0] for d in found}
+        heard = {bacnet_network.address_key(d["address"]) for d in found}
         targets = sorted({c["device_address"] for c in connections
-                          if c.get("device_address") and c["device_address"].split(":")[0] not in heard})
+                          if c.get("device_address") and bacnet_network.address_key(c["device_address"]) not in heard})
         directed = 0
         for address in targets:
             try:

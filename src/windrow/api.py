@@ -31,7 +31,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
-from windrow import credentials, legacy, modbus_discovery, mqtt_sink, tracing
+from windrow import (
+    bacnet_network,
+    connection_store,
+    credentials,
+    legacy,
+    modbus_discovery,
+    mqtt_sink,
+    tracing,
+)
 from windrow.connection_manager import ConnectionManager
 from windrow.device_registry import DeviceRegistry
 from windrow.modbus_connection_manager import ModbusConnectionManager
@@ -78,6 +86,19 @@ def _encrypt_credential(credential) -> dict:
 # credentials already redacted the way every HTTP GET redacts them.
 async def handle_discover(manager: ConnectionManager, body: dict) -> list:
     return await manager.discover(**body)
+
+
+async def handle_discover_routers(manager: ConnectionManager, body: dict) -> list:
+    """Who-Is-Router-To-Network: {network?, timeout?} -> [{address, networks}]."""
+    network = body.get("network")
+    if network is not None and (isinstance(network, bool) or not isinstance(network, int) or not 1 <= network <= 65534):
+        raise ValueError(f"network must be a BACnet network number 1-65534, got {network!r}")
+    timeout = connection_store.check_number("timeout", body.get("timeout", 5.0))
+    return await bacnet_network.discover_routers(manager.app, network=network, timeout=timeout)
+
+
+async def handle_network_status(manager: ConnectionManager, body: dict | None = None) -> dict:
+    return bacnet_network.network_status(manager.app)
 
 
 async def handle_learn(manager: ConnectionManager, body: dict) -> list:
@@ -353,6 +374,10 @@ def make_handler(
                 self._route("api.post_discover", lambda body: handle_discover(manager, body), count=True)
                 return
 
+            if self.path == "/discover/routers":
+                self._route("api.post_discover_routers", lambda body: handle_discover_routers(manager, body), count=True)
+                return
+
             if self.path == "/write":
                 self._route("api.post_write", lambda body: handle_point_write(manager, body))
                 return
@@ -463,6 +488,10 @@ def make_handler(
                 self._route("api.get_devices", lambda _: handle_list_devices(device_registry), body={}, count=True)
                 return
 
+            if self.path == "/bacnet/network":
+                self._route("api.get_bacnet_network", lambda _: handle_network_status(manager), body={})
+                return
+
             if self.path == "/openapi.yaml":
                 with tracer.start_as_current_span("api.get_openapi_spec"):
                     with open(OPENAPI_SPEC_PATH, "rb") as f:
@@ -566,6 +595,8 @@ def _make_on_command(
     """
     handlers = {
         "discover": lambda body: handle_discover(manager, body),
+        "discover_routers": lambda body: handle_discover_routers(manager, body),
+        "network_status": lambda body: handle_network_status(manager, body),
         "learn": lambda body: handle_learn(manager, body),
         "modbus_discover": lambda body: handle_modbus_discover(body),
         "point_write": lambda body: handle_point_write(manager, body),
@@ -655,6 +686,13 @@ def offline_payload(site_id: str, instance_id: str) -> str:
     return json.dumps({"online": False, "site_id": site_id, "instance_id": instance_id})
 
 
+def _network_summary(manager) -> dict:
+    """Mode and, for a foreign device, whether the BBMD took the registration
+    - the one BBMD fact worth seeing from Baler without asking."""
+    status = bacnet_network.network_status(getattr(manager, "app", None))
+    return {k: status[k] for k in ("mode", "bbmd", "registration") if k in status}
+
+
 def build_status(site_id: str, instance_id: str, started_at: str, manager, modbus_manager, device_registry) -> dict:
     devices = device_registry.list()
     return {
@@ -665,6 +703,7 @@ def build_status(site_id: str, instance_id: str, started_at: str, manager, modbu
         "started_at": started_at,
         "ts": _now_iso(),
         "bacnet_connections": len(manager.connections),
+        "bacnet_network": _network_summary(manager),
         "modbus_connections": len(modbus_manager.connections),
         "devices": len(devices),
         "pending_devices": sum(1 for d in devices if d.get("status") == "pending"),
@@ -722,6 +761,11 @@ def _crash_logger(task_name: str):
 async def async_main(args) -> None:
     app = Application.from_args(args)
     await asyncio.sleep(1)  # let transport setup finish, same as bridge.py
+    if getattr(args, "foreign", None):
+        print(f"BACnet: foreign device of BBMD {args.foreign}, ttl {args.ttl}s - "
+              f"registration {bacnet_network.network_status(app).get('registration')}")
+    elif getattr(args, "bbmd", None) is not None:
+        print(f"BACnet: acting as a BBMD, BDT {args.bbmd or '(no peers)'}")
 
     loop = asyncio.get_event_loop()
 
@@ -845,6 +889,7 @@ def main() -> None:
         "No default - periodic Modbus scanning only runs against subnets an operator explicitly configures.",
     )
     parser.add_argument("--modbus-scan-interval", type=float, default=600.0)
+    bacnet_network.add_network_args(parser)
     args = parser.parse_args()
     for attr in ("state_file", "modbus_state_file", "devices_state_file"):
         legacy.adopt_state_file(getattr(args, attr))
