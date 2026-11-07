@@ -33,7 +33,7 @@ from windrow import (
     mqtt_sink,
     tracing,
 )
-from windrow.bacnet_read import read_present_value, read_present_values
+from windrow.bacnet_read import READ_TIMEOUT, read_present_value, read_present_values
 from windrow.bacnet_values import normalize_value
 from windrow.poll_status import PollStatus
 
@@ -258,6 +258,10 @@ def _object_type(object_identifier: str) -> str:
 # waiting out its APDU timeout and retrying at once - starved the loop
 # until every API call timed out.
 MAX_CONCURRENT_READS = int(os.environ.get("WINDROW_MAX_CONCURRENT_READS", "16"))
+# Seconds a point write may take before it counts as failed (TimeoutError:
+# a 504 over HTTP, ok:false on the command channel). Same reasoning as
+# bacnet_read.READ_TIMEOUT.
+WRITE_TIMEOUT = float(os.environ.get("WINDROW_WRITE_TIMEOUT", "10"))
 # A point whose reads keep failing backs off up to this long between tries.
 MAX_FAILURE_BACKOFF = 300.0
 # After this many failures in a row to a routed (net:mac) device, forget the
@@ -486,18 +490,34 @@ class ConnectionManager:
             if obj_type not in COMMANDABLE_TYPES:
                 raise PointWriteError(f"{topic} is a {obj_type}, which is not commandable")
             bacnet_value = _to_bacnet(value, obj_type)
-            if priority == 17:
-                await self.app.write_property(
-                    record["device_address"], point["object_identifier"], "relinquish-default", bacnet_value
-                )
-            else:
-                await self.app.write_property(
-                    record["device_address"], point["object_identifier"], "present-value", bacnet_value, priority=priority
-                )
-            present = normalize_value(
-                await self.app.read_property(record["device_address"], point["object_identifier"], "present-value")
-            )
-            mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], present)
+            address, objid = record["device_address"], point["object_identifier"]
+            # bacpypes3 raises a device's Error/Reject/Abort answer, and those
+            # are BaseExceptions: uncaught, a refused write (write-access-
+            # denied, value-out-of-range, unknown-object) got past the API's
+            # `except Exception` - the HTTP client got no answer, and on the
+            # command channel it escaped into paho's network thread. It also
+            # had no timeout (Baler#84: a request to a device that stopped
+            # answering never returns).
+            try:
+                if priority == 17:
+                    write = self.app.write_property(address, objid, "relinquish-default", bacnet_value)
+                else:
+                    write = self.app.write_property(address, objid, "present-value", bacnet_value, priority=priority)
+                await asyncio.wait_for(write, WRITE_TIMEOUT)
+            except ErrorRejectAbortNack as answer:
+                span.set_attribute("error", str(answer))
+                raise PointWriteError(f"the device refused the write to {topic}: {answer}") from None
+            # The read-back is a courtesy (curVal without waiting for the next
+            # poll): if it fails, the write still happened - report it, publish
+            # nothing, and let the poll catch up.
+            try:
+                raw = await asyncio.wait_for(self.app.read_property(address, objid, "present-value"), READ_TIMEOUT)
+            except (Exception, ErrorRejectAbortNack) as exc:  # noqa: BLE001 - no read-back is not a failed write
+                span.set_attribute("readback_error", repr(exc))
+                raw = None
+            present = None if raw is None or isinstance(raw, (ErrorRejectAbortNack, ErrorType)) else normalize_value(raw)
+            if present is not None:
+                mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], present)
             return {"topic": topic, "priority": priority, "value": value, "present_value": present}
 
     async def delete_connection(self, connection_id: str) -> bool:

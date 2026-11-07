@@ -6,6 +6,9 @@ identifier. Real BACnet client calls via bacpypes3's Application, no
 protocol code of our own.
 """
 
+import asyncio
+import os
+
 from bacpypes3.apdu import AbortPDU, ErrorRejectAbortNack
 from bacpypes3.app import Application
 from bacpypes3.basetypes import ErrorType
@@ -16,6 +19,10 @@ from windrow import bacnet_network, tracing
 from windrow.bacnet_values import normalize_value
 
 tracer = tracing.get_tracer(__name__)
+
+# The object-list read can be long (a segmented answer from a big
+# controller), so more time than a single point read; but bounded (Baler#84).
+LEARN_TIMEOUT = float(os.environ.get("WINDROW_LEARN_TIMEOUT", "60"))
 
 LEARN_PROPERTIES = ["object-name", "present-value", "units", "description"]
 # Objects per ReadPropertyMultiple. One request for a whole big device came
@@ -139,7 +146,13 @@ async def learn_points(app: Application, device_address: str, device_instance: i
         # ObjectType also doesn't compare equal to a plain str directly
         # (`obj_id[0] == "device"` is always False, confirmed live) - str()
         # it first.
-        object_list = await app.read_property(device_address, f"device,{device_instance}", "object-list")
+        try:
+            object_list = await asyncio.wait_for(
+                app.read_property(device_address, f"device,{device_instance}", "object-list"), LEARN_TIMEOUT
+            )
+        except ErrorRejectAbortNack as exc:
+            # a BaseException in bacpypes3 - an ordinary error here, like _read_batch's
+            raise RuntimeError(f"{device_address} refused reading device,{device_instance}'s object-list: {exc}") from None
         object_ids = [ObjectIdentifier(obj_id) for obj_id in object_list if str(obj_id[0]) != "device"]
 
         if not object_ids:

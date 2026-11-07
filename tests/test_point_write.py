@@ -162,3 +162,132 @@ def test_mock_device_objects_are_commandable():
         assert obj.presentValue == 65.0
 
     asyncio.run(go())
+
+
+# --- a device that refuses or doesn't answer (bacpypes3 raises those answers
+# as BaseExceptions, which used to get past every `except Exception`) ---
+
+
+def _refusal(service="writeProperty", code="writeAccessDenied"):
+    from bacpypes3.apdu import ConfirmedServiceChoice, Error
+
+    return Error(service_choice=getattr(ConfirmedServiceChoice, service), errorClass="property", errorCode=code)
+
+
+class RefusingApp(FakeApp):
+    def __init__(self, refuse_write=True, refuse_read=False, hang=False):
+        super().__init__()
+        self.refuse_write, self.refuse_read, self.hang = refuse_write, refuse_read, hang
+
+    async def write_property(self, address, objid, prop, value, priority=None):
+        if self.hang:
+            await asyncio.sleep(3600)
+        if self.refuse_write:
+            raise _refusal()
+        await super().write_property(address, objid, prop, value, priority)
+
+    async def read_property(self, address, objid, prop):
+        if self.refuse_read:
+            raise _refusal("readProperty", "unknownObject")
+        return await super().read_property(address, objid, prop)
+
+
+def test_a_refused_write_is_a_point_write_error_with_the_devices_reason(tmp_path):
+    m = _manager(tmp_path)
+    m.app = RefusingApp()
+    with pytest.raises(cm.PointWriteError, match="refused the write.*write-access-denied"):
+        asyncio.run(m.write_point("fbf/hq/ahu-1/zone-sp", 72.5, 8))
+    assert m.mqtt_client.published == []
+
+
+def test_a_write_the_device_never_answers_times_out(tmp_path, monkeypatch):
+    monkeypatch.setattr(cm, "WRITE_TIMEOUT", 0.05)
+    m = _manager(tmp_path)
+    m.app = RefusingApp(refuse_write=False, hang=True)
+    with pytest.raises(TimeoutError):
+        asyncio.run(m.write_point("fbf/hq/ahu-1/zone-sp", 72.5, 8))
+
+
+def test_a_failed_read_back_still_reports_the_write(tmp_path):
+    m = _manager(tmp_path)
+    m.app = RefusingApp(refuse_write=False, refuse_read=True)
+    out = asyncio.run(m.write_point("fbf/hq/ahu-1/zone-sp", 72.5, 8))
+    assert m.app.writes and out["present_value"] is None
+    assert m.mqtt_client.published == []  # no read-back, nothing published; the poll catches up
+
+
+def test_command_channel_reports_a_refused_write_and_keeps_going(tmp_path):
+    m = _manager(tmp_path)
+    m.app = RefusingApp()
+    loop = asyncio.new_event_loop()
+    import threading
+
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    try:
+        on_command = api._make_on_command(m, loop, "site-a", "i1")
+        replies = FakeMqtt()
+
+        class Msg:
+            topic = "cmd/site-a/i1/point-write"
+            payload = json.dumps({"action": "point_write", "request_id": "r1", "topic": "fbf/hq/ahu-1/zone-sp",
+                                  "value": 71.0, "priority": 8}).encode()
+
+        on_command(replies, None, Msg())  # must not raise into paho's thread
+        out = json.loads(replies.published[-1][1])
+        assert out["ok"] is False and "write-access-denied" in out["error"] and out["request_id"] == "r1"
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+def test_command_channel_turns_a_raw_device_error_into_ok_false(tmp_path, monkeypatch):
+    """Belt and braces: a handler that lets a bacpypes3 answer through."""
+    async def leaky(*args):
+        raise _refusal()
+
+    monkeypatch.setattr(api, "handle_point_write", leaky)
+    m = _manager(tmp_path)
+    loop = asyncio.new_event_loop()
+    import threading
+
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    try:
+        on_command = api._make_on_command(m, loop, "site-a", "i1")
+        replies = FakeMqtt()
+
+        class Msg:
+            topic = "cmd/site-a/i1/point-write"
+            payload = json.dumps({"action": "point_write", "topic": "fbf/hq/ahu-1/zone-sp", "value": 1, "priority": 8}).encode()
+
+        on_command(replies, None, Msg())
+        out = json.loads(replies.published[-1][1])
+        assert out["ok"] is False and out["error"].startswith("the device answered:")
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+def test_http_turns_a_raw_device_error_into_a_502(tmp_path, monkeypatch):
+    import threading
+    import urllib.error
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    async def leaky(*args):
+        raise _refusal()
+
+    monkeypatch.setattr(api, "handle_point_write", leaky)
+    m = _manager(tmp_path)
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), api.make_handler(m, None, None, loop))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}/write",
+                                     data=json.dumps({"topic": "fbf/hq/ahu-1/zone-sp", "value": 1, "priority": 8}).encode(),
+                                     method="POST", headers={"Content-Type": "application/json"})
+        with pytest.raises(urllib.error.HTTPError) as info:
+            urllib.request.urlopen(req, timeout=5)
+        assert info.value.code == 502
+        assert "the device answered" in json.loads(info.value.read())["error"]
+    finally:
+        server.shutdown()
+        loop.call_soon_threadsafe(loop.stop)
