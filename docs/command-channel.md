@@ -76,6 +76,13 @@ echoed). An unknown (or missing) `action` gets an `{"ok": false, "error":
 "unknown action ..."}` result too; only a payload that isn't a JSON object
 is dropped without one.
 
+The envelope fields - `action`, `id`, `request_id` and `expires_at` - are
+stripped before the action runs, for every action, so they never reach it as
+parameters. The exceptions are the ones that are parameters: a targeted
+action's `id` (below), and `point_write`'s `expires_at` (a write that arrives
+after it is refused, not applied late). `discover` takes only `low_limit`,
+`high_limit`, `address` and `timeout`; other fields are ignored.
+
 For the actions that act on one device or connection (`set_device_status`,
 `recheck_credentials`, `update_connection`, `delete_connection`, their
 `modbus_*` twins, `set_credential` and `get_job`), `id` is the id of that device or

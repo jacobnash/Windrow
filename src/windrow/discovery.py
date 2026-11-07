@@ -19,6 +19,16 @@ tracer = tracing.get_tracer(__name__)
 LEARN_PROPERTIES = ["object-name", "present-value", "units", "description"]
 
 
+# What discover_devices() takes. Anything else in a request body - a command
+# envelope's expires_at, a caller's bookkeeping - is dropped rather than
+# splatted in as a keyword it doesn't know (Baler#140).
+DISCOVER_PARAMS = ("low_limit", "high_limit", "address", "timeout")
+
+
+def discover_params(body: dict) -> dict:
+    return {k: body[k] for k in DISCOVER_PARAMS if k in body}
+
+
 async def discover_devices(
     app: Application,
     low_limit: int | None = None,

@@ -35,6 +35,7 @@ from bacpypes3.argparse import SimpleArgumentParser
 from windrow import credentials, legacy, modbus_discovery, mqtt_sink, tracing
 from windrow.connection_manager import ConnectionManager
 from windrow.device_registry import DeviceRegistry
+from windrow.discovery import discover_params
 from windrow.jobs import JobRunner
 from windrow.modbus_connection_manager import ModbusConnectionManager
 
@@ -90,7 +91,7 @@ def _encrypt_credential(credential) -> dict:
 # request body as a dict and returns something JSON-serializable, with
 # credentials already redacted the way every HTTP GET redacts them.
 async def handle_discover(manager: ConnectionManager, body: dict) -> list:
-    return await manager.discover(**body)
+    return await manager.discover(**discover_params(body))
 
 
 async def handle_learn(manager: ConnectionManager, body: dict) -> list:
@@ -616,6 +617,22 @@ TARGETED_ACTIONS = {
 }
 
 
+# The command channel's own fields, around every action's parameters: the
+# action name, the correlation ids, and the sender's expiry. Stripped before
+# dispatch for every action (Baler#140), except where one is a parameter:
+# a targeted action's `id` names its device/connection/job, and point_write
+# refuses a command that arrives after its `expires_at`.
+ENVELOPE_FIELDS = ("action", "id", "request_id", "expires_at")
+ENVELOPE_PARAMS = {"point_write": {"expires_at"}}
+
+
+def command_body(action, payload: dict) -> dict:
+    keep = set(ENVELOPE_PARAMS.get(action, ()))
+    if action in TARGETED_ACTIONS:
+        keep.add("id")
+    return {k: v for k, v in payload.items() if k not in ENVELOPE_FIELDS or k in keep}
+
+
 def _make_on_command(
     manager: ConnectionManager,
     loop: asyncio.AbstractEventLoop,
@@ -692,8 +709,7 @@ def _make_on_command(
             if handler is None:
                 outcome = {"ok": False, "error": f"unknown action {action!r}"}
             else:
-                drop = ("action", "request_id") if action in TARGETED_ACTIONS else ("action", "id", "request_id")
-                body = {k: v for k, v in payload.items() if k not in drop}
+                body = command_body(action, payload)
                 try:
                     outcome = {"ok": True, "result": _run(handler(body), loop)}
                 except Exception as exc:  # noqa: BLE001 - one bad command must not crash the mqtt loop thread

@@ -350,3 +350,90 @@ def test_jobs_over_http_and_the_command_channel(harness, monkeypatch):
             break
     assert got["ok"] and got["result"]["state"] == "done"
     assert harness.send({"action": "list_jobs"})["ok"]
+
+
+def test_every_action_tolerates_the_full_command_envelope(harness, monkeypatch):
+    """Baler#140: Baler's Commander wraps every action as {id, ...body,
+    action, request_id, expires_at}. Envelope fields must never reach a
+    handler as parameters - a remote `discover` failed with
+    "discover_devices() got an unexpected keyword argument 'expires_at'"."""
+    import time
+
+    from windrow import api, connection_manager
+
+    calls = {}
+
+    async def fake_discover(**kwargs):
+        calls["discover"] = kwargs
+        return []
+
+    async def fake_learn(address, instance):
+        return [{"object_identifier": "analog-value,1", "label": "zone-temp"}]
+
+    async def fake_sweep(cidr, port=502, concurrency=64, timeout=1.0, progress=None):
+        return []
+
+    async def fake_write(topic, value, priority, expires_at=None):
+        calls["point_write"] = expires_at
+        return {"topic": topic}
+
+    async def fake_test_read(host, register, port=502, device_id=1):
+        return {"value": 1}
+
+    monkeypatch.setattr(harness.manager, "discover", fake_discover)
+    monkeypatch.setattr(harness.manager, "learn", fake_learn)
+    monkeypatch.setattr(harness.manager, "write_point", fake_write)
+    monkeypatch.setattr(harness.modbus_manager, "test_read", fake_test_read)
+    monkeypatch.setattr(api.modbus_discovery, "sweep", fake_sweep)
+    monkeypatch.setattr(connection_manager.ConnectionManager, "_tag_points", lambda *a: None)
+
+    bacnet = harness.send({"action": "create_connection", **BACNET_CONN})["result"]
+    modbus = harness.send({"action": "modbus_create_connection", **MODBUS_CONN})["result"]
+    device = harness.send({"action": "add_device", "protocol": "modbus", "host": "10.0.0.7"})["result"]
+    job = harness.send({"action": "start_job", "job": "learn", "device_address": "10.0.0.5", "device_instance": 5})["result"]
+
+    bodies = {
+        "discover": {},
+        "learn": {"device_address": "10.0.0.5", "device_instance": 5},
+        "modbus_discover": {"cidr": "10.0.0.0/30"},
+        "point_write": {"topic": "fbf/ahu-1/zone-temp", "value": 1, "priority": 8},
+        "list_devices": {},
+        "set_device_status": {"id": device["id"], "status": "ignored"},
+        "add_device": {"protocol": "bacnet", "device_address": "10.0.0.8", "device_instance": 8},
+        "recheck_credentials": {"id": device["id"]},
+        "list_connections": {},
+        "create_connection": {**BACNET_CONN, "topic_prefix": "fbf/ahu-2"},
+        "update_connection": {"id": bacnet["id"], "poll_interval": 9},
+        "modbus_list_connections": {},
+        "modbus_create_connection": {**MODBUS_CONN, "topic_prefix": "fbf/m2"},
+        "modbus_update_connection": {"id": modbus["id"], "poll_interval": 9},
+        "modbus_test_read": {"host": "10.0.0.6", "register": 0},
+        "set_credential": {"target": "device", "id": device["id"], "credential": {"username": "u", "password": "p"}},
+        "start_job": {"job": "discover"},
+        "get_job": {"id": job["id"]},
+        "list_jobs": {},
+        "delete_connection": {"id": bacnet["id"]},
+        "modbus_delete_connection": {"id": modbus["id"]},
+    }
+    on_command = api._make_on_command(harness.manager, None, "site-a", "inst-1", harness.modbus_manager, harness.registry)
+    import inspect
+    handled = set(inspect.getclosurevars(on_command).nonlocals["handlers"])
+    assert handled == set(bodies), f"add a body for {handled ^ set(bodies)}"
+
+    expires_at = time.time() + 300
+    for action, body in bodies.items():
+        envelope = {"id": "corr-1", **body, "action": action, "request_id": "corr-1", "expires_at": expires_at}
+        outcome = harness.send(envelope)
+        assert outcome["ok"], (action, outcome)
+        assert outcome["request_id"] == "corr-1"
+    assert calls["discover"] == {}
+    assert calls["point_write"] == expires_at  # the one action that takes it
+
+
+def test_command_body_strips_the_envelope():
+    from windrow.api import command_body
+
+    payload = {"action": "discover", "id": "c", "request_id": "c", "expires_at": 1.0, "address": "10.0.0.5"}
+    assert command_body("discover", payload) == {"address": "10.0.0.5"}
+    assert command_body("delete_connection", {**payload, "id": "conn-1"}) == {"id": "conn-1", "address": "10.0.0.5"}
+    assert command_body("point_write", payload) == {"expires_at": 1.0, "address": "10.0.0.5"}

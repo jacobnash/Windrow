@@ -23,6 +23,7 @@ import time
 import uuid
 
 from windrow import modbus_discovery, tracing
+from windrow.discovery import discover_params
 
 tracer = tracing.get_tracer(__name__)
 
@@ -134,6 +135,7 @@ class JobRunner:
         # discover: no arguments is the periodic scan's own pass (broadcast,
         # then a directed Who-Is to each known connection's address).
         connections = list(self.manager.connections.values())
+        params = discover_params(params)
         if params or self.device_registry is None:
             found = await self.manager.discover(**params)
         else:
