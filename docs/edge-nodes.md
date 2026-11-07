@@ -56,7 +56,14 @@ MQTT_USERNAME=...
 MQTT_PASSWORD=...
 WEATHER_TOPIC_PREFIX=fbf/home/weather   # must sit under the site's prefix
 WINDROW_SITE_ID=...                     # gateway: the broker username
+#WINDROW_BACNET_FOREIGN_BBMD=10.1.0.1   # gateway: BACnet devices on other subnets, via this BBMD
+#WINDROW_BACNET_FOREIGN_TTL=300
 ```
+
+A gateway Pi only hears BACnet broadcasts on its own subnet. If the site's
+controllers are on other subnets, point it at the site's BBMD with
+`WINDROW_BACNET_FOREIGN_BBMD` (see bacnet-discovery-api.md, "Other subnets
+and MS/TP"); MS/TP devices behind routers are found either way.
 
 The broker drops anything published outside the account's site prefixes, so
 a wrong `WEATHER_TOPIC_PREFIX` or a gateway connection's `topic_prefix`

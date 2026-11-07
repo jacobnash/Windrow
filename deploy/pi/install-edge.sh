@@ -79,6 +79,10 @@ WINDROW_SITE_ID=
 # gateway role, only if its API is exposed (WINDROW_API_HOST): requests
 # then need this in X-Gateway-Secret
 #WINDROW_GATEWAY_SECRET=
+# gateway role: reach BACnet devices on other subnets by registering as a
+# foreign device with the site's BBMD (renewed every TTL seconds)
+#WINDROW_BACNET_FOREIGN_BBMD=
+#WINDROW_BACNET_FOREIGN_TTL=300
 ENV
 fi
 chown root:"$SVC_USER" "$ENV_FILE"
