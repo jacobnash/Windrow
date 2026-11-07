@@ -31,8 +31,8 @@ def test_build_status_shape():
     status = api.build_status("site-a", "inst-1", "2026-01-01T00:00:00+00:00", *_managers())
     assert set(status) == {
         "online", "site_id", "instance_id", "version", "started_at", "ts",
-        "bacnet_connections", "bacnet_network", "bacnet_requests", "modbus_connections", "devices", "pending_devices",
-        "networks",
+        "bacnet_connections", "bacnet_network", "bacnet_requests", "modbus_connections", "spool", "devices",
+        "pending_devices", "networks",
     }
     assert status["networks"] == []
     assert status["online"] is True
@@ -44,6 +44,7 @@ def test_build_status_shape():
     assert (status["devices"], status["pending_devices"]) == (3, 2)
     assert status["bacnet_network"] == {"mode": "normal"}  # no app in this fake: a plain local link
     assert status["bacnet_requests"] == {"read_property_multiple": 4, "cov_subscriptions": 1}
+    assert set(status["spool"]) == {"rows", "capacity", "dropped"}
     json.dumps(status)
 
 

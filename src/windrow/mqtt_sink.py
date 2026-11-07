@@ -20,13 +20,46 @@ import paho.mqtt.client as mqtt
 
 from windrow import legacy
 
-MAX_SPOOL_ROWS = 10_000
-# ponytail: fixed 10k-row ring buffer, no dynamic sizing by outage length or
-# point count - bump MAX_SPOOL_ROWS or move to a real bounded queue if a
-# real outage ever overflows it (this is a guess at "long enough", not
-# measured).
+# Spool capacity (Baler#129): enough rows to cover an uplink outage of
+# WINDROW_SPOOL_OUTAGE_HOURS at the rate this process takes readings (the
+# connection managers report it through set_reading_rate), with 10% slack,
+# never below MIN_SPOOL_ROWS and never above MAX_SPOOL_ROWS - the disk
+# ceiling (a reading is ~100 bytes on disk, so 5M rows is ~500 MB). It was
+# a fixed 10k rows: at 500 points on a 5 s poll that's 100 seconds.
+SPOOL_OUTAGE_HOURS = float(legacy.env("WINDROW_SPOOL_OUTAGE_HOURS") or 24)
+MAX_SPOOL_ROWS = int(legacy.env("WINDROW_SPOOL_MAX_ROWS") or 5_000_000)
+MIN_SPOOL_ROWS = 10_000
 
 _spool_lock = threading.Lock()
+_reading_rate = None  # () -> readings per second, from the connection managers
+_spool_rows: dict[str, int] = {}  # path -> rows in it, so an append doesn't re-read the file
+_spool_dropped = 0
+
+
+def set_reading_rate(rate) -> None:
+    """Register a callable giving the readings per second this process
+    takes - what the spool must hold per second of outage."""
+    global _reading_rate
+    _reading_rate = rate
+
+
+def spool_capacity() -> int:
+    rate = 0.0
+    if _reading_rate is not None:
+        try:
+            rate = float(_reading_rate())
+        except Exception as exc:  # noqa: BLE001 - a bad estimate falls back to the minimum, it doesn't stop spooling
+            print(f"spool: reading rate unavailable ({exc!r}); using the minimum capacity")
+    wanted = int(rate * SPOOL_OUTAGE_HOURS * 3600 * 1.1)
+    return min(MAX_SPOOL_ROWS, max(MIN_SPOOL_ROWS, wanted))
+
+
+def spool_stats() -> dict:
+    """Rows waiting, the current capacity, and rows dropped since start."""
+    path = _spool_path()
+    with _spool_lock:
+        rows = _count_rows(path)
+    return {"rows": rows, "capacity": spool_capacity(), "dropped": _spool_dropped}
 
 
 def _spool_path() -> str:
@@ -62,14 +95,45 @@ def _write_spool(path: str, records: list[dict]) -> None:
     os.replace(tmp_path, path)
 
 
+def _count_rows(path: str) -> int:
+    if path not in _spool_rows:
+        if os.path.exists(path):
+            with open(path) as f:
+                _spool_rows[path] = sum(1 for line in f if line.strip())
+        else:
+            _spool_rows[path] = 0
+    return _spool_rows[path]
+
+
 def _spool_append(record: dict) -> None:
+    """Append one reading. Over capacity, the oldest rows go - trimmed in one
+    rewrite once the file is 10% over (not on every append, which made each
+    append re-read the whole file), and logged: how many, and the time span
+    lost."""
+    global _spool_dropped
     path = _spool_path()
     with _spool_lock:
+        rows = _count_rows(path)
         with open(path, "a") as f:
             f.write(json.dumps(record) + "\n")
-        records = _read_spool(path)
-        if len(records) > MAX_SPOOL_ROWS:
-            _write_spool(path, records[-MAX_SPOOL_ROWS:])
+        rows += 1
+        _spool_rows[path] = rows
+        capacity = spool_capacity()
+        # 10% slack before a trim, except for a tiny (test-sized) cap
+        threshold = int(capacity * 1.1) if capacity >= MIN_SPOOL_ROWS else capacity
+        if rows > threshold:
+            records = _read_spool(path)
+            dropped = records[:-capacity]
+            _write_spool(path, records[-capacity:])
+            _spool_rows[path] = min(len(records), capacity)
+            if dropped:
+                _spool_dropped += len(dropped)
+                points = len({(r.get("topic_prefix"), r.get("point")) for r in dropped})
+                print(
+                    f"spool full ({capacity} rows, sized for {SPOOL_OUTAGE_HOURS:g} h of outage): dropped the "
+                    f"{len(dropped)} oldest reading(s) of {points} point(s), "
+                    f"ts {dropped[0].get('ts')} to {dropped[-1].get('ts')}; {_spool_dropped} dropped since start"
+                )
 
 
 def _flush_spool(client: mqtt.Client) -> None:
@@ -82,8 +146,10 @@ def _flush_spool(client: mqtt.Client) -> None:
             if not client.is_connected():
                 print(f"reconnect lost mid-flush, {len(records) - i} record(s) remain spooled")
                 return
-            _publish(client, record["topic_prefix"], record["point"], record["value"], record["ts"])
+            _publish(client, record["topic_prefix"], record["point"], record["value"], record["ts"],
+                     retain=record.get("retain", True))
         os.remove(path)
+        _spool_rows[path] = 0
         print(f"flushed {len(records)} spooled reading(s)")
 
 
@@ -149,26 +215,34 @@ def connect(
     return client
 
 
-def _publish(client: mqtt.Client, topic_prefix: str, point: str, value, ts: float) -> str:
+def _publish(client: mqtt.Client, topic_prefix: str, point: str, value, ts: float, retain: bool = True) -> str:
     payload = json.dumps({"point": point, "value": value, "ts": ts})
     topic = f"{topic_prefix}/{point}"
-    client.publish(topic, payload, qos=1, retain=True)
+    client.publish(topic, payload, qos=1, retain=retain)
     return topic
 
 
-def publish_reading(client: mqtt.Client, topic_prefix: str, point: str, value, ts: float | None = None) -> str:
+def publish_reading(
+    client: mqtt.Client, topic_prefix: str, point: str, value, ts: float | None = None, retain: bool = True
+) -> str:
     """Publishes {"point", "value", "ts"} to f"{topic_prefix}/{point}",
     retained. This exact shape is the frozen wire contract every consumer
     (Haxall's task engine, Baler's mqtt_listener) parses by name.
 
     If the client isn't currently connected, the reading is spooled to
     disk instead of dropped, and replayed automatically once the
-    connection is back (see _on_connect)."""
+    connection is back (see _on_connect).
+
+    retain=False is for history - a backfilled trend-log record (Baler#129)
+    - which must not replace the point's retained current value."""
     ts = ts if ts is not None else time.time()
     if not client.is_connected():
-        _spool_append({"topic_prefix": topic_prefix, "point": point, "value": value, "ts": ts})
+        record = {"topic_prefix": topic_prefix, "point": point, "value": value, "ts": ts}
+        if not retain:
+            record["retain"] = False
+        _spool_append(record)
         return f"{topic_prefix}/{point}"
-    return _publish(client, topic_prefix, point, value, ts)
+    return _publish(client, topic_prefix, point, value, ts, retain=retain)
 
 
 def clear_retained(client: mqtt.Client, topic_prefix: str, point: str) -> str:

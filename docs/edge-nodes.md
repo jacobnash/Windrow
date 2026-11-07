@@ -121,6 +121,19 @@ PATCH /connections/{id}         {"device_name": "bacnet"}
 PATCH /modbus/connections/{id}  {"device_name": "modbus"}
 ```
 
+## When the uplink is down
+
+Readings taken while the broker is unreachable are spooled to disk
+(`WINDROW_SPOOL_FILE`, default `windrow-spool.jsonl` in the working
+directory) and replayed, with their original timestamps, on reconnect. The
+spool holds `WINDROW_SPOOL_OUTAGE_HOURS` (default 24) of readings at the
+rate this node polls - every point's poll rate, BACnet and Modbus - plus
+10%, between 10,000 rows and `WINDROW_SPOOL_MAX_ROWS` (default 5,000,000,
+about 500 MB). It is resized as connections change. In an outage longer
+than that, the oldest readings go first, and each trim is logged with how
+many readings of how many points were dropped and the time span lost. The
+status heartbeat's `spool` shows `rows`, `capacity` and `dropped`.
+
 ## Checking
 
 ```bash

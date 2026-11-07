@@ -1043,6 +1043,16 @@ components:
             `false` for a point whose device floods notifications. (Not
             the same thing as `his_collect_cov`, which filters what gets
             published, however the value arrived.)
+        trend_log:
+          type: string
+          description: >-
+            The controller's TrendLog object that logs this point (e.g.
+            `trend-log,3`). After Windrow was down, or couldn't reach the
+            device, the readings it missed are read back from that log with
+            ReadRange and published on the point's topic with their own
+            timestamps, not retained (so the live value stays the retained
+            one). Goes back at most the connection's `backfill_window`.
+          example: "trend-log,3"
     CreateConnectionRequest:
       type: object
       required: [device_address, device_instance, topic_prefix, points]
@@ -1118,6 +1128,11 @@ components:
           exclusiveMinimum: 0
           default: 300
           description: Seconds between the safety-net polls of a point whose COV subscription is live.
+        backfill_window:
+          type: number
+          minimum: 0
+          default: 86400
+          description: Most seconds of history a trend-log backfill reads back for this connection's points with `trend_log`; 0 turns backfill off.
         credential:
           description: Optional - the login this device's own UI/gateway needs, if any. Write-only on create; a created/listed Connection always shows this redacted (see RedactedCredential).
           oneOf:
@@ -1496,6 +1511,8 @@ components:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/cov_lifetime"
         cov_poll_interval:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/cov_poll_interval"
+        backfill_window:
+          $ref: "#/components/schemas/CreateConnectionRequest/properties/backfill_window"
     UpdateModbusConnectionRequest:
       type: object
       minProperties: 1

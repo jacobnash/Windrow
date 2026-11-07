@@ -12,13 +12,22 @@ object list instead - see windrow.mock_hospital, which builds one.
 """
 
 import asyncio
+import datetime
 import json
 import random
 
+from bacpypes3.apdu import ReadRangeACK
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
+from bacpypes3.basetypes import LogRecord, LogRecordLogDatum
+from bacpypes3.constructeddata import Any, SequenceOf
+from bacpypes3.errors import ExecutionError
 from bacpypes3.local.analog import AnalogValueObjectCmd
 from bacpypes3.local.binary import BinaryValueObjectCmd
+from bacpypes3.local.object import Object as _LocalObject
+from bacpypes3.object import TrendLogObject
+
+from windrow import bacnet_trend
 
 INTERVAL = 5.0
 
@@ -85,17 +94,128 @@ def _next_value(value, behavior: str):
     return value
 
 
+class MockTrendLog(_LocalObject, TrendLogObject):
+    """A TrendLog that polls one object's presentValue every log interval
+    into a ring buffer (Baler#129), served by MockApplication's ReadRange.
+    Records are kept as (sequence number, LogRecord, device-local datetime);
+    the device's clock is this host's local time, like bacpypes3's own
+    DeviceObject.localDate/localTime."""
+
+    def __init__(self, source, interval: float, buffer_size: int = 10_000, **kwargs):
+        super().__init__(
+            logDeviceObjectProperty={"objectIdentifier": source.objectIdentifier, "propertyIdentifier": "present-value"},
+            logInterval=int(interval * 100), bufferSize=buffer_size, enable=True, stopWhenFull=False,
+            recordCount=0, totalRecordCount=0, loggingType="polled", statusFlags=[0, 0, 0, 0],
+            eventState="normal", **kwargs,
+        )
+        self._source = source
+        self._interval = interval
+        self._buffer_size = buffer_size
+        self._records: list[tuple[int, LogRecord, datetime.datetime]] = []
+        self._next_sequence = 1
+
+    def log_now(self) -> None:
+        value = self._source.presentValue
+        if self._source.objectIdentifier[0] in ("binary-value", "binary-input", "binary-output") or str(
+            self._source.objectIdentifier[0]
+        ).startswith("binary"):
+            datum = LogRecordLogDatum(enumValue=1 if str(value) == "active" else 0)
+        else:
+            datum = LogRecordLogDatum(realValue=float(value))
+        now = datetime.datetime.now()  # noqa: DTZ005 - a BACnet device logs its local wall-clock time
+        record = LogRecord(timestamp=bacnet_trend.to_bacnet_datetime(now), logDatum=datum, statusFlags=[0, 0, 0, 0])
+        self._records.append((self._next_sequence, record, now))
+        self._next_sequence += 1
+        del self._records[:-self._buffer_size]
+        self.recordCount = len(self._records)
+        self.totalRecordCount = self._next_sequence - 1
+
+    async def run(self) -> None:
+        while True:
+            self.log_now()
+            await asyncio.sleep(self._interval)
+
+
+class MockApplication(Application):
+    """bacpypes3 0.0.110's Application has no ReadRange server (its
+    do_ReadRangeRequest raises NotImplementedError); this one answers
+    ReadRange on a MockTrendLog's log-buffer, by position, sequence number
+    or time, per Clause 15.8."""
+
+    async def do_ReadRangeRequest(self, apdu) -> None:
+        obj = self.get_object_id(apdu.objectIdentifier)
+        if not isinstance(obj, MockTrendLog):
+            raise ExecutionError(errorClass="object", errorCode="unknownObject")
+        if str(apdu.propertyIdentifier) != "log-buffer":
+            raise ExecutionError(errorClass="property", errorCode="propertyIsNotAList")
+        records = obj._records
+        rng = apdu.range
+        indexes: list[int]
+        if rng is None:
+            indexes = list(range(len(records)))
+        elif rng.byTime is not None:
+            ref = bacnet_trend.from_bacnet_datetime(rng.byTime.referenceTime)
+            count = int(rng.byTime.count)
+            if count > 0:
+                indexes = [i for i, (_, _, when) in enumerate(records) if when > ref][:count]
+            else:
+                indexes = [i for i, (_, _, when) in enumerate(records) if when < ref][count:]
+        elif rng.bySequenceNumber is not None:
+            ref, count = int(rng.bySequenceNumber.referenceSequenceNumber), int(rng.bySequenceNumber.count)
+            if count > 0:
+                indexes = [i for i, (seq, _, _) in enumerate(records) if seq >= ref][:count]
+            else:
+                indexes = [i for i, (seq, _, _) in enumerate(records) if seq <= ref][count:]
+        else:
+            ref, count = int(rng.byPosition.referenceIndex), int(rng.byPosition.count)  # 1-based
+            start, stop = (ref - 1, ref - 1 + count) if count > 0 else (ref + count, ref)
+            indexes = list(range(max(0, start), min(len(records), stop)))
+        items = [records[i][1] for i in indexes]
+        more = bool(indexes) and (
+            indexes[-1] < len(records) - 1 if (rng is None or _forward(rng)) else indexes[0] > 0
+        )
+        await self.response(ReadRangeACK(
+            context=apdu,
+            objectIdentifier=apdu.objectIdentifier,
+            propertyIdentifier=apdu.propertyIdentifier,
+            resultFlags=[bool(indexes) and indexes[0] == 0, bool(indexes) and indexes[-1] == len(records) - 1, more],
+            itemCount=len(items),
+            itemData=Any(SequenceOf(LogRecord)(items)),
+            firstSequenceNumber=records[indexes[0]][0] if indexes else None,
+        ))
+
+
+def _forward(rng) -> bool:
+    for choice in (rng.byTime, rng.bySequenceNumber, rng.byPosition):
+        if choice is not None:
+            return int(choice.count) > 0
+    return True
+
+
 class MockDevice:
-    def __init__(self, args=None, site_spec: list[dict] | None = None, app: Application | None = None):
+    def __init__(self, args=None, site_spec: list[dict] | None = None, trend_log_interval: float | None = None,
+                 app: Application | None = None):
         # `app`: an already-built Application, e.g. one on a virtual
-        # network behind windrow.mock_router instead of on BACnet/IP
-        self.app = app if app is not None else Application.from_args(args)
+        # network behind windrow.mock_router instead of on BACnet/IP (that
+        # one has no ReadRange server, so no trend logs there)
+        self.app = app if app is not None else MockApplication.from_args(args)
         self.objects: list[tuple] = []
 
         for spec in site_spec or _DEFAULT_SITE_SPEC:
             obj = _make_object(spec)
             self.app.add_object(obj)
             self.objects.append((obj, spec["behavior"]))
+
+        # One TrendLog per object, trend-log,1..N in object order, when asked
+        # for: off by default so /learn on the plain mock lists only its points.
+        self.trend_logs: list[MockTrendLog] = []
+        if trend_log_interval:
+            for n, (obj, _behavior) in enumerate(self.objects, start=1):
+                trend = MockTrendLog(obj, trend_log_interval, objectIdentifier=("trend-log", n),
+                                     objectName=f"{obj.objectName}-trend")
+                self.app.add_object(trend)
+                self.trend_logs.append(trend)
+                asyncio.create_task(trend.run())
 
         asyncio.create_task(self._simulate())
 
@@ -121,9 +241,13 @@ async def main() -> None:
         default=None,
         help="path to a JSON list of BACnet object specs (see windrow.mock_hospital); omit for the original 2-point demo device",
     )
+    parser.add_argument(
+        "--trend-log-interval", type=float, default=None,
+        help="seconds; adds a TrendLog (trend-log,1..N, in object order) logging each object's present-value",
+    )
     args = parser.parse_args()
     site_spec = _load_site_spec(args.site_spec) if args.site_spec else None
-    MockDevice(args, site_spec=site_spec)
+    MockDevice(args, site_spec=site_spec, trend_log_interval=args.trend_log_interval)
     await asyncio.Future()  # run forever
 
 

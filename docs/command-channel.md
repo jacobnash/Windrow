@@ -167,6 +167,7 @@ on `cmd/<site-id>/<instance-id>/status`, published at startup, on every
  "bacnet_network": {"mode": "foreign", "bbmd": "10.1.0.1", "registration": "registered"},
  "bacnet_requests": {"read_property_multiple": 1200, "subscribe_cov": 40,
                      "cov_notifications": 310, "cov_subscriptions": 20},
+ "spool": {"rows": 0, "capacity": 95040, "dropped": 0},
  "networks": ["192.168.1.0/24"]}
 ```
 
