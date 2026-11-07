@@ -49,6 +49,8 @@ equivalent calls (the `handle_*` functions in `src/windrow/api.py`):
 | `discover_routers` | `POST /discover/routers` | optional `network`, `timeout` |
 | `network_status` | `GET /bacnet/network` | none |
 | `learn` | `POST /learn` | `device_address`, `device_instance` |
+| `read_schedules` | `POST /schedules` | `device_address`, `device_instance` |
+| `connection_schedules` | `GET /connections/{id}/schedules` | `id` |
 | `modbus_discover` | `POST /modbus/discover` | `cidr`, optional `port`/`concurrency`/`timeout` |
 | `point_write` | `POST /write` | `topic`, `value` (`null` relinquishes), `priority` 1-17 (17 sets BACnet relinquish-default; it cannot be relinquished), optional `expires_at` (unix s). A topic a Modbus connection publishes goes to its writable holding register or coil - see below |
 | `list_devices` | `GET /devices` | none |

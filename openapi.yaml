@@ -215,6 +215,39 @@ paths:
           description: Unknown point, not commandable/writable, bad priority/value, expired, or the Modbus device isn't connected or refused the write.
         "504":
           description: The device didn't answer.
+  /schedules:
+    post:
+      operationId: readSchedules
+      summary: Read a device's Schedule and Calendar objects (as-built schedule check)
+      description: >-
+        Reads every schedule and calendar object in the device's object-list
+        now and returns them as JSON (Baler#165). An exception-schedule too big
+        for one answer is read element by element. Same as the command
+        channel's `read_schedules`; `GET /connections/{id}/schedules` does the
+        same for a connection's device and names its points.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_address, device_instance]
+              properties:
+                device_address: { type: string, example: "192.168.128.63:47808" }
+                device_instance: { type: integer, example: 3456 }
+      responses:
+        "200":
+          description: The device's schedules and calendars.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceSchedules"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "504":
+          $ref: "#/components/responses/Timeout"
+        "500":
+          $ref: "#/components/responses/ServerError"
   /learn:
     post:
       operationId: learnPoints
@@ -380,6 +413,29 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /connections/{id}/schedules:
+    get:
+      operationId: getConnectionSchedules
+      summary: The connection's device's schedules, with its points named in `controls`
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: As POST /schedules; a schedule that writes one of this connection's points carries its `label`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceSchedules"
+        "404":
+          description: No connection with that id.
+        "504":
+          $ref: "#/components/responses/Timeout"
         "500":
           $ref: "#/components/responses/ServerError"
   /connections/{id}/credential:
@@ -1053,6 +1109,72 @@ components:
             timestamps, not retained (so the live value stays the retained
             one). Goes back at most the connection's `backfill_window`.
           example: "trend-log,3"
+    TimeValue:
+      type: object
+      properties:
+        time: { type: string, example: "07:00:00" }
+        value: { description: "What the schedule writes then: a number, active/inactive for a binary target, or null (relinquish)." }
+    SchedulePeriod:
+      type: object
+      description: "One of: `date` (YYYY-MM-DD, `*` for any field), `date_range` [start, end], `week_n_day` {month, week, weekday} (null = any), or `calendar` (a calendar object id)."
+      properties:
+        date: { type: string, example: "*-12-25" }
+        date_range: { type: array, items: { type: string } }
+        week_n_day:
+          type: object
+          properties:
+            month: { type: ["integer", "null"] }
+            week: { type: ["integer", "null"], description: "1-5 = days 1-7, 8-14, ...; 6 = the last 7 days" }
+            weekday: { type: ["string", "null"], example: thursday }
+        calendar: { type: string, example: "calendar,1" }
+    DeviceSchedules:
+      type: object
+      required: [schedules, calendars]
+      properties:
+        schedules:
+          type: array
+          items:
+            type: object
+            properties:
+              object: { type: string, example: "schedule,1" }
+              name: { type: ["string", "null"] }
+              present_value: {}
+              default: {}
+              priority_for_writing: { type: ["integer", "null"] }
+              effective_period: { type: ["array", "null"], items: { type: string } }
+              weekly:
+                type: ["object", "null"]
+                description: monday..sunday, each a list of TimeValue.
+                additionalProperties:
+                  type: array
+                  items: { $ref: "#/components/schemas/TimeValue" }
+              exceptions:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    period: { $ref: "#/components/schemas/SchedulePeriod" }
+                    priority: { type: integer }
+                    times: { type: array, items: { $ref: "#/components/schemas/TimeValue" } }
+              controls:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    object: { type: string }
+                    property: { type: string }
+                    index: { type: integer }
+                    device: { type: string }
+                    label: { type: string, description: The connection point that polls this object, when there is one. }
+        calendars:
+          type: array
+          items:
+            type: object
+            properties:
+              object: { type: string }
+              name: { type: ["string", "null"] }
+              present_value: { type: boolean }
+              dates: { type: array, items: { $ref: "#/components/schemas/SchedulePeriod" } }
     CreateConnectionRequest:
       type: object
       required: [device_address, device_instance, topic_prefix, points]
