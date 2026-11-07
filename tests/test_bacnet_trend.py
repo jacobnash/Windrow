@@ -334,3 +334,32 @@ def test_spooled_history_replays_not_retained(spool):
     mqtt_sink._flush_spool(online)
     assert published == [(1.0, False), (2.0, True)]
     assert mqtt_sink.spool_stats()["rows"] == 0
+
+
+def test_backfill_window_is_a_read_option_on_create_and_update(tmp_path, monkeypatch):
+    async def read(app, address, objid):
+        return 1.0
+
+    monkeypatch.setattr(cm, "read_present_value", read)
+
+    async def run():
+        manager = cm.ConnectionManager(None, CapturingMqtt(), str(tmp_path / "c.json"))
+        record = await manager.create_connection("10.0.0.5", 5, "fbf/a", RECORD["points"], read_options={"backfill_window": 600})
+        assert record["backfill_window"] == 600
+        assert (await manager.update_connection(record["id"], {"backfill_window": 0}))["backfill_window"] == 0
+        with pytest.raises(ValueError):
+            await manager.update_connection(record["id"], {"backfill_window": -5})
+        await manager.delete_connection(record["id"])
+        await asyncio.sleep(0.01)
+
+    asyncio.run(run())
+
+
+def test_a_cov_notification_moves_the_mark_too(tmp_path):
+    """With #10's COV, a subscribed point may go a long time between polls;
+    its mark follows the notifications, so a restart backfills from the
+    last reading actually received."""
+    manager = cm.ConnectionManager(None, CapturingMqtt(), str(tmp_path / "c.json"))
+    before = __import__("time").time()
+    manager._offer(RECORD, RECORD["points"][0], cm._PointState(), 71.0)
+    assert manager._marks["c1/zone-temp"] >= before

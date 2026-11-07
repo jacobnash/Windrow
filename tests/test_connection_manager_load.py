@@ -62,7 +62,10 @@ def test_reads_are_capped_and_the_loop_stays_responsive(tmp_path, monkeypatch):
     async def run():
         app = SlowApp()
         manager = ConnectionManager(app, NullMqtt(), str(tmp_path / "c.json"))
+        # single reads: the cap is what keeps 200 one-point reads off the loop
+        # (batched, this is four RPMs a tick - test_bacnet_rpm.py)
         record = {"id": "c1", "device_address": "10.0.0.9", "topic_prefix": "fbf/x", "poll_interval": 0.05,
+                  "read_multiple": False,
                   "points": [{"object_identifier": f"analog-value,{i}", "label": f"p{i}"} for i in range(200)]}
         task = asyncio.get_event_loop().create_task(manager._poll_loop(record))
         # what an API call does: a trivial coroutine on the same loop

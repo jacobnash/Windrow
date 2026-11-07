@@ -10,14 +10,19 @@ async and touches only loop-thread-owned state.
 import asyncio
 import contextlib
 import json
+import math
 import os
 import random
 import time
+from collections import Counter
 
 from bacpypes3.apdu import ErrorRejectAbortNack
 from bacpypes3.app import Application
+from bacpypes3.basetypes import ErrorType
 
 from windrow import (
+    bacnet_batch,
+    bacnet_cov,
     bacnet_tagger,
     bacnet_trend,
     connection_store,
@@ -25,13 +30,12 @@ from windrow import (
     mqtt_sink,
     tracing,
 )
-from windrow.bacnet_read import read_present_value
+from windrow.bacnet_read import read_present_value, read_present_values
 from windrow.bacnet_values import normalize_value
 
 tracer = tracing.get_tracer(__name__)
 
-_TAGGER_RULES_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "rules", "bacnet_to_haystack_tags.yaml")
-_TAGGER_RULES = bacnet_tagger.load_rules(_TAGGER_RULES_PATH)
+_TAGGER_RULES = bacnet_tagger.load_default_rules()
 
 
 def should_publish(
@@ -104,15 +108,31 @@ COMMANDABLE_TYPES = {
 POINT_FIELDS = {
     "object_identifier", "label", "units", "description", "poll_interval",
     "his_collect_cov", "his_collect_cov_rate_limit", "his_collect_interval",
-    "trend_log",
+    "subscribe_cov", "trend_log",
 }
-UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "backfill_window"}
+# How a connection reads its device (Baler#127). All optional; a record
+# without them reads with ReadPropertyMultiple and doesn't subscribe.
+#   read_multiple      batch this connection's reads into RPMs (default true)
+#   read_multiple_max  most objects per RPM to this device (default: what
+#                      the device's max APDU fits, at most WINDROW_RPM_MAX_POINTS)
+#   subscribe_cov      SubscribeCOV for every point (a point's own
+#                      subscribe_cov overrides it), polling slowly underneath
+#   cov_lifetime       seconds each subscription asks for; renewed at half
+#   cov_poll_interval  the slow fallback poll for a subscribed point
+#   backfill_window    trend-log backfill (Baler#129, below) reaches back at
+#                      most this many seconds; 0 turns it off
+READ_OPTION_FIELDS = {
+    "read_multiple", "read_multiple_max", "subscribe_cov", "cov_lifetime", "cov_poll_interval", "backfill_window",
+}
+UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix"} | READ_OPTION_FIELDS
+DEFAULT_COV_LIFETIME = 300
+DEFAULT_COV_POLL_INTERVAL = 300.0
 # Trend-log backfill (Baler#129): a point with `trend_log` (the TrendLog
 # object logging it on the controller, e.g. "trend-log,3") gets the
 # readings it missed read back from that log - after Windrow was down
-# (from the last reading it published, remembered in a marks file next to
-# the state file) and after the device was unreachable - going back at
-# most `backfill_window` seconds (per connection; 0 turns it off).
+# (from the last reading it took, remembered in a marks file next to the
+# state file) and after the device was unreachable - going back at most
+# `backfill_window` seconds.
 DEFAULT_BACKFILL_WINDOW = 86400.0
 # How often the marks file is rewritten while readings come in.
 MARKS_SAVE_INTERVAL = 60.0
@@ -122,6 +142,27 @@ def check_backfill_window(value) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         raise ValueError(f"backfill_window must be a number of seconds >= 0, got {value!r}")
     return value
+
+
+def validate_read_options(options: dict) -> dict:
+    """The READ_OPTION_FIELDS present in `options`, type-checked. ValueError
+    (a 400) for a wrong type, same as every other connection field."""
+    cleaned = {}
+    for key in ("read_multiple", "subscribe_cov"):
+        if key in options:
+            if not isinstance(options[key], bool):
+                raise ValueError(f"{key} must be true or false, got {options[key]!r}")
+            cleaned[key] = options[key]
+    if "read_multiple_max" in options:
+        cleaned["read_multiple_max"] = connection_store.check_int("read_multiple_max", options["read_multiple_max"], 1, 500)
+    if "cov_lifetime" in options:
+        # 0 would mean "forever" to the device, which outlives us; keep it renewable
+        cleaned["cov_lifetime"] = connection_store.check_int("cov_lifetime", options["cov_lifetime"], 10, 86400)
+    if "cov_poll_interval" in options:
+        cleaned["cov_poll_interval"] = connection_store.check_number("cov_poll_interval", options["cov_poll_interval"])
+    if "backfill_window" in options:
+        cleaned["backfill_window"] = check_backfill_window(options["backfill_window"])
+    return cleaned
 
 
 def validate_points(points) -> list[dict]:
@@ -142,6 +183,8 @@ def validate_points(points) -> list[dict]:
             connection_store.check_number("point poll_interval", point["poll_interval"])
         if "trend_log" in point:
             connection_store.check_text("trend_log", point["trend_log"])
+        if "subscribe_cov" in point and not isinstance(point["subscribe_cov"], bool):
+            raise ValueError(f"subscribe_cov must be true or false, got {point['subscribe_cov']!r}")
         cov = point.get("his_collect_cov")
         if cov is not None and not isinstance(cov, (bool, int, float)):
             raise ValueError(f"his_collect_cov must be true/false or a number, got {cov!r}")
@@ -169,6 +212,29 @@ class PointWriteError(ValueError):
 
 class ReadFailed(RuntimeError):
     """The device answered a read with an error, reject, abort or nothing."""
+
+
+class _PointState:
+    """What one point's poll task and its COV subscription share: the last
+    published value (so a notification and a poll apply the same hisCollect
+    policy) and whether the subscription is live (which sets the poll rate)."""
+
+    def __init__(self):
+        self.last_value = None
+        self.last_published_at: float | None = None
+        self.cov_active = False
+        self.wake = asyncio.Event()  # poll now: the subscription went away
+        self.resubscribe = asyncio.Event()  # subscribe now: the device came back
+
+
+# Module-level so tests that replace read_present_value(s) here are what the
+# batchers call.
+async def _read_one(app, address, objid):
+    return await read_present_value(app, address, objid)
+
+
+async def _read_many(app, address, objids):
+    return await read_present_values(app, address, objids)
 
 
 def _object_type(object_identifier: str) -> str:
@@ -213,7 +279,15 @@ class ConnectionManager:
         self.connections: dict[str, dict] = {}
         self.tasks: dict[str, asyncio.Task] = {}
         self._read_slots: asyncio.Semaphore | None = None
-        # Trend-backed points' last published reading time (unix s), by
+        # one per device address, shared by every connection on it
+        self.batchers: dict[str, bacnet_batch.ReadBatcher] = {}
+        # each device's poll ticks sit at this fraction of the interval, so a
+        # device's points tick together (one RPM) but devices don't all tick at once
+        self._phase: dict[str, float] = {}
+        # requests sent, by kind - how much the device is asked, not how many points
+        self.stats: Counter = Counter()
+        self._cov_live: set[int] = set()
+        # Trend-backed points' last reading time (unix s), by
         # "<connection id>/<label>", so a restart knows where to backfill from.
         base, _ext = os.path.splitext(state_file)
         self.marks_file = f"{base}.trend-marks.json"
@@ -262,7 +336,7 @@ class ConnectionManager:
         points: list[dict],
         poll_interval: float = 5.0,
         credential: dict | None = None,
-        backfill_window: float | None = None,
+        read_options: dict | None = None,
     ) -> dict:
         with tracer.start_as_current_span("connection_manager.create_connection") as span:
             record = {
@@ -273,10 +347,10 @@ class ConnectionManager:
                 "poll_interval": poll_interval,
                 "points": points,
                 "credential": credential,
+                **validate_read_options(read_options or {}),
             }
-            if backfill_window is not None:
-                record["backfill_window"] = check_backfill_window(backfill_window)
             self.connections[record["id"]] = record
+            self._apply_batch_limit(device_address)
             self._save()
             self._tag_points(topic_prefix, points)
             self._publish_equip_membership(topic_prefix, points)
@@ -396,7 +470,8 @@ class ConnectionManager:
             task = self.tasks.pop(connection_id, None)
             if task is not None:
                 task.cancel()
-            del self.connections[connection_id]
+            address = self.connections.pop(connection_id)["device_address"]
+            self._apply_batch_limit(address)
             self._save()
             span.set_attribute("found", True)
             return True
@@ -421,11 +496,11 @@ class ConnectionManager:
                 record["poll_interval"] = connection_store.check_number("poll_interval", patch["poll_interval"])
             if "topic_prefix" in patch:
                 record["topic_prefix"] = connection_store.check_topic_prefix(patch["topic_prefix"])
-            if "backfill_window" in patch:
-                record["backfill_window"] = check_backfill_window(patch["backfill_window"])
+            record.update(validate_read_options(patch))
 
             await stop_task(self.tasks.pop(connection_id, None))
             self.connections[connection_id] = record
+            self._apply_batch_limit(record["device_address"])
             self._save()
 
             old_labels = [p["label"] for p in old["points"]]
@@ -469,7 +544,7 @@ class ConnectionManager:
 
     def reading_rate(self) -> float:
         """Readings per second across every point - what mqtt_sink sizes
-        its outage spool by."""
+        its outage spool by (the poll rate; an upper bound for a COV point)."""
         return sum(
             1.0 / point.get("poll_interval", record["poll_interval"])
             for record in self.connections.values() for point in record["points"]
@@ -517,6 +592,53 @@ class ConnectionManager:
             print(f"backfilled {len(readings)} reading(s) for {record['topic_prefix']}/{point['label']} "
                   f"from {point['trend_log']} ({until - since:.0f} s gap)")
         return len(readings)
+
+    def read_stats(self) -> dict:
+        """Requests sent so far by kind, and live COV subscriptions - the
+        numbers that say whether batching and COV are doing their job."""
+        return {**self.stats, "cov_subscriptions": len(self._cov_live)}
+
+    def _device_max_apdu(self, address: str) -> int | None:
+        """From the device's I-Am, if bacpypes3 has seen one."""
+        try:
+            from bacpypes3.pdu import Address
+
+            info = self.app.device_info_cache.address_cache.get(Address(address))
+        except Exception:  # noqa: BLE001 - no app (tests) or an address bacpypes3 can't parse: just the default cap
+            return None
+        return getattr(info, "max_apdu_length_accepted", None)
+
+    def _batch_limit(self, address: str) -> int:
+        limit = bacnet_batch.points_per_request(self._device_max_apdu(address))
+        for record in self.connections.values():
+            if record["device_address"] == address and "read_multiple_max" in record:
+                limit = min(limit, record["read_multiple_max"])
+        return limit
+
+    def _apply_batch_limit(self, address: str) -> None:
+        if address in self.batchers:
+            self.batchers[address].max_points = self._batch_limit(address)
+
+    def _batcher(self, address: str) -> bacnet_batch.ReadBatcher:
+        batcher = self.batchers.get(address)
+        if batcher is None:
+            batcher = bacnet_batch.ReadBatcher(
+                self.app, address, self._slots, _read_one, _read_many, self.stats,
+                max_points=self._batch_limit(address),
+            )
+            self.batchers[address] = batcher
+        return batcher
+
+    def _until_tick(self, address: str, interval: float, earliest: float) -> float:
+        """Seconds from now to this device's first poll tick after loop time
+        `earliest`. Ticks are fixed multiples of the interval (offset by the
+        device's phase), so points that drift apart - one backed off after a
+        failure, one restarted by an update - land back on the same tick and
+        in the same RPM."""
+        loop_now = asyncio.get_running_loop().time()
+        base = self._phase.setdefault(address, random.random()) * interval
+        tick = base + (math.floor((earliest - base) / interval) + 1) * interval
+        return max(0.0, tick - loop_now)
 
     def _start_poll_task(self, record: dict) -> None:
         task = asyncio.get_event_loop().create_task(self._poll_loop(record))
@@ -566,34 +688,62 @@ class ConnectionManager:
         CLI arg list. Sharing normalize_value and publish_reading is the
         right amount of sharing; sharing this loop body isn't.
 
+        Reads go through the device's ReadBatcher (one RPM for every point
+        on the device that ticks together) unless the connection sets
+        read_multiple: false. With subscribe_cov, a sibling task keeps a
+        COV subscription alive; while it is, this loop only polls every
+        cov_poll_interval, as a safety net for a lost notification or a
+        lapsed subscription.
+
         A point with `trend_log` backfills (Baler#129) on its first good
-        read - from the last reading published before a restart, per the
-        marks file - and on the first good read after failures, from the
-        last good read before them."""
+        read - from the last reading taken before a restart, per the marks
+        file - and on the first good read after failures, from the last good
+        read before them."""
+        address = record["device_address"]
         interval = point.get("poll_interval", record["poll_interval"])
-        last_value = None
-        last_published_at: float | None = None
+        batched = record.get("read_multiple", True)
+        cov_poll_interval = record.get("cov_poll_interval", DEFAULT_COV_POLL_INTERVAL)
+        state = _PointState()
         trended = "trend_log" in point
         last_ok: float | None = self._marks.get(f"{record.get('id')}/{point['label']}") if trended else None
         backfills: set[asyncio.Task] = set()
+        cov_task = None
+        if point.get("subscribe_cov", record.get("subscribe_cov", False)):
+            cov_task = asyncio.get_running_loop().create_task(self._keep_cov(record, point, state, interval))
 
-        # Jittered start: on a warm restore (connection_manager.start()),
-        # every point's task fires its first read_property in the same
-        # event-loop tick. Confirmed live: at ~500 points this burst
-        # livelocks the single shared bacpypes3 Application (pegs a core,
-        # zero reads actually complete) even though the same reads work
-        # fine sequentially. Spreading first reads across one interval
-        # keeps steady-state polling identical.
-        await asyncio.sleep(random.uniform(0, interval))
+        async def wait_next(every: float, failures: int) -> None:
+            delay = failure_backoff(every, failures)
+            if batched:
+                loop_now = asyncio.get_running_loop().time()
+                delay = self._until_tick(address, every, loop_now + delay - every)
+            if not state.wake.is_set():
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(state.wake.wait(), delay)
+            state.wake.clear()
 
-        failures = 0
-        first_read = True
         try:
+            # Spread first reads. Batched: onto the device's tick, so the
+            # whole device is one burst of a few RPMs rather than one read
+            # per point. Unbatched: uniformly over an interval - on a warm
+            # restore every point's first read otherwise fires in the same
+            # tick, which at ~500 points livelocked the shared bacpypes3
+            # Application (confirmed live).
+            if batched:
+                await asyncio.sleep(self._until_tick(address, interval, asyncio.get_running_loop().time()))
+            else:
+                await asyncio.sleep(random.uniform(0, interval))
+
+            failures = 0
+            first_read = True
             while True:
                 try:
-                    async with self._slots():
-                        raw = await read_present_value(self.app, record["device_address"], point["object_identifier"])
-                    if raw is None or isinstance(raw, ErrorRejectAbortNack):
+                    if batched:
+                        raw = await self._batcher(address).read(point["object_identifier"])
+                    else:
+                        async with self._slots():
+                            self.stats["read_property"] += 1
+                            raw = await read_present_value(self.app, address, point["object_identifier"])
+                    if raw is None or isinstance(raw, (ErrorRejectAbortNack, ErrorType)):
                         raise ReadFailed(f"device answered {raw!r}")
                     value = normalize_value(raw)
                 except Exception as exc:  # noqa: BLE001 - every failure means "count it and retry"
@@ -602,10 +752,12 @@ class ConnectionManager:
                     failures += 1
                     if failures in (1, 5) or failures % 50 == 0:  # don't flood the log with a dead device
                         print(f"read failed for {point['object_identifier']} ({failures}x): {exc!r}")
-                    await asyncio.sleep(failure_backoff(interval, failures))
+                    await wait_next(interval, failures)
                     continue
                 if failures:
                     print(f"read recovered for {point['object_identifier']} after {failures} failures")
+                    # a device that went away has probably dropped its subscriptions too
+                    state.resubscribe.set()
                 read_at = time.time()
                 if trended and (first_read or failures) and last_ok is not None:
                     # what the controller logged while we weren't reading it
@@ -616,25 +768,85 @@ class ConnectionManager:
                 last_ok = read_at
                 failures = 0
 
-                now = time.monotonic()
-                if should_publish(
-                    value,
-                    last_value,
-                    last_published_at,
-                    now,
-                    his_collect_cov=point.get("his_collect_cov"),
-                    his_collect_cov_rate_limit=point.get("his_collect_cov_rate_limit"),
-                    his_collect_interval=point.get("his_collect_interval"),
-                ):
-                    mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value)
-                    last_value = value
-                    last_published_at = now
-                self._mark(record, point, read_at)
-
-                await asyncio.sleep(failure_backoff(interval, failures))
+                self._offer(record, point, state, value)
+                await wait_next(cov_poll_interval if state.cov_active else interval, 0)
         finally:
+            if cov_task is not None:
+                cov_task.cancel()
             for task in backfills:
                 task.cancel()
+
+    def _offer(self, record: dict, point: dict, state: _PointState, value) -> None:
+        """A fresh value, from a poll or a COV notification: publish it if the
+        point's hisCollect policy says so."""
+        now = time.monotonic()
+        if should_publish(
+            value,
+            state.last_value,
+            state.last_published_at,
+            now,
+            his_collect_cov=point.get("his_collect_cov"),
+            his_collect_cov_rate_limit=point.get("his_collect_cov_rate_limit"),
+            his_collect_interval=point.get("his_collect_interval"),
+        ):
+            mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value)
+            state.last_value = value
+            state.last_published_at = now
+        self._mark(record, point, time.time())
+
+    def _set_cov_live(self, state: _PointState, live: bool) -> None:
+        if state.cov_active == live:
+            return
+        state.cov_active = live
+        if live:
+            self._cov_live.add(id(state))
+        else:
+            self._cov_live.discard(id(state))
+            state.wake.set()  # back to the normal rate now, not after the slow poll's long sleep
+
+    async def _keep_cov(self, record: dict, point: dict, state: _PointState, interval: float) -> None:
+        """Subscribe, renew at half the lifetime, and on any failure fall back
+        to polling at the point's normal interval while retrying with
+        back-off. A device that refuses COV for this object is polled from
+        then on and not asked again (until the connection restarts)."""
+        objid = point["object_identifier"]
+        lifetime = record.get("cov_lifetime", DEFAULT_COV_LIFETIME)
+
+        def on_value(raw) -> None:
+            self.stats["cov_notifications"] += 1
+            self._offer(record, point, state, normalize_value(raw))
+
+        subscription = bacnet_cov.Subscription(self.app, record["device_address"], objid, on_value)
+        failures = 0
+        try:
+            await asyncio.sleep(random.uniform(0, min(interval, 5.0)))  # don't subscribe a whole site in one tick
+            while True:
+                try:
+                    async with self._slots():
+                        self.stats["subscribe_cov"] += 1
+                        await subscription.subscribe(lifetime)
+                except bacnet_cov.CovUnsupported as exc:
+                    print(f"COV not available for {objid} ({exc}); polling it every {interval:g}s")
+                    self._set_cov_live(state, False)
+                    return
+                except Exception as exc:  # noqa: BLE001 - poll meanwhile, retry with back-off
+                    failures += 1
+                    if failures in (1, 5) or failures % 50 == 0:
+                        print(f"COV subscribe failed for {objid} ({failures}x): {exc!r}; polling every {interval:g}s")
+                    self._set_cov_live(state, False)
+                    delay = failure_backoff(min(lifetime / 2, 30.0), failures)
+                else:
+                    if failures or not state.cov_active:
+                        print(f"COV subscribed for {objid} (lifetime {lifetime}s)")
+                    failures = 0
+                    self._set_cov_live(state, True)
+                    delay = max(1.0, lifetime / 2)
+                state.resubscribe.clear()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(state.resubscribe.wait(), delay)
+        finally:
+            self._cov_live.discard(id(state))
+            subscription.close()
 
 
 def _load_marks(path: str) -> dict[str, float]:

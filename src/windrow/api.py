@@ -32,7 +32,7 @@ from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
 from windrow import credentials, legacy, modbus_discovery, mqtt_sink, tracing
-from windrow.connection_manager import ConnectionManager
+from windrow.connection_manager import READ_OPTION_FIELDS, ConnectionManager
 from windrow.device_registry import DeviceRegistry
 from windrow.modbus_connection_manager import ModbusConnectionManager
 
@@ -122,13 +122,15 @@ async def handle_create_connection(manager: ConnectionManager, body: dict) -> di
         points=body["points"],
         poll_interval=body.get("poll_interval", 5.0),
         credential=credential,
-        backfill_window=body.get("backfill_window"),
+        read_options={k: body[k] for k in READ_OPTION_FIELDS if k in body},
     )
     return _redact(record)
 
 
 async def handle_update_connection(manager: ConnectionManager, body: dict) -> dict:
-    """{id, ...patch} - patch is any of points/poll_interval/topic_prefix."""
+    """{id, ...patch} - patch is any of points/poll_interval/topic_prefix and
+    the read options (read_multiple, read_multiple_max, subscribe_cov,
+    cov_lifetime, cov_poll_interval)."""
     connection_id = _target_id(body)
     record = await manager.update_connection(connection_id, {k: v for k, v in body.items() if k != "id"})
     if record is None:
@@ -671,6 +673,7 @@ def build_status(site_id: str, instance_id: str, started_at: str, manager, modbu
         "started_at": started_at,
         "ts": _now_iso(),
         "bacnet_connections": len(manager.connections),
+        "bacnet_requests": manager.read_stats(),
         "modbus_connections": len(modbus_manager.connections),
         "spool": mqtt_sink.spool_stats(),
         "devices": len(devices),

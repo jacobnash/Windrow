@@ -20,7 +20,6 @@ building that would be over-parity for no requirement driving it.
 import asyncio
 import contextlib
 import json
-import os
 import time
 
 import pymodbus.client as ModbusClient
@@ -32,8 +31,7 @@ tracer = tracing.get_tracer(__name__)
 # The same label -> Haystack markers rules the BACnet connections use: a
 # Modbus point has no object type or description, but its label carries the
 # same words ("zone_temp", "fan_status").
-_TAGGER_RULES_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "rules", "bacnet_to_haystack_tags.yaml")
-_TAGGER_RULES = bacnet_tagger.load_rules(_TAGGER_RULES_PATH)
+_TAGGER_RULES = bacnet_tagger.load_default_rules()
 
 # Longest wait between reconnect attempts to an unreachable device.
 RECONNECT_MAX = 60.0
