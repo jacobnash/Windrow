@@ -80,8 +80,10 @@ def _next_value(value, behavior: str):
 
 
 class MockDevice:
-    def __init__(self, args, site_spec: list[dict] | None = None):
-        self.app = Application.from_args(args)
+    def __init__(self, args=None, site_spec: list[dict] | None = None, app: Application | None = None):
+        # `app`: an already-built Application, e.g. one on a virtual
+        # network behind windrow.mock_router instead of on BACnet/IP
+        self.app = app if app is not None else Application.from_args(args)
         self.objects: list[tuple] = []
 
         for spec in site_spec or _DEFAULT_SITE_SPEC:
