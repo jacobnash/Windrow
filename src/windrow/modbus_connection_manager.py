@@ -23,6 +23,7 @@ import pymodbus.client as ModbusClient
 
 from windrow import bacnet_tagger, connection_store, mqtt_sink, tracing
 from windrow.modbus_bridge import normalize_value
+from windrow.poll_status import PollStatus
 
 tracer = tracing.get_tracer(__name__)
 
@@ -36,6 +37,9 @@ _TAGGER_RULES = bacnet_tagger.load_rules(_TAGGER_RULES_PATH)
 RECONNECT_MAX = 60.0
 
 UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "host", "port", "device_id", "units"}
+
+# A test read (Baler#110) answers within this, reachable device or not.
+TEST_READ_TIMEOUT = 5.0
 
 
 def validate_points(points) -> dict[str, int]:
@@ -70,6 +74,8 @@ class ModbusConnectionManager:
         self.connections: dict[str, dict] = {}
         self.clients: dict[str, ModbusClient.AsyncModbusTcpClient] = {}
         self.tasks: dict[str, asyncio.Task] = {}
+        # In-memory poll health per connection, never persisted (Baler#110).
+        self.status = PollStatus()
 
     async def start(self) -> None:
         with tracer.start_as_current_span("modbus_connection_manager.start") as span:
@@ -149,6 +155,7 @@ class ModbusConnectionManager:
             if client is not None:
                 client.close()
             del self.connections[connection_id]
+            self.status.reset(connection_id)
             self._save()
             span.set_attribute("found", True)
             return True
@@ -201,6 +208,7 @@ class ModbusConnectionManager:
             client = self.clients.pop(connection_id, None)
             if client is not None:
                 client.close()
+            self.status.reset(connection_id)
             self.connections[connection_id] = record
             self._save()
 
@@ -237,6 +245,42 @@ class ModbusConnectionManager:
             self._save()
             span.set_attribute("found", True)
             return record
+
+    async def test_read(self, host, register, port=502, device_id=1) -> dict:
+        """Read one holding register from a device that isn't a connection
+        yet - the Connectors page's "Test read" before saving (Baler#110).
+        A fresh client, closed again whatever happens; an unreachable host
+        or an exception code is a ValueError with what went wrong."""
+        with tracer.start_as_current_span("modbus_connection_manager.test_read") as span:
+            host = connection_store.check_text("host", host).strip()
+            port = connection_store.check_int("port", port, 1, 65535)
+            device_id = connection_store.check_int("device_id", device_id, 0, 255)
+            register = connection_store.check_int("register", register, 0, 65535)
+            span.set_attribute("host", host)
+            span.set_attribute("register", register)
+            where = f"{host}:{port}"
+            client = self._new_client({"host": host, "port": port})
+            try:
+                try:
+                    connected = await asyncio.wait_for(client.connect(), TEST_READ_TIMEOUT)
+                except (asyncio.TimeoutError, OSError) as exc:
+                    raise ValueError(f"can't connect to {where}: {exc or 'timed out'}") from exc
+                if not connected:
+                    raise ValueError(f"can't connect to {where}: nothing accepted the connection")
+                try:
+                    rr = await asyncio.wait_for(
+                        client.read_holding_registers(register, count=1, device_id=device_id), TEST_READ_TIMEOUT
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise ValueError(f"{where} didn't answer a read of register {register} (unit {device_id})") from exc
+                except Exception as exc:
+                    raise ValueError(f"reading register {register} from {where} failed: {exc}") from exc
+                if rr.isError():
+                    raise ValueError(f"{where} refused register {register} (unit {device_id}): {rr}")
+                return {"host": host, "port": port, "device_id": device_id, "register": register,
+                        "value": normalize_value(rr.registers)}
+            finally:
+                client.close()
 
     async def close(self) -> None:
         """Cancels every poll task and closes every client without
@@ -320,6 +364,7 @@ class ModbusConnectionManager:
                 client = await self._connect(record)
                 if client is None:
                     attempts += 1
+                    self.status.failure(record["id"], list(record["points"]), f"can't connect to {where}")
                     if down_since is None:
                         down_since = asyncio.get_event_loop().time()
                     if attempts in (1, 5) or attempts % 50 == 0:
@@ -338,11 +383,14 @@ class ModbusConnectionManager:
                 except Exception as exc:  # noqa: BLE001 - a lost session raises many types; all mean reconnect
                     raised += 1
                     print(f"modbus read failed for {label}@{address}: {exc!r}")
+                    self.status.failure(record["id"], label, f"register {address}: {exc}")
                     continue
                 if rr.isError():  # the device answered with an exception code: the session is fine
                     print(f"modbus read error for {label}@{address}: {rr}")
+                    self.status.failure(record["id"], label, f"register {address}: {rr}")
                     continue
                 mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], label, normalize_value(rr.registers))
+                self.status.success(record["id"], label, published=True)
             if record["points"] and raised == len(record["points"]):
                 client.close()  # every read raised: next cycle reconnects
             await asyncio.sleep(record["poll_interval"])

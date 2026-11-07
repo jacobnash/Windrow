@@ -61,6 +61,7 @@ equivalent calls (the `handle_*` functions in `src/windrow/api.py`):
 | `modbus_create_connection` | `POST /modbus/connections` | as the HTTP body: `host`, `topic_prefix`, `points` (`{label: register}`), optional `port`/`device_id`/`poll_interval`/`credential` |
 | `modbus_update_connection` | `PATCH /modbus/connections/{id}` | `id`, plus any of `points`, `poll_interval`, `topic_prefix`, `host`, `port`, `device_id` |
 | `modbus_delete_connection` | `DELETE /modbus/connections/{id}` | `id` |
+| `modbus_test_read` | `POST /modbus/test-read` | `host`, `register`, optional `port` (502) / `device_id` (1). Reads once; stores and publishes nothing |
 | `set_credential` | `PATCH .../{id}/credential` | `target` (`device`, `connection` or `modbus_connection`), `id`, `credential: {username, password}` |
 
 The outcome (`{"ok": true, "result": ...}` or `{"ok": false, "error": ...}`,
@@ -120,8 +121,21 @@ on `cmd/<site-id>/<instance-id>/status`, published at startup, on every
 {"online": true, "site_id": "hospital-a", "instance_id": "ahu-bridge-1",
  "version": "0.1.0", "started_at": "2026-11-07T09:00:00.123456+00:00",
  "ts": "2026-11-07T09:05:00.654321+00:00",
- "bacnet_connections": 3, "modbus_connections": 1, "devices": 9, "pending_devices": 2}
+ "bacnet_connections": 3, "modbus_connections": 1, "devices": 9, "pending_devices": 2,
+ "networks": ["192.168.1.0/24"]}
 ```
+
+`networks` lists the subnets the node sits on (its BACnet `--address` and any
+`--modbus-scan-cidr`); Baler's Connectors page prefills its Modbus sweep with
+the first one. `GET /status` returns the same payload over HTTP, for a node
+reached that way.
+
+Each listed connection (`list_connections`, `modbus_list_connections`, and
+their HTTP `GET`s) carries a `poll_status` too: `state` (`waiting`, `ok`,
+`partial` or `error`), `last_poll_at`, `last_success_at`, `last_value_at`,
+`last_error`, `last_error_at` (unix seconds), and the labels of the points
+whose last read failed. It's in memory only and resets when the connection
+is edited.
 
 `version` is the installed `windrow` package version (`"dev"` if it isn't
 installed). The same topic is the MQTT client's last will, also retained:

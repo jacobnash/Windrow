@@ -21,6 +21,7 @@ import contextlib
 import datetime
 import hmac
 import importlib.metadata
+import ipaddress
 import json
 import os
 import signal
@@ -51,6 +52,17 @@ def _redact(record: dict) -> dict:
     through this - password_ciphertext never appears in an API response,
     same shape as baler/webhooks.py's `_redact_webhook`."""
     return {**record, "credential": credentials.redact(record.get("credential"))}
+
+
+def _with_poll_status(owner, record: dict) -> dict:
+    """A listed connection plus `poll_status` (poll_status.py, Baler#110):
+    whether it's actually reading. Added to the response only - the stored
+    record never carries it."""
+    out = _redact(record)
+    status = getattr(owner, "status", None)
+    if status is not None:
+        out["poll_status"] = status.snapshot(record["id"], len(record.get("points") or ()))
+    return out
 
 
 class NotFound(LookupError):
@@ -105,7 +117,7 @@ async def handle_modbus_discover(body: dict) -> list:
 
 
 async def handle_list_connections(manager: ConnectionManager, body: dict | None = None) -> list:
-    return [_redact(c) for c in await manager.list_connections()]
+    return [_with_poll_status(manager, c) for c in await manager.list_connections()]
 
 
 async def handle_create_connection(manager: ConnectionManager, body: dict) -> dict:
@@ -141,7 +153,16 @@ async def handle_delete_connection(manager: ConnectionManager, body: dict) -> di
 
 
 async def handle_modbus_list_connections(modbus_manager: ModbusConnectionManager, body: dict | None = None) -> list:
-    return [_redact(c) for c in await modbus_manager.list_connections()]
+    return [_with_poll_status(modbus_manager, c) for c in await modbus_manager.list_connections()]
+
+
+async def handle_modbus_test_read(modbus_manager: ModbusConnectionManager, body: dict) -> dict:
+    """{host, register, port?, device_id?} - one holding register from a
+    device before it's a connection, so a wrong host/unit/register shows up
+    before saving (Baler#110). Nothing is stored or published."""
+    return await modbus_manager.test_read(
+        body["host"], body["register"], port=body.get("port", 502), device_id=body.get("device_id", 1)
+    )
 
 
 async def handle_modbus_create_connection(modbus_manager: ModbusConnectionManager, body: dict) -> dict:
@@ -252,7 +273,10 @@ def make_handler(
     modbus_manager: ModbusConnectionManager,
     device_registry: DeviceRegistry,
     loop: asyncio.AbstractEventLoop,
+    status_fn=None,
 ):
+    """`status_fn` builds GET /status - the same payload as the MQTT
+    heartbeat, for a node Baler reaches over HTTP (Baler#114)."""
     gateway_secret = os.environ.get("WINDROW_GATEWAY_SECRET") or None
     cors_origin = os.environ.get("WINDROW_CORS_ORIGIN") or None
 
@@ -369,6 +393,10 @@ def make_handler(
                 self._route("api.post_modbus_discover", handle_modbus_discover, count=True)
                 return
 
+            if self.path == "/modbus/test-read":
+                self._route("api.post_modbus_test_read", lambda body: handle_modbus_test_read(modbus_manager, body))
+                return
+
             if self.path == "/modbus/connections":
                 self._route(
                     "api.post_modbus_connections",
@@ -461,6 +489,13 @@ def make_handler(
 
             if self.path == "/devices":
                 self._route("api.get_devices", lambda _: handle_list_devices(device_registry), body={}, count=True)
+                return
+
+            if self.path == "/status" and status_fn is not None:
+                async def status(_body):  # on the loop, like every other read (module docstring)
+                    return status_fn()
+
+                self._route("api.get_status", status, body={})
                 return
 
             if self.path == "/openapi.yaml":
@@ -581,6 +616,7 @@ def _make_on_command(
         "modbus_create_connection": lambda body: handle_modbus_create_connection(modbus_manager, body),
         "modbus_update_connection": lambda body: handle_modbus_update_connection(modbus_manager, body),
         "modbus_delete_connection": lambda body: handle_modbus_delete_connection(modbus_manager, body),
+        "modbus_test_read": lambda body: handle_modbus_test_read(modbus_manager, body),
         "set_credential": lambda body: handle_set_credential(manager, modbus_manager, device_registry, body),
     }
     result_topic = f"cmd/{site_id}/{instance_id}/result"
@@ -655,7 +691,30 @@ def offline_payload(site_id: str, instance_id: str) -> str:
     return json.dumps({"online": False, "site_id": site_id, "instance_id": instance_id})
 
 
-def build_status(site_id: str, instance_id: str, started_at: str, manager, modbus_manager, device_registry) -> dict:
+def node_networks(address, modbus_cidrs) -> list[str]:
+    """The subnets this node sits on, as CIDRs: its BACnet interface
+    (--address, e.g. 192.168.1.20/24:47808) and any --modbus-scan-cidr.
+    The Connectors page prefills its subnet-sweep dialog from these
+    (Baler#114). A bare address with no mask, or anything unparsable, is
+    skipped rather than guessed at."""
+    out: list[str] = []
+    candidates = []
+    if isinstance(address, str) and "/" in address:
+        candidates.append(address.rsplit(":", 1)[0] if address.count(":") == 1 else address)
+    candidates.extend(modbus_cidrs or [])
+    for value in candidates:
+        try:
+            net = ipaddress.ip_interface(str(value).strip()).network
+        except ValueError:
+            continue
+        if net.num_addresses > 1 and str(net) not in out:
+            out.append(str(net))
+    return out
+
+
+def build_status(
+    site_id: str, instance_id: str, started_at: str, manager, modbus_manager, device_registry, networks=None,
+) -> dict:
     devices = device_registry.list()
     return {
         "online": True,
@@ -668,6 +727,7 @@ def build_status(site_id: str, instance_id: str, started_at: str, manager, modbu
         "modbus_connections": len(modbus_manager.connections),
         "devices": len(devices),
         "pending_devices": sum(1 for d in devices if d.get("status") == "pending"),
+        "networks": list(networks or []),
     }
 
 
@@ -759,16 +819,23 @@ async def async_main(args) -> None:
     device_registry = DeviceRegistry(args.devices_state_file)
     await device_registry.start()
 
+    started_at = _now_iso()
+    networks = node_networks(getattr(args, "address", None), args.modbus_scan_cidr)
+
+    def status_fn() -> dict:
+        return build_status(
+            args.site_id, args.instance_id, started_at, manager, modbus_manager, device_registry, networks,
+        )
+
     if command_topic:
         mqtt_client.message_callback_add(
             command_topic,
             _make_on_command(manager, loop, args.site_id, args.instance_id, modbus_manager, device_registry),
         )
-        started_at = _now_iso()
         heartbeat_task = loop.create_task(run_status_heartbeat(
             mqtt_client,
             status_topic(args.site_id, args.instance_id),
-            lambda: build_status(args.site_id, args.instance_id, started_at, manager, modbus_manager, device_registry),
+            status_fn,
             heartbeat_wake,
         ))
         heartbeat_task.add_done_callback(_crash_logger("status heartbeat"))
@@ -785,7 +852,7 @@ async def async_main(args) -> None:
         modbus_scan_task.add_done_callback(_crash_logger(f"modbus periodic scan ({cidr})"))
 
     server = ThreadingHTTPServer(
-        (args.host, args.port), make_handler(manager, modbus_manager, device_registry, loop)
+        (args.host, args.port), make_handler(manager, modbus_manager, device_registry, loop, status_fn)
     )
     server.daemon_threads = True  # unset default is False - a hung request would otherwise block shutdown
 

@@ -20,6 +20,7 @@ from bacpypes3.app import Application
 from windrow import bacnet_tagger, connection_store, discovery, mqtt_sink, tracing
 from windrow.bacnet_read import read_present_value
 from windrow.bacnet_values import normalize_value
+from windrow.poll_status import PollStatus
 
 tracer = tracing.get_tracer(__name__)
 
@@ -187,6 +188,8 @@ class ConnectionManager:
         self.instance_id = instance_id
         self.connections: dict[str, dict] = {}
         self.tasks: dict[str, asyncio.Task] = {}
+        # In-memory poll health per connection, never persisted (Baler#110).
+        self.status = PollStatus()
         self._read_slots: asyncio.Semaphore | None = None
 
     def _slots(self) -> asyncio.Semaphore:
@@ -362,6 +365,7 @@ class ConnectionManager:
             if task is not None:
                 task.cancel()
             del self.connections[connection_id]
+            self.status.reset(connection_id)
             self._save()
             span.set_attribute("found", True)
             return True
@@ -388,6 +392,7 @@ class ConnectionManager:
                 record["topic_prefix"] = connection_store.check_topic_prefix(patch["topic_prefix"])
 
             await stop_task(self.tasks.pop(connection_id, None))
+            self.status.reset(connection_id)
             self.connections[connection_id] = record
             self._save()
 
@@ -502,6 +507,7 @@ class ConnectionManager:
                 # A failed read publishes nothing: a null reading made a dead
                 # device look like it was reporting downstream (Baler#83/#85).
                 failures += 1
+                self.status.failure(record["id"], point["label"], exc)
                 if failures in (1, 5) or failures % 50 == 0:  # don't flood the log with a dead device
                     print(f"read failed for {point['object_identifier']} ({failures}x): {exc!r}")
                 await asyncio.sleep(failure_backoff(interval, failures))
@@ -511,7 +517,7 @@ class ConnectionManager:
             failures = 0
 
             now = time.monotonic()
-            if should_publish(
+            publish = should_publish(
                 value,
                 last_value,
                 last_published_at,
@@ -519,10 +525,12 @@ class ConnectionManager:
                 his_collect_cov=point.get("his_collect_cov"),
                 his_collect_cov_rate_limit=point.get("his_collect_cov_rate_limit"),
                 his_collect_interval=point.get("his_collect_interval"),
-            ):
+            )
+            if publish:
                 mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value)
                 last_value = value
                 last_published_at = now
+            self.status.success(record["id"], point["label"], published=publish)
 
             await asyncio.sleep(failure_backoff(interval, failures))
 

@@ -30,8 +30,9 @@ def test_build_status_shape():
     status = api.build_status("site-a", "inst-1", "2026-01-01T00:00:00+00:00", *_managers())
     assert set(status) == {
         "online", "site_id", "instance_id", "version", "started_at", "ts",
-        "bacnet_connections", "modbus_connections", "devices", "pending_devices",
+        "bacnet_connections", "modbus_connections", "devices", "pending_devices", "networks",
     }
+    assert status["networks"] == []
     assert status["online"] is True
     assert (status["site_id"], status["instance_id"]) == ("site-a", "inst-1")
     assert status["version"] == api.package_version() and status["version"]
@@ -40,6 +41,20 @@ def test_build_status_shape():
     assert (status["bacnet_connections"], status["modbus_connections"]) == (2, 1)
     assert (status["devices"], status["pending_devices"]) == (3, 2)
     json.dumps(status)
+
+
+def test_build_status_carries_networks():
+    status = api.build_status("s", "i", "2026-01-01T00:00:00+00:00", *_managers(), ["192.168.1.0/24"])
+    assert status["networks"] == ["192.168.1.0/24"]
+
+
+def test_node_networks_from_bacnet_address_and_modbus_cidrs():
+    assert api.node_networks("192.168.1.20/24:47808", ["10.0.0.0/22", "192.168.1.0/24"]) == [
+        "192.168.1.0/24", "10.0.0.0/22",
+    ]
+    assert api.node_networks("192.168.1.20", None) == []  # no mask: not guessed
+    assert api.node_networks(None, ["not-a-cidr"]) == []
+    assert api.node_networks("10.1.2.3/32", []) == []  # a single host isn't a subnet to sweep
 
 
 def test_package_version_falls_back_to_dev(monkeypatch):

@@ -293,3 +293,30 @@ def test_new_routes_match_the_documented_schemas(harness):
 
     status, error = harness.http("PATCH", "/connections/nope", {"poll_interval": 1})
     _assert_matches_schema(error, _schema_for(spec, "/connections/{id}", "patch", str(status)), spec)
+
+
+def test_listings_carry_poll_status_matching_the_schema(harness):
+    import yaml
+    from test_openapi import _assert_matches_schema, _schema_for
+
+    from windrow.api import OPENAPI_SPEC_PATH
+
+    with open(OPENAPI_SPEC_PATH) as f:
+        spec = yaml.safe_load(f)
+    harness.http("POST", "/modbus/connections", {**MODBUS_CONN, "credential": None})
+    status, listed = harness.http("GET", "/modbus/connections")
+    assert listed[0]["poll_status"]["state"] in ("waiting", "error")  # FakeModbusClient never connects
+    _assert_matches_schema(listed, _schema_for(spec, "/modbus/connections", "get", str(status)), spec)
+    over_mqtt = harness.send({"action": "modbus_list_connections"})["result"]
+    assert "poll_status" in over_mqtt[0]
+    # never written into the stored record
+    assert all("poll_status" not in r for r in harness.modbus_manager.connections.values())
+
+
+def test_modbus_test_read_route_and_action(harness):
+    status, body = harness.http("POST", "/modbus/test-read", {"host": "10.0.0.9", "register": 0})
+    assert status == 400 and "can't connect" in body["error"]  # FakeModbusClient never connects
+    result = harness.send({"action": "modbus_test_read", "host": "10.0.0.9", "register": 0})
+    assert result["ok"] is False and "can't connect" in result["error"]
+    status, body = harness.http("POST", "/modbus/test-read", {"host": "10.0.0.9"})
+    assert status == 400

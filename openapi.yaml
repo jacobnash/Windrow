@@ -338,6 +338,36 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/ServerError"
+  /modbus/test-read:
+    post:
+      operationId: modbusTestRead
+      summary: Read one holding register from a device before connecting it
+      description: >-
+        Opens a fresh connection, reads `register` once and closes it again.
+        Nothing is stored or published. A host that doesn't answer, or an
+        exception code from the device, is a 400 with what went wrong.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModbusTestReadRequest"
+            examples:
+              default:
+                value: { "host": "192.168.1.50", "port": 502, "device_id": 1, "register": 0 }
+      responses:
+        "200":
+          description: The register's value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModbusTestReadResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "504":
+          $ref: "#/components/responses/Timeout"
+        "500":
+          $ref: "#/components/responses/ServerError"
   /modbus/connections:
     post:
       operationId: createModbusConnection
@@ -648,6 +678,19 @@ paths:
           description: No device with that id.
         "500":
           $ref: "#/components/responses/ServerError"
+  /status:
+    get:
+      operationId: getStatus
+      summary: This node's status (the heartbeat's payload, over HTTP)
+      responses:
+        "200":
+          description: Same fields as the retained cmd/<site>/<instance>/status heartbeat.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeStatus"
+        "500":
+          $ref: "#/components/responses/ServerError"
   /openapi.yaml:
     get:
       operationId: getOpenApiSpec
@@ -804,7 +847,64 @@ components:
               example: 419dff013a6d4d7783b43e6603ccefd7
             credential:
               $ref: "#/components/schemas/RedactedCredential"
+            poll_status:
+              $ref: "#/components/schemas/PollStatus"
         - $ref: "#/components/schemas/CreateConnectionRequest"
+    PollStatus:
+      type: object
+      description: >-
+        Listings only: whether this connection is actually reading, since
+        the process started. Kept in memory and never stored on the record;
+        it resets when the connection is updated. Times are unix seconds.
+      properties:
+        state:
+          type: string
+          enum: [waiting, ok, partial, error]
+          description: waiting = nothing polled yet; partial = some points failing; error = every point failing.
+        last_poll_at: { type: [number, "null"] }
+        last_success_at: { type: [number, "null"] }
+        last_value_at: { type: [number, "null"], description: When a value was last published. }
+        last_error: { type: [string, "null"] }
+        last_error_at: { type: [number, "null"] }
+        failing_count: { type: integer }
+        failing_points:
+          type: array
+          items: { type: string }
+          description: Labels of the points whose last read failed (at most 20).
+    ModbusTestReadRequest:
+      type: object
+      required: [host, register]
+      properties:
+        host: { type: string, example: "192.168.1.50" }
+        port: { type: integer, default: 502 }
+        device_id: { type: integer, default: 1, description: Modbus unit id. }
+        register: { type: integer, minimum: 0, maximum: 65535 }
+    ModbusTestReadResult:
+      type: object
+      properties:
+        host: { type: string }
+        port: { type: integer }
+        device_id: { type: integer }
+        register: { type: integer }
+        value: { type: [integer, "null"] }
+    NodeStatus:
+      type: object
+      description: The status heartbeat's payload (docs/command-channel.md).
+      properties:
+        online: { type: boolean }
+        site_id: { type: [string, "null"] }
+        instance_id: { type: [string, "null"] }
+        version: { type: string }
+        started_at: { type: string, format: date-time }
+        ts: { type: string, format: date-time }
+        bacnet_connections: { type: integer }
+        modbus_connections: { type: integer }
+        devices: { type: integer }
+        pending_devices: { type: integer }
+        networks:
+          type: array
+          items: { type: string }
+          description: Subnets this node sits on (its BACnet --address and any --modbus-scan-cidr), as CIDRs.
     SetCredentialRequest:
       type: object
       required: [username, password]
@@ -925,6 +1025,8 @@ components:
               type: string
             credential:
               $ref: "#/components/schemas/RedactedCredential"
+            poll_status:
+              $ref: "#/components/schemas/PollStatus"
         - $ref: "#/components/schemas/CreateModbusConnectionRequest"
     UpdateConnectionRequest:
       type: object
