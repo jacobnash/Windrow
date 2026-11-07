@@ -267,6 +267,15 @@ for unit_file in /etc/systemd/system/windrow-*.service; do
     "$([ -n "$started" ] && date -d "@$started" '+%F %T' || echo -)"
 done
 echo "    Logs: journalctl -u ${SVC} -f"
+# Only nag about the broker account when it isn't filled in yet: the hint
+# printed on every re-run, even on Pis long since configured.
+env_value() { sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | tail -n 1; }
 case "$ROLE" in weather|gateway)
-  echo "    set MQTT_USERNAME/MQTT_PASSWORD (and WINDROW_SITE_ID for gateway) in ${ENV_FILE}, then: systemctl restart windrow-${ROLE}";;
+  missing=""
+  [ -n "$(env_value MQTT_USERNAME)" ] || missing="$missing MQTT_USERNAME"
+  [ -n "$(env_value MQTT_PASSWORD)" ] || missing="$missing MQTT_PASSWORD"
+  if [ "$ROLE" = gateway ] && [ -z "$(env_value WINDROW_SITE_ID)" ]; then missing="$missing WINDROW_SITE_ID"; fi
+  if [ -n "$missing" ]; then
+    echo "    set${missing} in ${ENV_FILE}, then: systemctl restart windrow-${ROLE}"
+  fi;;
 esac
