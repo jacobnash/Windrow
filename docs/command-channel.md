@@ -150,8 +150,13 @@ on `cmd/<site-id>/<instance-id>/status`, published at startup, on every
 {"online": true, "site_id": "hospital-a", "instance_id": "ahu-bridge-1",
  "version": "0.1.0", "started_at": "2026-11-07T09:00:00.123456+00:00",
  "ts": "2026-11-07T09:05:00.654321+00:00",
- "bacnet_connections": 3, "modbus_connections": 1, "devices": 9, "pending_devices": 2}
+ "bacnet_connections": 3, "modbus_connections": 1, "devices": 9, "pending_devices": 2,
+ "bacnet_requests": {"read_property_multiple": 1200, "subscribe_cov": 40,
+                     "cov_notifications": 310, "cov_subscriptions": 20}}
 ```
+
+`bacnet_requests` counts BACnet requests sent since startup, by kind, plus
+the number of live COV subscriptions - see bacnet-discovery-api.md 3c.
 
 `version` is the installed `windrow` package version (`"dev"` if it isn't
 installed). The same topic is the MQTT client's last will, also retained:

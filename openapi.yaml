@@ -232,9 +232,11 @@ paths:
           $ref: "#/components/responses/ServerError"
     patch:
       operationId: updateConnection
-      summary: Edit a connection's points, poll interval or topic prefix
+      summary: Edit a connection's points, poll interval, topic prefix or read options
       description: >-
-        Send any subset of `points`, `poll_interval` and `topic_prefix`;
+        Send any subset of `points`, `poll_interval`, `topic_prefix` and the
+        read options (`read_multiple`, `read_multiple_max`, `subscribe_cov`,
+        `cov_lifetime`, `cov_poll_interval`);
         anything else is a 400 (a typo'd field is refused, not ignored).
         `points` replaces the whole list, and each point keeps only the
         fields `PointRef` documents (so `/learn` output can be sent as-is;
@@ -783,6 +785,13 @@ components:
           type: number
           description: Alternative to his_collect_cov - publish at most this often regardless of whether the value changed, independent of poll_interval (matches Haystack's hisCollectInterval).
           example: 300.0
+        subscribe_cov:
+          type: boolean
+          description: >-
+            Overrides the connection's `subscribe_cov` for this point - e.g.
+            `false` for a point whose device floods notifications. (Not
+            the same thing as `his_collect_cov`, which filters what gets
+            published, however the value arrived.)
     CreateConnectionRequest:
       type: object
       required: [device_address, device_instance, topic_prefix, points]
@@ -806,6 +815,48 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/PointRef"
+        read_multiple:
+          type: boolean
+          default: true
+          description: >-
+            Read with ReadPropertyMultiple. Reads are batched per device,
+            across every connection on it: points on one device tick
+            together and go out as one request per `read_multiple_max`
+            objects. A device that rejects RPM is read with one
+            ReadProperty per point from then on; one whose answer doesn't
+            fit an APDU gets smaller batches. `false` keeps one
+            ReadProperty per point for this connection.
+        read_multiple_max:
+          type: integer
+          minimum: 1
+          maximum: 500
+          description: >-
+            Most objects per ReadPropertyMultiple to this device. Default:
+            what fits the device's max APDU (from its I-Am), at most
+            WINDROW_RPM_MAX_POINTS (50). With several connections on one
+            device the smallest value wins.
+        subscribe_cov:
+          type: boolean
+          default: false
+          description: >-
+            SubscribeCOV for every point (a point's own `subscribe_cov`
+            overrides it), so a change publishes as soon as the device
+            notifies. While a point's subscription is live it is still
+            polled, every `cov_poll_interval`, in case a notification is
+            lost; if the subscription fails it's polled at its normal
+            interval and re-subscribed with back-off, and an object the
+            device won't do COV for is just polled.
+        cov_lifetime:
+          type: integer
+          minimum: 10
+          maximum: 86400
+          default: 300
+          description: Seconds each COV subscription asks the device for. Renewed at half that.
+        cov_poll_interval:
+          type: number
+          exclusiveMinimum: 0
+          default: 300
+          description: Seconds between the safety-net polls of a point whose COV subscription is live.
         credential:
           description: Optional - the login this device's own UI/gateway needs, if any. Write-only on create; a created/listed Connection always shows this redacted (see RedactedCredential).
           oneOf:
@@ -1050,6 +1101,16 @@ components:
         topic_prefix:
           type: string
           description: No `+`/`#`; a trailing `/` is dropped.
+        read_multiple:
+          $ref: "#/components/schemas/CreateConnectionRequest/properties/read_multiple"
+        read_multiple_max:
+          $ref: "#/components/schemas/CreateConnectionRequest/properties/read_multiple_max"
+        subscribe_cov:
+          $ref: "#/components/schemas/CreateConnectionRequest/properties/subscribe_cov"
+        cov_lifetime:
+          $ref: "#/components/schemas/CreateConnectionRequest/properties/cov_lifetime"
+        cov_poll_interval:
+          $ref: "#/components/schemas/CreateConnectionRequest/properties/cov_poll_interval"
     UpdateModbusConnectionRequest:
       type: object
       minProperties: 1
