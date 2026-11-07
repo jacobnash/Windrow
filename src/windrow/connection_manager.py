@@ -8,6 +8,7 @@ async and touches only loop-thread-owned state.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import random
@@ -88,6 +89,53 @@ COMMANDABLE_TYPES = {
     "analog-output", "analog-value", "binary-output", "binary-value",
     "multi-state-output", "multi-state-value",
 }
+
+
+# What a stored BACnet point keeps. Anything else a caller sends (e.g. the
+# present_value snapshot /learn returns) is dropped on update rather than
+# frozen into the state file as if it meant something.
+POINT_FIELDS = {
+    "object_identifier", "label", "units", "description", "poll_interval",
+    "his_collect_cov", "his_collect_cov_rate_limit", "his_collect_interval",
+}
+UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix"}
+
+
+def validate_points(points) -> list[dict]:
+    """A non-empty list of {object_identifier, label, ...} with unique
+    labels (two points on one label would publish to the same topic)."""
+    if not isinstance(points, list) or not points:
+        raise ValueError("points must be a non-empty list of {object_identifier, label} objects")
+    cleaned, labels = [], set()
+    for point in points:
+        if not isinstance(point, dict):
+            raise ValueError(f"each point must be an object, got {point!r}")  # noqa: TRY004 - ValueError means 400 / ok:false
+        connection_store.check_text("object_identifier", point.get("object_identifier"))
+        label = connection_store.check_text("label", point.get("label"))
+        if label in labels:
+            raise ValueError(f"duplicate point label {label!r}")
+        labels.add(label)
+        if "poll_interval" in point:
+            connection_store.check_number("point poll_interval", point["poll_interval"])
+        cov = point.get("his_collect_cov")
+        if cov is not None and not isinstance(cov, (bool, int, float)):
+            raise ValueError(f"his_collect_cov must be true/false or a number, got {cov!r}")
+        for key in ("his_collect_cov_rate_limit", "his_collect_interval"):
+            if point.get(key) is not None:
+                connection_store.check_number(key, point[key])
+        cleaned.append({k: v for k, v in point.items() if k in POINT_FIELDS})
+    return cleaned
+
+
+async def stop_task(task: asyncio.Task | None) -> None:
+    """Cancel and wait for it to actually finish, so nothing it was in the
+    middle of (a read, a publish) lands after the caller moves on - e.g. a
+    stale value republished to a topic update_connection just cleared."""
+    if task is None:
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
 
 
 class PointWriteError(ValueError):
@@ -247,8 +295,10 @@ class ConnectionManager:
                     tags["writable"] = True
                 # The BACnet units the point was learned with, as Haystack's
                 # `unit` tag - Baler shows curVal/history with it, and unit
-                # filters (`temp > 70°F`) need it.
-                unit = bacnet_tagger.haystack_unit(point.get("units"))
+                # filters (`temp > 70°F`) need it. An explicit Haystack
+                # `unit` on the point wins, for a device that reports none
+                # or the wrong one (Baler#82).
+                unit = point.get("unit") or bacnet_tagger.haystack_unit(point.get("units"))
                 tag_payload: dict = dict(tags)
                 if unit:
                     tag_payload["unit"] = unit
@@ -315,6 +365,49 @@ class ConnectionManager:
             self._save()
             span.set_attribute("found", True)
             return True
+
+    async def update_connection(self, connection_id: str, patch: dict) -> dict | None:
+        """Edit points/poll_interval/topic_prefix in place: validate, persist,
+        restart this connection's poll tasks, clear the retained value and
+        tags of every point that no longer publishes where it did (all of
+        them when the prefix moves - including the old equip record), then
+        retag. The id survives, so the device registry's link to it does too."""
+        with tracer.start_as_current_span("connection_manager.update_connection") as span:
+            span.set_attribute("connection_id", connection_id)
+            old = self.connections.get(connection_id)
+            if old is None:
+                span.set_attribute("found", False)
+                return None
+            connection_store.check_patch(patch, UPDATABLE_FIELDS)
+            record = dict(old)
+            if "points" in patch:
+                record["points"] = validate_points(patch["points"])
+            if "poll_interval" in patch:
+                record["poll_interval"] = connection_store.check_number("poll_interval", patch["poll_interval"])
+            if "topic_prefix" in patch:
+                record["topic_prefix"] = connection_store.check_topic_prefix(patch["topic_prefix"])
+
+            await stop_task(self.tasks.pop(connection_id, None))
+            self.connections[connection_id] = record
+            self._save()
+
+            old_labels = [p["label"] for p in old["points"]]
+            if record["topic_prefix"] != old["topic_prefix"]:
+                removed = old_labels
+                mqtt_sink.clear_retained(self.mqtt_client, old["topic_prefix"], "equip/tags")
+            else:
+                kept = {p["label"] for p in record["points"]}
+                removed = [label for label in old_labels if label not in kept]
+            for label in removed:
+                mqtt_sink.clear_retained(self.mqtt_client, old["topic_prefix"], label)
+                mqtt_sink.clear_retained(self.mqtt_client, old["topic_prefix"], f"{label}/tags")
+
+            self._tag_points(record["topic_prefix"], record["points"])
+            self._publish_equip_membership(record["topic_prefix"], record["points"])
+            self._start_poll_task(record)
+            span.set_attribute("found", True)
+            span.set_attribute("cleared_count", len(removed))
+            return record
 
     async def list_connections(self) -> list[dict]:
         with tracer.start_as_current_span("connection_manager.list_connections") as span:
