@@ -25,7 +25,9 @@ from bacpypes3.errors import ExecutionError
 from bacpypes3.local.analog import AnalogValueObjectCmd
 from bacpypes3.local.binary import BinaryValueObjectCmd
 from bacpypes3.local.object import Object as _LocalObject
-from bacpypes3.object import TrendLogObject
+from bacpypes3.local.schedule import ScheduleObject
+from bacpypes3.object import CalendarObject, TrendLogObject
+from bacpypes3.primitivedata import Enumerated
 
 from windrow import bacnet_trend
 
@@ -192,9 +194,72 @@ def _forward(rng) -> bool:
     return True
 
 
+class MockCalendar(_LocalObject, CalendarObject):
+    """bacpypes3 has CalendarObject's definition but no local object for it."""
+
+    async def _post_init(self):
+        # the local Object's version looks up a notificationClass, which a
+        # Calendar doesn't have (it raises AttributeError in a stray task)
+        return None
+
+
+# The mock's schedule (Baler#165), as the spec says it should be: occupied
+# 07:00-18:00 on weekdays, all day off on the holidays in calendar,1, and
+# an early close the fourth Thursday of November.
+MOCK_WEEKLY = [[("07:00", "active"), ("18:00", "inactive")]] * 5 + [[], []]
+MOCK_HOLIDAYS = ["2026-12-25", "*-01-01"]
+
+
+def _time(text: str):
+    hour, minute = (int(x) for x in text.split(":"))
+    return (hour, minute, 0, 0)
+
+
+def _binary(value: str):
+    return Enumerated(1 if value == "active" else 0)
+
+
+def _mock_schedule_objects(target) -> list:
+    """schedule,1 driving `target`'s present-value, and calendar,1."""
+    from bacpypes3.basetypes import (
+        CalendarEntry,
+        DailySchedule,
+        DateRange,
+        SpecialEvent,
+        TimeValue,
+    )
+    from bacpypes3.primitivedata import Date
+
+    def day(entries):
+        return DailySchedule(daySchedule=[TimeValue(time=_time(t), value=_binary(v)) for t, v in entries])
+
+    def date(text):
+        year, month, dom = text.split("-")
+        return Date((255 if year == "*" else int(year) - 1900, int(month), int(dom), 255))
+
+    calendar = MockCalendar(objectIdentifier=("calendar", 1), objectName="holidays", presentValue=False,
+                            dateList=[CalendarEntry(date=date(d)) for d in MOCK_HOLIDAYS])
+    schedule = ScheduleObject(
+        objectIdentifier=("schedule", 1), objectName="occupancy", presentValue=_binary("inactive"),
+        effectivePeriod=DateRange(startDate=date("2000-01-01"), endDate=date("2099-12-31")),
+        weeklySchedule=[day(entries) for entries in MOCK_WEEKLY],
+        exceptionSchedule=[
+            SpecialEvent(period={"calendarReference": calendar.objectIdentifier},
+                         listOfTimeValues=[TimeValue(time=_time("00:00"), value=_binary("inactive"))], eventPriority=1),
+            SpecialEvent(period={"calendarEntry": CalendarEntry(weekNDay=bytes([11, 4, 4]))},
+                         listOfTimeValues=[TimeValue(time=_time("07:00"), value=_binary("active")),
+                                           TimeValue(time=_time("12:00"), value=_binary("inactive"))], eventPriority=10),
+        ],
+        scheduleDefault=_binary("inactive"),
+        listOfObjectPropertyReferences=[{"objectIdentifier": target.objectIdentifier, "propertyIdentifier": "present-value"}],
+        priorityForWriting=10, statusFlags=[0, 0, 0, 0], reliability="no-fault-detected", outOfService=False,
+    )
+    return [calendar, schedule]
+
+
 class MockDevice:
     def __init__(self, args=None, site_spec: list[dict] | None = None, trend_log_interval: float | None = None,
-                 app: Application | None = None):
+                 app: Application | None = None, schedules: bool = False):
         # `app`: an already-built Application, e.g. one on a virtual
         # network behind windrow.mock_router instead of on BACnet/IP (that
         # one has no ReadRange server, so no trend logs there)
@@ -216,6 +281,15 @@ class MockDevice:
                 self.app.add_object(trend)
                 self.trend_logs.append(trend)
                 asyncio.create_task(trend.run())
+
+        # A schedule and a holiday calendar (Baler#165), driving the first
+        # binary object; off by default, like the trend logs.
+        if schedules:
+            target = next((obj for obj, _ in self.objects if str(obj.objectIdentifier[0]).startswith("binary")), None)
+            if target is None:
+                raise SystemExit("--schedules needs a binary object for the schedule to drive")
+            for obj in _mock_schedule_objects(target):
+                self.app.add_object(obj)
 
         asyncio.create_task(self._simulate())
 
@@ -245,9 +319,14 @@ async def main() -> None:
         "--trend-log-interval", type=float, default=None,
         help="seconds; adds a TrendLog (trend-log,1..N, in object order) logging each object's present-value",
     )
+    parser.add_argument(
+        "--schedules", action="store_true",
+        help="adds schedule,1 (weekdays 07:00-18:00, holiday and early-close exceptions) driving the first binary "
+        "object, and calendar,1 (the holidays)",
+    )
     args = parser.parse_args()
     site_spec = _load_site_spec(args.site_spec) if args.site_spec else None
-    MockDevice(args, site_spec=site_spec, trend_log_interval=args.trend_log_interval)
+    MockDevice(args, site_spec=site_spec, trend_log_interval=args.trend_log_interval, schedules=args.schedules)
     await asyncio.Future()  # run forever
 
 
