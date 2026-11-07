@@ -23,6 +23,9 @@ from windrow.modbus_bridge import normalize_value
 
 tracer = tracing.get_tracer(__name__)
 
+# Longest wait between reconnect attempts to an unreachable device.
+RECONNECT_MAX = 60.0
+
 
 class ModbusConnectionManager:
     def __init__(self, mqtt_client, state_file: str):
@@ -126,10 +129,10 @@ class ModbusConnectionManager:
         connection_store.save(self.state_file, list(self.connections.values()))
 
     async def _start_poll_task(self, record: dict) -> None:
-        client = ModbusClient.AsyncModbusTcpClient(record["host"], port=record["port"])
-        await client.connect()
-        self.clients[record["id"]] = client
-        task = asyncio.get_event_loop().create_task(self._poll_loop(record, client))
+        """Never connects here: the poll loop owns the client, so a device
+        that isn't listening yet (or is rebooting) is retried by the loop
+        instead of leaving a dead client behind (Baler#83)."""
+        task = asyncio.get_event_loop().create_task(self._poll_loop(record))
         task.add_done_callback(self._make_crash_logger(record["id"]))
         self.tasks[record["id"]] = task
 
@@ -147,14 +150,68 @@ class ModbusConnectionManager:
 
         return on_done
 
-    async def _poll_loop(self, record: dict, client: ModbusClient.AsyncModbusTcpClient) -> None:
+    def _new_client(self, record: dict) -> ModbusClient.AsyncModbusTcpClient:
+        # reconnect_delay=0 turns pymodbus's own background reconnect off:
+        # the poll loop reconnects on its own schedule, and the library's
+        # task never retried a first connect that failed (Baler#83).
+        return ModbusClient.AsyncModbusTcpClient(record["host"], port=record["port"], reconnect_delay=0)
+
+    async def _connect(self, record: dict) -> ModbusClient.AsyncModbusTcpClient | None:
+        old = self.clients.pop(record["id"], None)
+        if old is not None:
+            old.close()
+        client = self._new_client(record)
+        self.clients[record["id"]] = client
+        try:
+            if await client.connect():
+                return client
+        except Exception as exc:  # noqa: BLE001 - any connect failure means "retry later"
+            print(f"modbus connect to {record['host']}:{record['port']} raised {exc!r}")
+        return None
+
+    async def _poll_loop(self, record: dict) -> None:
+        """Read every point, publish what was read, sleep, repeat.
+
+        A failed read publishes nothing - a null reading made a dead
+        controller look alive downstream (Baler#83/#85). While the device
+        is unreachable the loop reconnects with backoff, from one poll
+        interval up to RECONNECT_MAX seconds, and resumes on its own when
+        the device comes back. A cycle where every read fails on a client
+        that still claims to be connected (a half-open socket) forces a
+        fresh connection too."""
+        where = f"{record['host']}:{record['port']}"
+        client = None
+        backoff = record["poll_interval"]
+        down_since: float | None = None
+        attempts = 0
         while True:
+            if client is None or not client.connected:
+                client = await self._connect(record)
+                if client is None:
+                    attempts += 1
+                    if down_since is None:
+                        down_since = asyncio.get_event_loop().time()
+                    if attempts in (1, 5) or attempts % 50 == 0:
+                        print(f"modbus device {where} unreachable ({attempts} attempts); retrying in {backoff:g}s")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max(RECONNECT_MAX, record["poll_interval"]))
+                    continue
+                if down_since is not None:
+                    print(f"modbus device {where} reconnected after {attempts} attempts")
+                down_since, attempts, backoff = None, 0, record["poll_interval"]
+
+            raised = 0
             for label, address in record["points"].items():
                 try:
                     rr = await client.read_holding_registers(address, count=1, device_id=record["device_id"])
-                    value = None if rr.isError() else normalize_value(rr.registers)
-                except Exception as exc:
-                    value = None
+                except Exception as exc:  # noqa: BLE001 - a lost session raises many types; all mean reconnect
+                    raised += 1
                     print(f"modbus read failed for {label}@{address}: {exc!r}")
-                mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], label, value)
+                    continue
+                if rr.isError():  # the device answered with an exception code: the session is fine
+                    print(f"modbus read error for {label}@{address}: {rr}")
+                    continue
+                mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], label, normalize_value(rr.registers))
+            if record["points"] and raised == len(record["points"]):
+                client.close()  # every read raised: next cycle reconnects
             await asyncio.sleep(record["poll_interval"])
