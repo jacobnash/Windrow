@@ -1,0 +1,59 @@
+# Tokens (lowercased, split on -/_/,/space) extracted from a learned BACnet
+# point's label/object_identifier/description -> Haystack marker tags. See
+# windrow/src/windrow/bacnet_tagger.py's docstring for why this exists and how it
+# hands off to Baler's existing mapping.classify_point unchanged.
+#
+# Every `tags` list here is deliberately an exact tag set from
+# baler's rules/haystack_to_brick.yaml (not a superset/subset) - so
+# a BACnet point auto-tagged from this file gets a *direct* Brick match on
+# the Baler side, not a PROJ fallback, proving the two rule files
+# actually connect end to end. Every tag is a real Haystack v4 marker (see
+# the verification note at the top of baler's
+# rules/haystack_to_brick.yaml - same source, not re-guessed here).
+rules:
+  - match: [zone, temp]
+    tags: [zone, air, temp, sensor]
+  - match: [zone, temp, sp]
+    tags: [zone, air, temp, sp]
+  - match: [zone, temp, setpoint]
+    tags: [zone, air, temp, sp]
+  - match: [discharge, temp]
+    tags: [discharge, air, temp, sensor]
+  - match: [supply, temp]
+    tags: [discharge, air, temp, sensor]
+  - match: [return, temp]
+    tags: [return, air, temp, sensor]
+  - match: [mixed, temp]
+    tags: [mixed, air, temp, sensor]
+  - match: [outside, temp]
+    tags: [outside, air, temp, sensor]
+  - match: [zone, humidity]
+    tags: [zone, air, humidity, sensor]
+  - match: [zone, co2]
+    tags: [zone, co2, sensor]
+  - match: [fan, status]
+    tags: [fan, run, sensor]
+  - match: [fan, cmd]
+    tags: [fan, cmd]
+  - match: [fan, command]
+    tags: [fan, cmd]
+  - match: [damper, cmd]
+    tags: [damper, cmd]
+  - match: [damper, command]
+    tags: [damper, cmd]
+  - match: [damper, pos]
+    tags: [damper, sensor]
+  - match: [damper, position]
+    tags: [damper, sensor]
+  - match: [valve, cmd]
+    tags: [valve, cmd]
+  - match: [valve, command]
+    tags: [valve, cmd]
+  - match: [valve, pos]
+    tags: [valve, sensor]
+  - match: [valve, position]
+    tags: [valve, sensor]
+  - match: [kw, demand]
+    tags: [elec, demand, sensor]
+  - match: [kwh, total]
+    tags: [elec, energy, sensor]
