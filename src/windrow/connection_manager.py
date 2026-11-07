@@ -247,8 +247,10 @@ class ConnectionManager:
                     tags["writable"] = True
                 # The BACnet units the point was learned with, as Haystack's
                 # `unit` tag - Baler shows curVal/history with it, and unit
-                # filters (`temp > 70°F`) need it.
-                unit = bacnet_tagger.haystack_unit(point.get("units"))
+                # filters (`temp > 70°F`) need it. An explicit Haystack
+                # `unit` on the point wins, for a device that reports none
+                # or the wrong one (Baler#82).
+                unit = point.get("unit") or bacnet_tagger.haystack_unit(point.get("units"))
                 tag_payload: dict = dict(tags)
                 if unit:
                     tag_payload["unit"] = unit

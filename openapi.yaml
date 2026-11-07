@@ -295,6 +295,11 @@ paths:
         register addresses are opaque and vendor-documented, so `points`
         is a plain `{label: register_address}` map you supply directly,
         not something a `/learn`-equivalent suggests.
+        Like a BACnet connection, it also publishes (retained) each point's
+        Haystack tags on `{topic_prefix}/{label}/tags` - markers from the
+        label's words, plus `unit` from `units` - and one
+        `{topic_prefix}/equip/tags` naming its points, so Baler gives the
+        connection an equipment record.
       requestBody:
         required: true
         content:
@@ -589,6 +594,17 @@ components:
           type: string
           description: MQTT topic segment for this point - freely renameable from what /learn suggested.
           example: zone-temp
+        units:
+          type: ["string", "null"]
+          description: The BACnet units /learn reported for this point (pass it through). Published as the point's Haystack `unit` tag.
+          example: degrees-fahrenheit
+        description:
+          type: ["string", "null"]
+          description: The description /learn reported. Its words help tag the point (rules/bacnet_to_haystack_tags.yaml).
+        unit:
+          type: string
+          description: An explicit Haystack unit symbol for the point's `unit` tag, overriding `units` - for a device that reports none or the wrong one.
+          example: "°F"
         poll_interval:
           type: number
           description: Seconds between reads of this specific point, overriding the connection-level default. Each point runs its own independent poll loop - a fast-changing point and a slow one on the same device don't have to share a cadence.
@@ -751,6 +767,12 @@ components:
           default: 5.0
         points:
           $ref: "#/components/schemas/ModbusPoints"
+        units:
+          type: object
+          description: Optional Haystack unit symbol per point label (a register is just a number). Published as each point's `unit` tag on `{topic_prefix}/{label}/tags`.
+          additionalProperties:
+            type: string
+          example: { "zone-temp": "°F" }
         credential:
           oneOf:
             - $ref: "#/components/schemas/SetCredentialRequest"

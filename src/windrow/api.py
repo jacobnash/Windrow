@@ -220,6 +220,7 @@ def make_handler(
                             device_id=body.get("device_id", 1),
                             poll_interval=body.get("poll_interval", 5.0),
                             credential=credential,
+                            units=body.get("units"),
                         ),
                         loop,
                     )
