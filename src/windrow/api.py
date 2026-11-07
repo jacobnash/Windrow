@@ -84,10 +84,15 @@ async def handle_learn(manager: ConnectionManager, body: dict) -> list:
     return await manager.learn(body["device_address"], body["device_instance"])
 
 
-async def handle_point_write(manager: ConnectionManager, body: dict) -> dict:
+async def handle_point_write(
+    manager: ConnectionManager, body: dict, modbus_manager: ModbusConnectionManager | None = None
+) -> dict:
     """{topic, value (null = relinquish), priority 1-17 (17 = relinquish-default), optional expires_at}
-    - BACnet WriteProperty on the point that publishes `topic`."""
-    return await manager.write_point(
+    - BACnet WriteProperty on the point that publishes `topic`, or a Modbus
+    register/coil write if a Modbus connection publishes it (Baler#128).
+    Same command either way, so Baler needs no protocol switch."""
+    owner = modbus_manager if modbus_manager is not None and modbus_manager.owns(body["topic"]) else manager
+    return await owner.write_point(
         body["topic"], body.get("value"), body["priority"], expires_at=body.get("expires_at")
     )
 
@@ -354,7 +359,7 @@ def make_handler(
                 return
 
             if self.path == "/write":
-                self._route("api.post_write", lambda body: handle_point_write(manager, body))
+                self._route("api.post_write", lambda body: handle_point_write(manager, body, modbus_manager))
                 return
 
             if self.path == "/learn":
@@ -568,7 +573,7 @@ def _make_on_command(
         "discover": lambda body: handle_discover(manager, body),
         "learn": lambda body: handle_learn(manager, body),
         "modbus_discover": lambda body: handle_modbus_discover(body),
-        "point_write": lambda body: handle_point_write(manager, body),
+        "point_write": lambda body: handle_point_write(manager, body, modbus_manager),
         "list_devices": lambda body: handle_list_devices(device_registry, body),
         "set_device_status": lambda body: handle_set_device_status(device_registry, body),
         "add_device": lambda body: handle_add_device(device_registry, manager, modbus_manager, body),
@@ -753,7 +758,10 @@ async def async_main(args) -> None:
     )
     await manager.start()
 
-    modbus_manager = ModbusConnectionManager(mqtt_client, args.modbus_state_file)
+    modbus_manager = ModbusConnectionManager(
+        mqtt_client, args.modbus_state_file,
+        site_id=args.site_id, instance_id=args.instance_id if args.site_id else None,
+    )
     await modbus_manager.start()
 
     device_registry = DeviceRegistry(args.devices_state_file)
