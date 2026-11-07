@@ -17,7 +17,14 @@ import time
 from bacpypes3.apdu import ErrorRejectAbortNack
 from bacpypes3.app import Application
 
-from windrow import bacnet_tagger, connection_store, discovery, mqtt_sink, tracing
+from windrow import (
+    bacnet_tagger,
+    bacnet_trend,
+    connection_store,
+    discovery,
+    mqtt_sink,
+    tracing,
+)
 from windrow.bacnet_read import read_present_value
 from windrow.bacnet_values import normalize_value
 
@@ -97,8 +104,24 @@ COMMANDABLE_TYPES = {
 POINT_FIELDS = {
     "object_identifier", "label", "units", "description", "poll_interval",
     "his_collect_cov", "his_collect_cov_rate_limit", "his_collect_interval",
+    "trend_log",
 }
-UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix"}
+UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "backfill_window"}
+# Trend-log backfill (Baler#129): a point with `trend_log` (the TrendLog
+# object logging it on the controller, e.g. "trend-log,3") gets the
+# readings it missed read back from that log - after Windrow was down
+# (from the last reading it published, remembered in a marks file next to
+# the state file) and after the device was unreachable - going back at
+# most `backfill_window` seconds (per connection; 0 turns it off).
+DEFAULT_BACKFILL_WINDOW = 86400.0
+# How often the marks file is rewritten while readings come in.
+MARKS_SAVE_INTERVAL = 60.0
+
+
+def check_backfill_window(value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(f"backfill_window must be a number of seconds >= 0, got {value!r}")
+    return value
 
 
 def validate_points(points) -> list[dict]:
@@ -117,6 +140,8 @@ def validate_points(points) -> list[dict]:
         labels.add(label)
         if "poll_interval" in point:
             connection_store.check_number("point poll_interval", point["poll_interval"])
+        if "trend_log" in point:
+            connection_store.check_text("trend_log", point["trend_log"])
         cov = point.get("his_collect_cov")
         if cov is not None and not isinstance(cov, (bool, int, float)):
             raise ValueError(f"his_collect_cov must be true/false or a number, got {cov!r}")
@@ -188,6 +213,12 @@ class ConnectionManager:
         self.connections: dict[str, dict] = {}
         self.tasks: dict[str, asyncio.Task] = {}
         self._read_slots: asyncio.Semaphore | None = None
+        # Trend-backed points' last published reading time (unix s), by
+        # "<connection id>/<label>", so a restart knows where to backfill from.
+        base, _ext = os.path.splitext(state_file)
+        self.marks_file = f"{base}.trend-marks.json"
+        self._marks: dict[str, float] = {}
+        self._marks_saved_at = 0.0
 
     def _slots(self) -> asyncio.Semaphore:
         # created on first use, on the running loop (not in __init__, which
@@ -201,6 +232,7 @@ class ConnectionManager:
         discovery needed, the device address is already known."""
         with tracer.start_as_current_span("connection_manager.start") as span:
             records = connection_store.load(self.state_file)
+            self._marks = _load_marks(self.marks_file)
             for record in records:
                 self.connections[record["id"]] = record
                 self._start_poll_task(record)
@@ -230,6 +262,7 @@ class ConnectionManager:
         points: list[dict],
         poll_interval: float = 5.0,
         credential: dict | None = None,
+        backfill_window: float | None = None,
     ) -> dict:
         with tracer.start_as_current_span("connection_manager.create_connection") as span:
             record = {
@@ -241,6 +274,8 @@ class ConnectionManager:
                 "points": points,
                 "credential": credential,
             }
+            if backfill_window is not None:
+                record["backfill_window"] = check_backfill_window(backfill_window)
             self.connections[record["id"]] = record
             self._save()
             self._tag_points(topic_prefix, points)
@@ -386,6 +421,8 @@ class ConnectionManager:
                 record["poll_interval"] = connection_store.check_number("poll_interval", patch["poll_interval"])
             if "topic_prefix" in patch:
                 record["topic_prefix"] = connection_store.check_topic_prefix(patch["topic_prefix"])
+            if "backfill_window" in patch:
+                record["backfill_window"] = check_backfill_window(patch["backfill_window"])
 
             await stop_task(self.tasks.pop(connection_id, None))
             self.connections[connection_id] = record
@@ -429,6 +466,57 @@ class ConnectionManager:
 
     def _save(self) -> None:
         connection_store.save(self.state_file, list(self.connections.values()))
+
+    def reading_rate(self) -> float:
+        """Readings per second across every point - what mqtt_sink sizes
+        its outage spool by."""
+        return sum(
+            1.0 / point.get("poll_interval", record["poll_interval"])
+            for record in self.connections.values() for point in record["points"]
+        )
+
+    def _mark(self, record: dict, point: dict, ts: float) -> None:
+        if "trend_log" not in point:
+            return
+        self._marks[f"{record.get('id')}/{point['label']}"] = ts
+        if time.monotonic() - self._marks_saved_at >= MARKS_SAVE_INTERVAL:
+            self.save_marks()
+
+    def save_marks(self) -> None:
+        self._marks_saved_at = time.monotonic()
+        try:
+            _save_marks(self.marks_file, self._marks)
+        except OSError as exc:  # a full disk mustn't stop polling; the next backfill just reaches further back
+            print(f"couldn't save trend marks to {self.marks_file}: {exc!r}")
+
+    async def _backfill(self, record: dict, point: dict, since: float, until: float) -> int:
+        """Publish what the point's TrendLog recorded in (since, until), not
+        retained and with each record's own timestamp; returns how many."""
+        window = record.get("backfill_window", DEFAULT_BACKFILL_WINDOW)
+        if not window:
+            return 0
+        since = max(since, until - window)
+        if until - since < 1.0:
+            return 0
+        address = record["device_address"]
+        try:
+            async with self._slots():
+                offset = await bacnet_trend.device_utc_offset(self.app, address, record["device_instance"])
+            if offset is None:
+                offset = bacnet_trend.host_utc_offset()
+            async with self._slots():
+                readings = await bacnet_trend.backfill(
+                    self.app, address, point["trend_log"], _object_type(point["object_identifier"]), since, until, offset
+                )
+        except Exception as exc:  # noqa: BLE001 - a backfill that fails loses history, not the live poll
+            print(f"backfill from {point['trend_log']} for {point['label']} failed: {exc!r}")
+            return 0
+        for ts, value in readings:
+            mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value, ts=ts, retain=False)
+        if readings:
+            print(f"backfilled {len(readings)} reading(s) for {record['topic_prefix']}/{point['label']} "
+                  f"from {point['trend_log']} ({until - since:.0f} s gap)")
+        return len(readings)
 
     def _start_poll_task(self, record: dict) -> None:
         task = asyncio.get_event_loop().create_task(self._poll_loop(record))
@@ -476,10 +564,18 @@ class ConnectionManager:
         poll_forever rather than a forced shared abstraction: it iterates
         a dynamic list-of-dicts from a stored record instead of a static
         CLI arg list. Sharing normalize_value and publish_reading is the
-        right amount of sharing; sharing this loop body isn't."""
+        right amount of sharing; sharing this loop body isn't.
+
+        A point with `trend_log` backfills (Baler#129) on its first good
+        read - from the last reading published before a restart, per the
+        marks file - and on the first good read after failures, from the
+        last good read before them."""
         interval = point.get("poll_interval", record["poll_interval"])
         last_value = None
         last_published_at: float | None = None
+        trended = "trend_log" in point
+        last_ok: float | None = self._marks.get(f"{record.get('id')}/{point['label']}") if trended else None
+        backfills: set[asyncio.Task] = set()
 
         # Jittered start: on a warm restore (connection_manager.start()),
         # every point's task fires its first read_property in the same
@@ -491,40 +587,73 @@ class ConnectionManager:
         await asyncio.sleep(random.uniform(0, interval))
 
         failures = 0
-        while True:
-            try:
-                async with self._slots():
-                    raw = await read_present_value(self.app, record["device_address"], point["object_identifier"])
-                if raw is None or isinstance(raw, ErrorRejectAbortNack):
-                    raise ReadFailed(f"device answered {raw!r}")
-                value = normalize_value(raw)
-            except Exception as exc:  # noqa: BLE001 - every failure means "count it and retry"
-                # A failed read publishes nothing: a null reading made a dead
-                # device look like it was reporting downstream (Baler#83/#85).
-                failures += 1
-                if failures in (1, 5) or failures % 50 == 0:  # don't flood the log with a dead device
-                    print(f"read failed for {point['object_identifier']} ({failures}x): {exc!r}")
+        first_read = True
+        try:
+            while True:
+                try:
+                    async with self._slots():
+                        raw = await read_present_value(self.app, record["device_address"], point["object_identifier"])
+                    if raw is None or isinstance(raw, ErrorRejectAbortNack):
+                        raise ReadFailed(f"device answered {raw!r}")
+                    value = normalize_value(raw)
+                except Exception as exc:  # noqa: BLE001 - every failure means "count it and retry"
+                    # A failed read publishes nothing: a null reading made a dead
+                    # device look like it was reporting downstream (Baler#83/#85).
+                    failures += 1
+                    if failures in (1, 5) or failures % 50 == 0:  # don't flood the log with a dead device
+                        print(f"read failed for {point['object_identifier']} ({failures}x): {exc!r}")
+                    await asyncio.sleep(failure_backoff(interval, failures))
+                    continue
+                if failures:
+                    print(f"read recovered for {point['object_identifier']} after {failures} failures")
+                read_at = time.time()
+                if trended and (first_read or failures) and last_ok is not None:
+                    # what the controller logged while we weren't reading it
+                    task = asyncio.get_running_loop().create_task(self._backfill(record, point, last_ok, read_at))
+                    backfills.add(task)
+                    task.add_done_callback(backfills.discard)
+                first_read = False
+                last_ok = read_at
+                failures = 0
+
+                now = time.monotonic()
+                if should_publish(
+                    value,
+                    last_value,
+                    last_published_at,
+                    now,
+                    his_collect_cov=point.get("his_collect_cov"),
+                    his_collect_cov_rate_limit=point.get("his_collect_cov_rate_limit"),
+                    his_collect_interval=point.get("his_collect_interval"),
+                ):
+                    mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value)
+                    last_value = value
+                    last_published_at = now
+                self._mark(record, point, read_at)
+
                 await asyncio.sleep(failure_backoff(interval, failures))
-                continue
-            if failures:
-                print(f"read recovered for {point['object_identifier']} after {failures} failures")
-            failures = 0
+        finally:
+            for task in backfills:
+                task.cancel()
 
-            now = time.monotonic()
-            if should_publish(
-                value,
-                last_value,
-                last_published_at,
-                now,
-                his_collect_cov=point.get("his_collect_cov"),
-                his_collect_cov_rate_limit=point.get("his_collect_cov_rate_limit"),
-                his_collect_interval=point.get("his_collect_interval"),
-            ):
-                mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value)
-                last_value = value
-                last_published_at = now
 
-            await asyncio.sleep(failure_backoff(interval, failures))
+def _load_marks(path: str) -> dict[str, float]:
+    try:
+        with open(path) as f:
+            marks = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        print(f"ignoring unreadable trend marks file {path}: {exc!r}")
+        return {}
+    return {k: float(v) for k, v in marks.items() if isinstance(v, (int, float))}
+
+
+def _save_marks(path: str, marks: dict[str, float]) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(marks, f)
+    os.replace(tmp, path)
 
 
 def _to_bacnet(value, obj_type: str):

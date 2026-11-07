@@ -150,7 +150,8 @@ on `cmd/<site-id>/<instance-id>/status`, published at startup, on every
 {"online": true, "site_id": "hospital-a", "instance_id": "ahu-bridge-1",
  "version": "0.1.0", "started_at": "2026-11-07T09:00:00.123456+00:00",
  "ts": "2026-11-07T09:05:00.654321+00:00",
- "bacnet_connections": 3, "modbus_connections": 1, "devices": 9, "pending_devices": 2}
+ "bacnet_connections": 3, "modbus_connections": 1, "devices": 9, "pending_devices": 2,
+ "spool": {"rows": 0, "capacity": 95040, "dropped": 0}}
 ```
 
 `version` is the installed `windrow` package version (`"dev"` if it isn't

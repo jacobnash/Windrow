@@ -30,7 +30,7 @@ def test_build_status_shape():
     status = api.build_status("site-a", "inst-1", "2026-01-01T00:00:00+00:00", *_managers())
     assert set(status) == {
         "online", "site_id", "instance_id", "version", "started_at", "ts",
-        "bacnet_connections", "modbus_connections", "devices", "pending_devices",
+        "bacnet_connections", "modbus_connections", "spool", "devices", "pending_devices",
     }
     assert status["online"] is True
     assert (status["site_id"], status["instance_id"]) == ("site-a", "inst-1")
@@ -39,6 +39,7 @@ def test_build_status_shape():
     assert datetime.datetime.fromisoformat(status["ts"]).tzinfo is not None
     assert (status["bacnet_connections"], status["modbus_connections"]) == (2, 1)
     assert (status["devices"], status["pending_devices"]) == (3, 2)
+    assert set(status["spool"]) == {"rows", "capacity", "dropped"}
     json.dumps(status)
 
 

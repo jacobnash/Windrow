@@ -133,6 +133,40 @@ Omitting `his_collect_cov`/`his_collect_interval` entirely (as `fan-status`
 does) is the safe, backward-compatible default — nothing changes for a
 point that doesn't opt in.
 
+## 3d. Backfilling gaps from the controller's trend logs
+
+A controller keeps logging while Windrow is down or can't reach it. Give a
+point the TrendLog that logs it, and Windrow reads the gap back:
+
+```json
+{"object_identifier": "analog-input,1", "label": "zone-temp", "trend_log": "trend-log,1"}
+```
+
+- **After a restart**, the point's first good read backfills from the last
+  reading Windrow published for it before going down. That time is kept in
+  `<state file>.trend-marks.json` (e.g. `windrow-connections.trend-marks.json`),
+  written once a minute and on a clean shutdown. A point with no mark yet
+  isn't backfilled.
+- **After an outage** (reads failing, then succeeding), the first good read
+  backfills from the last good read before the failures.
+- Records are read with ReadRange by time, 20 per request, and published on
+  the point's own topic with the record's timestamp, **not retained**, so
+  the point's retained message stays its live value. Baler stores them as
+  history (its ingest is idempotent on point + timestamp, so an overlap
+  is harmless). Binary points come back as `active`/`inactive`, like a poll.
+- A backfill goes back at most `backfill_window` seconds (per connection,
+  default 86400; `0` turns it off). A failed backfill is logged and the live
+  poll carries on.
+- Log timestamps are the device's local time. Windrow reads the device's
+  `local-date`/`local-time` to work out its UTC offset (to the nearest 15
+  minutes); a device that doesn't report them is assumed to be on this
+  host's time zone. A backfill across a DST change is an hour off on the far
+  side of it.
+
+`python -m windrow.mock_device --trend-log-interval 5` adds a TrendLog
+(`trend-log,1..N`, in object order) for each mock object, served over
+ReadRange.
+
 ## 4. List / delete
 
 ```
