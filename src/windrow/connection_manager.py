@@ -25,6 +25,7 @@ from windrow import (
     bacnet_batch,
     bacnet_cov,
     bacnet_network,
+    bacnet_schedules,
     bacnet_tagger,
     bacnet_trend,
     connection_store,
@@ -344,6 +345,23 @@ class ConnectionManager:
         with tracer.start_as_current_span("connection_manager.learn") as span:
             span.set_attribute("device_address", device_address)
             return await discovery.learn_points(self.app, device_address, device_instance)
+
+    async def read_schedules(self, device_address: str, device_instance: int, labels: dict | None = None) -> dict:
+        """The device's Schedule and Calendar objects, read now (Baler#165)."""
+        with tracer.start_as_current_span("connection_manager.read_schedules") as span:
+            span.set_attribute("device_address", device_address)
+            bacnet_network.parse_device_address(device_address)
+            async with self._slots():
+                return await bacnet_schedules.read_device_schedules(self.app, device_address, device_instance, labels)
+
+    async def connection_schedules(self, connection_id: str) -> dict | None:
+        """read_schedules for a connection's device, with the objects its
+        points poll named by their labels in each schedule's `controls`."""
+        record = self.connections.get(connection_id)
+        if record is None:
+            return None
+        labels = {str(_objid(p["object_identifier"])): p["label"] for p in record["points"]}
+        return await self.read_schedules(record["device_address"], record["device_instance"], labels)
 
     async def create_connection(
         self,
@@ -1012,6 +1030,16 @@ def _save_marks(path: str, marks: dict[str, float]) -> None:
     with open(tmp, "w") as f:
         json.dump(marks, f)
     os.replace(tmp, path)
+
+
+def _objid(text: str):
+    """`analogValue,1` and `analog-value,1` alike, as bacpypes3 prints them."""
+    from bacpypes3.primitivedata import ObjectIdentifier
+
+    try:
+        return ObjectIdentifier(text)
+    except Exception:  # noqa: BLE001 - unparseable: keep the text, it just won't match
+        return text
 
 
 def _to_bacnet(value, obj_type: str):

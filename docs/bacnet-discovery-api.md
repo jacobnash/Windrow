@@ -249,6 +249,34 @@ point the TrendLog that logs it, and Windrow reads the gap back:
 (`trend-log,1..N`, in object order) for each mock object, served over
 ReadRange.
 
+## 3e. Schedules and calendars
+
+For commissioning's as-built vs spec check, Windrow reads a device's
+Schedule and Calendar objects on demand:
+
+```
+curl -X POST localhost:8001/schedules -d '{"device_address": "10.0.4.20", "device_instance": 4020}'
+curl localhost:8001/connections/<id>/schedules   # same, with the connection's points named
+```
+
+Each schedule comes back with:
+- `weekly`: monday..sunday, each a list of `{time, value}`;
+- `exceptions`: `{period, priority, times}`, where `period` is a `date` (`*` for any field, e.g.
+  `*-12-25`), a `date_range`, a `week_n_day` (`{month, week, weekday}`), or a `calendar`
+  reference;
+- `effective_period`, `default`, `priority_for_writing`, `present_value`;
+- `controls`: the objects and properties it writes, with the connection's `label` where it polls
+  that object.
+
+Values are numbers, or `active`/`inactive` when every controlled object is binary. Calendars come
+back as their `dates`. An exception-schedule too big for one unsegmented answer is read element by
+element; an optional property the device doesn't have comes back null. The command channel has the
+same as `read_schedules` and `connection_schedules`.
+
+`python -m windrow.mock_device --schedules` adds `schedule,1` (weekdays 07:00-18:00, a holiday
+calendar exception and an early close on the fourth Thursday of November) driving the first binary
+object, and `calendar,1`.
+
 ## 3f. Alarms (intrinsic reporting)
 
 With `"forward_alarms": true` on a connection, a controller's own alarms -

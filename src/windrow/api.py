@@ -120,6 +120,20 @@ async def handle_learn(manager: ConnectionManager, body: dict) -> list:
     return await manager.learn(body["device_address"], body["device_instance"])
 
 
+async def handle_read_schedules(manager: ConnectionManager, body: dict) -> dict:
+    """{device_address, device_instance} -> the device's schedules and calendars."""
+    instance = connection_store.check_int("device_instance", body.get("device_instance"), 0, 4194302)
+    return await manager.read_schedules(connection_store.check_text("device_address", body.get("device_address")), instance)
+
+
+async def handle_connection_schedules(manager: ConnectionManager, body: dict) -> dict:
+    """{id} -> the connection's device's schedules, controlled points named by label."""
+    result = await manager.connection_schedules(_target_id(body))
+    if result is None:
+        raise NotFound("no connection with that id")
+    return result
+
+
 async def handle_point_write(
     manager: ConnectionManager, body: dict, modbus_manager: ModbusConnectionManager | None = None
 ) -> dict:
@@ -456,6 +470,10 @@ def make_handler(
                 self._route("api.post_learn", lambda body: handle_learn(manager, body), count=True)
                 return
 
+            if self.path == "/schedules":
+                self._route("api.post_schedules", lambda body: handle_read_schedules(manager, body))
+                return
+
             if self.path == "/connections":
                 self._route("api.post_connections", lambda body: handle_create_connection(manager, body), status=201)
                 return
@@ -582,6 +600,12 @@ def make_handler(
                             body={"id": connection_id})
                 return
 
+            connection_id = self._path_id("/connections/", "/schedules")
+            if connection_id is not None:
+                self._route("api.get_connection_schedules", lambda body: handle_connection_schedules(manager, body),
+                            body={"id": connection_id})
+                return
+
             job_id = self._path_id("/jobs/")
             if job_id is not None:
                 self._route("api.get_job", lambda body: handle_get_job(jobs, body), body={"id": job_id})
@@ -676,6 +700,7 @@ def make_handler(
 TARGETED_ACTIONS = {
     "set_device_status", "recheck_credentials", "update_connection", "delete_connection",
     "modbus_update_connection", "modbus_delete_connection", "set_credential", "get_job", "connection_alarms",
+    "connection_schedules",
 }
 
 
@@ -726,6 +751,8 @@ def _make_on_command(
         "discover_routers": lambda body: handle_discover_routers(manager, body),
         "network_status": lambda body: handle_network_status(manager, body),
         "learn": lambda body: handle_learn(manager, body),
+        "read_schedules": lambda body: handle_read_schedules(manager, body),
+        "connection_schedules": lambda body: handle_connection_schedules(manager, body),
         "modbus_discover": lambda body: handle_modbus_discover(body),
         "point_write": lambda body: handle_point_write(manager, body, modbus_manager),
         "list_devices": lambda body: handle_list_devices(device_registry, body),
