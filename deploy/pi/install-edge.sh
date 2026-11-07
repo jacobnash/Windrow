@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Sets up a Raspberry Pi (Raspberry Pi OS Lite 64-bit, or any Debian with
+# systemd) as a Windrow edge node for Baler (Baler#35). One role per run;
+# re-running is safe (it upgrades Windrow and rewrites the unit).
+#
+#   sudo bash install-edge.sh <role>
+#
+# Roles:
+#   bacnet   a simulated BACnet/IP device (windrow.mock_device) on this Pi's
+#            LAN address, UDP 47808 - for Windrow to discover and poll
+#   modbus   a simulated Modbus TCP server (windrow.mock_modbus_device) on
+#            TCP 502
+#   weather  a simulated weather station publishing to Baler's MQTT broker
+#            (windrow.mock_weather) with an edge-node account
+#   gateway  Windrow itself (windrow.api): discovers BACnet/Modbus devices on
+#            this LAN and publishes them to Baler with an edge-node account
+#
+# Broker settings for weather/gateway go in /etc/windrow/edge.env (created
+# here with placeholders, mode 600): MQTT_HOST, MQTT_PORT (8883 = TLS),
+# MQTT_USERNAME, MQTT_PASSWORD - the account from Baler's Ops -> Edge nodes,
+# whose site prefix the topics must sit under.
+set -euo pipefail
+
+ROLE="${1:-}"
+WINDROW_REF="${WINDROW_REF:-main}"
+VENV=/opt/windrow
+ENV_FILE=/etc/windrow/edge.env
+SVC_USER=windrow
+
+case "$ROLE" in bacnet|modbus|weather|gateway) ;; *)
+  echo "usage: sudo bash $0 bacnet|modbus|weather|gateway" >&2; exit 2;;
+esac
+[ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
+
+echo "==> packages"
+apt-get update -qq
+apt-get install -y -qq python3-venv python3-pip git >/dev/null
+
+echo "==> service user and Windrow ($WINDROW_REF)"
+id -u "$SVC_USER" >/dev/null 2>&1 || useradd --system --home /var/lib/windrow --shell /usr/sbin/nologin "$SVC_USER"
+[ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
+"$VENV/bin/pip" install -q --upgrade pip
+"$VENV/bin/pip" install -q --upgrade "windrow @ git+https://github.com/jacobnash/Windrow@${WINDROW_REF}"
+
+mkdir -p /etc/windrow
+if [ ! -f "$ENV_FILE" ]; then
+  cat > "$ENV_FILE" <<ENV
+# Baler broker (edge-node account from Ops -> Edge nodes). 8883 = TLS.
+MQTT_HOST=timberdoodle.nash.engineering
+MQTT_PORT=8883
+MQTT_USERNAME=
+MQTT_PASSWORD=
+# weather role: must sit under the account's site prefix
+WEATHER_TOPIC_PREFIX=fbf/home/weather
+# gateway role: this site's id (= the broker username) and topic prefix
+WINDROW_SITE_ID=
+ENV
+fi
+chown root:"$SVC_USER" "$ENV_FILE"
+chmod 640 "$ENV_FILE"
+
+# This Pi's LAN address with its prefix length, e.g. 192.168.1.23/24 -
+# BACnet needs the /24 to hear broadcasts (Who-Is).
+CIDR=$(ip -o -4 addr show scope global | awk '{print $4; exit}')
+[ -n "$CIDR" ] || { echo "no LAN IPv4 address found" >&2; exit 1; }
+
+case "$ROLE" in
+  bacnet)
+    INSTANCE="${BACNET_INSTANCE:-$(( $(echo "${CIDR%/*}" | awk -F. '{print $4}') + 10000 ))}"
+    EXEC="$VENV/bin/python -m windrow.mock_device --address ${CIDR}:47808 --instance ${INSTANCE} --name $(hostname)-sim"
+    CAPS="" ;;
+  modbus)
+    EXEC="$VENV/bin/python -m windrow.mock_modbus_device --host 0.0.0.0 --port 502"
+    CAPS="AmbientCapabilities=CAP_NET_BIND_SERVICE" ;;  # port 502 as a non-root user, no setcap on python
+  weather)
+    EXEC="$VENV/bin/python -m windrow.mock_weather --interval 60"
+    CAPS="" ;;
+  gateway)
+    EXEC="$VENV/bin/python -m windrow.api --address ${CIDR}:47808 --host 0.0.0.0 --port 8001 --mqtt-host \${MQTT_HOST} --mqtt-port \${MQTT_PORT} --site-id \${WINDROW_SITE_ID} --modbus-scan-cidr ${CIDR}"
+    CAPS="" ;;
+esac
+
+UNIT=/etc/systemd/system/windrow-${ROLE}.service
+cat > "$UNIT" <<UNITEOF
+[Unit]
+Description=Windrow edge node: ${ROLE}
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=${SVC_USER}
+EnvironmentFile=${ENV_FILE}
+StateDirectory=windrow
+WorkingDirectory=/var/lib/windrow
+ExecStart=${EXEC}
+${CAPS}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+
+systemctl daemon-reload
+systemctl enable --now "windrow-${ROLE}.service"
+echo "==> windrow-${ROLE} running ($(systemctl is-active "windrow-${ROLE}")). Logs: journalctl -u windrow-${ROLE} -f"
+case "$ROLE" in weather|gateway)
+  echo "    set MQTT_USERNAME/MQTT_PASSWORD (and WINDROW_SITE_ID for gateway) in ${ENV_FILE}, then: systemctl restart windrow-${ROLE}";;
+esac
