@@ -551,7 +551,7 @@ class ModbusConnectionManager:
                 client = await self._connect(record)
                 if client is None:
                     attempts += 1
-                    self.status.failure(record["id"], list(record["points"]), f"can't connect to {where}")
+                    self.status.failure(record.get("id"), list(record["points"]), f"can't connect to {where}")
                     if down_since is None:
                         down_since = asyncio.get_event_loop().time()
                     if attempts in (1, 5) or attempts % 50 == 0:
@@ -572,14 +572,14 @@ class ModbusConnectionManager:
                     except Exception as exc:  # noqa: BLE001 - a lost session raises many types; all mean reconnect
                         raised += 1
                         print(f"modbus read failed for {label}@{point['register']}: {exc!r}")
-                        self.status.failure(record["id"], label, f"register {point['register']}: {exc}")
+                        self.status.failure(record.get("id"), label, f"register {point['register']}: {exc}")
                         continue
                     if value is None:  # an exception code (or NaN): the session is fine, publish nothing
-                        self.status.failure(record["id"], label,
+                        self.status.failure(record.get("id"), label,
                                             f"register {point['register']}: the device refused it or sent no usable value")
                         continue
                     mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], label, value)
-                    self.status.success(record["id"], label, published=True)
+                    self.status.success(record.get("id"), label, published=True)
             if record["points"] and raised == len(record["points"]):
                 client.close()  # every read raised: next cycle reconnects
             await asyncio.sleep(record["poll_interval"])

@@ -392,6 +392,12 @@ def test_every_action_tolerates_the_full_command_envelope(harness, monkeypatch):
     monkeypatch.setattr(api.modbus_discovery, "sweep", fake_sweep)
     monkeypatch.setattr(connection_manager.ConnectionManager, "_tag_points", lambda *a: None)
 
+    async def fake_routers(app, network=None, timeout=5.0):
+        calls["discover_routers"] = (network, timeout)
+        return []
+
+    monkeypatch.setattr(api.bacnet_network, "discover_routers", fake_routers)
+
     bacnet = harness.send({"action": "create_connection", **BACNET_CONN})["result"]
     modbus = harness.send({"action": "modbus_create_connection", **MODBUS_CONN})["result"]
     device = harness.send({"action": "add_device", "protocol": "modbus", "host": "10.0.0.7"})["result"]
@@ -399,6 +405,8 @@ def test_every_action_tolerates_the_full_command_envelope(harness, monkeypatch):
 
     bodies = {
         "discover": {},
+        "discover_routers": {"network": 5, "timeout": 1},
+        "network_status": {},
         "learn": {"device_address": "10.0.0.5", "device_instance": 5},
         "modbus_discover": {"cidr": "10.0.0.0/30"},
         "point_write": {"topic": "fbf/ahu-1/zone-temp", "value": 1, "priority": 8},
@@ -432,6 +440,7 @@ def test_every_action_tolerates_the_full_command_envelope(harness, monkeypatch):
         assert outcome["ok"], (action, outcome)
         assert outcome["request_id"] == "corr-1"
     assert calls["discover"] == {}
+    assert calls["discover_routers"] == (5, 1)
     assert calls["point_write"] == expires_at  # the one action that takes it
 
 

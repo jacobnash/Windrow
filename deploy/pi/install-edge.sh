@@ -117,6 +117,10 @@ WINDROW_SITE_ID=
 # gateway role, only if its API is exposed (WINDROW_API_HOST): requests
 # then need this in X-Gateway-Secret
 #WINDROW_GATEWAY_SECRET=
+# gateway role: reach BACnet devices on other subnets by registering as a
+# foreign device with the site's BBMD (renewed every TTL seconds)
+#WINDROW_BACNET_FOREIGN_BBMD=
+#WINDROW_BACNET_FOREIGN_TTL=300
 # Traces: off unless a collector is named here (e.g. http://<host>:4318/v1/traces)
 #OTEL_EXPORTER_OTLP_ENDPOINT=
 ENV

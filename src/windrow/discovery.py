@@ -12,7 +12,7 @@ from bacpypes3.basetypes import ErrorType
 from bacpypes3.pdu import Address
 from bacpypes3.primitivedata import ObjectIdentifier
 
-from windrow import tracing
+from windrow import bacnet_network, tracing
 from windrow.bacnet_values import normalize_value
 
 tracer = tracing.get_tracer(__name__)
@@ -40,10 +40,20 @@ async def discover_devices(
     high_limit: int | None = None,
     address: str | None = None,
     timeout: float | None = None,
+    network: int | None = None,
+    global_broadcast: bool = True,
 ) -> list[dict]:
-    """Broadcasts Who-Is (or targets one address if given) and returns
-    every I-Am response as a plain dict - the device picker's data
-    source."""
+    """Broadcasts Who-Is and returns every I-Am response as a plain dict -
+    the device picker's data source.
+
+    Where the Who-Is goes (Baler#126): `address` targets one device (a
+    local `ip[:port]` or a routed `net:mac`); `network` broadcasts on that
+    one remote network (`net:*`); otherwise a global broadcast (`*:*`),
+    which every router forwards to the networks behind it - MS/TP trunks
+    included - and which a foreign device hands its BBMD to distribute.
+    `global_broadcast=False` keeps it to this subnet. A device behind a
+    router answers with a `net:mac` address, which is what a connection to
+    it uses."""
     with tracer.start_as_current_span("discovery.discover_devices") as span:
         kwargs = {}
         if low_limit is not None:
@@ -55,19 +65,34 @@ async def discover_devices(
             # inside with a confusing AttributeError (is_localstation),
             # confirmed live against the real mock device.
             kwargs["address"] = address if isinstance(address, Address) else Address(address)
+        elif network is not None:
+            if isinstance(network, bool) or not isinstance(network, int) or not 1 <= network <= 65534:
+                raise ValueError(f"network must be a BACnet network number 1-65534, got {network!r}")
+            kwargs["address"] = Address(f"{network}:*")
+        elif global_broadcast:
+            kwargs["address"] = Address("*:*")
+        span.set_attribute("who_is_to", str(kwargs.get("address", "local broadcast")))
         if timeout is not None:
             kwargs["timeout"] = timeout
 
         i_ams = await app.who_is(**kwargs)
 
-        devices = [
-            {
+        devices = []
+        seen = set()
+        for i_am in i_ams:
+            source = bacnet_network.describe_source(i_am.pduSource)
+            key = (i_am.iAmDeviceIdentifier[1], source["address"])
+            if key in seen:  # a global broadcast can reach a device by two paths
+                continue
+            seen.add(key)
+            devices.append({
                 "device_instance": i_am.iAmDeviceIdentifier[1],
-                "address": str(i_am.pduSource),
+                "address": source["address"],
+                "network": source["network"],
+                "mac": source["mac"],
                 "vendor_id": int(i_am.vendorID),
-            }
-            for i_am in i_ams
-        ]
+                "max_apdu": int(i_am.maxAPDULengthAccepted),
+            })
         span.set_attribute("device_count", len(devices))
         return devices
 
