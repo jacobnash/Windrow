@@ -16,13 +16,23 @@
 #            this LAN and publishes them to Baler with an edge-node account
 #
 # Broker settings for weather/gateway go in /etc/windrow/edge.env (created
-# here with placeholders, mode 600): MQTT_HOST, MQTT_PORT (8883 = TLS),
+# here with placeholders, mode 640): MQTT_HOST, MQTT_PORT (8883 = TLS),
 # MQTT_USERNAME, MQTT_PASSWORD - the account from Baler's Ops -> Edge nodes,
 # whose site prefix the topics must sit under.
+#
+# The gateway's HTTP API (port 8001) binds to 127.0.0.1: it can create
+# connections and write points, and Baler manages a gateway over the MQTT
+# command channel, not over HTTP. To expose it on the LAN anyway:
+#   sudo WINDROW_API_HOST=0.0.0.0 bash install-edge.sh gateway
+# and set WINDROW_GATEWAY_SECRET in edge.env, so a request needs the
+# X-Gateway-Secret header.
+#
+# bacnet and gateway can't share a Pi: both bind UDP 47808 on its address.
 set -euo pipefail
 
 ROLE="${1:-}"
 WINDROW_REF="${WINDROW_REF:-main}"
+WINDROW_API_HOST="${WINDROW_API_HOST:-127.0.0.1}"
 VENV=/opt/windrow
 ENV_FILE=/etc/windrow/edge.env
 SVC_USER=windrow
@@ -31,6 +41,18 @@ case "$ROLE" in bacnet|modbus|weather|gateway) ;; *)
   echo "usage: sudo bash $0 bacnet|modbus|weather|gateway" >&2; exit 2;;
 esac
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
+
+# A BACnet simulator and Windrow both bind UDP 47808 on this Pi's address
+# (Windrow has to: bacpypes3 sends Who-Is to its own port), so the second
+# would fail to start and restart forever. Refuse up front instead.
+case "$ROLE" in bacnet|gateway)
+  OTHER=$([ "$ROLE" = bacnet ] && echo gateway || echo bacnet)
+  if systemctl is-enabled --quiet "windrow-${OTHER}.service" 2>/dev/null; then
+    echo "windrow-${OTHER} is enabled here and also uses UDP 47808; one Pi runs bacnet or gateway, not both." >&2
+    echo "  to switch: sudo systemctl disable --now windrow-${OTHER}" >&2
+    exit 1
+  fi;;
+esac
 
 echo "==> packages"
 apt-get update -qq
@@ -54,6 +76,9 @@ MQTT_PASSWORD=
 WEATHER_TOPIC_PREFIX=fbf/home/weather
 # gateway role: this site's id (= the broker username) and topic prefix
 WINDROW_SITE_ID=
+# gateway role, only if its API is exposed (WINDROW_API_HOST): requests
+# then need this in X-Gateway-Secret
+#WINDROW_GATEWAY_SECRET=
 ENV
 fi
 chown root:"$SVC_USER" "$ENV_FILE"
@@ -76,7 +101,7 @@ case "$ROLE" in
     EXEC="$VENV/bin/python -m windrow.mock_weather --interval 60"
     CAPS="" ;;
   gateway)
-    EXEC="$VENV/bin/python -m windrow.api --address ${CIDR}:47808 --host 0.0.0.0 --port 8001 --mqtt-host \${MQTT_HOST} --mqtt-port \${MQTT_PORT} --site-id \${WINDROW_SITE_ID} --modbus-scan-cidr ${CIDR}"
+    EXEC="$VENV/bin/python -m windrow.api --address ${CIDR}:47808 --host ${WINDROW_API_HOST} --port 8001 --mqtt-host \${MQTT_HOST} --mqtt-port \${MQTT_PORT} --site-id \${WINDROW_SITE_ID} --modbus-scan-cidr ${CIDR}"
     CAPS="" ;;
 esac
 
