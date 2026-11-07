@@ -143,3 +143,21 @@ def test_sweep_reports_progress_per_host(monkeypatch):
     found = asyncio.run(modbus_discovery.sweep("10.0.0.0/29", progress=lambda d, t: seen.append((d, t))))
     assert found == [{"host": "10.0.0.2", "port": 502}]
     assert seen[0] == (0, 6) and seen[-1] == (6, 6) and len(seen) == 7
+
+
+def test_a_bacpypes_abort_fails_the_job_instead_of_leaving_it_running():
+    from bacpypes3.apdu import AbortPDU
+
+    runner = _runner()
+
+    async def abort(address, instance):
+        raise AbortPDU(reason="apduTooLong")
+
+    runner.manager.learn = abort
+
+    async def run():
+        job = await runner.start({"job": "learn", "device_address": "a", "device_instance": 1})
+        done = await _wait_done(runner, job["id"])
+        assert done["state"] == "failed" and done["error"]
+
+    asyncio.run(run())

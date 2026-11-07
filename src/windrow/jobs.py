@@ -107,7 +107,11 @@ class JobRunner:
                 raise
             except asyncio.TimeoutError:
                 job["state"], job["error"] = "failed", f"gave up after {MAX_RUNTIME:g} s"
-            except Exception as exc:  # noqa: BLE001 - a failed job reports its error, never crashes the loop
+            except (KeyboardInterrupt, SystemExit):
+                job["state"], job["error"] = "failed", "Windrow is shutting down"
+                raise
+            except BaseException as exc:  # noqa: BLE001 - bacpypes3's Abort/Reject/Error PDUs are BaseExceptions;
+                # a failed job reports its error and is never left "running"
                 job["state"], job["error"] = "failed", str(exc) or exc.__class__.__name__
                 span.set_attribute("error", job["error"])
             finally:
