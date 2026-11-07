@@ -16,6 +16,7 @@ import time
 from bacpypes3.app import Application
 
 from windrow import bacnet_tagger, connection_store, discovery, mqtt_sink, tracing
+from windrow.bacnet_read import read_present_value
 from windrow.bacnet_values import normalize_value
 
 tracer = tracing.get_tracer(__name__)
@@ -396,7 +397,7 @@ class ConnectionManager:
             try:
                 async with self._slots():
                     value = normalize_value(
-                        await self.app.read_property(record["device_address"], point["object_identifier"], "present-value")
+                        await read_present_value(self.app, record["device_address"], point["object_identifier"])
                     )
                 failures = 0
             except Exception as exc:

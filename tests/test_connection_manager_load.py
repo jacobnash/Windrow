@@ -39,6 +39,16 @@ class SlowApp:
             self.in_flight -= 1
 
 
+@pytest.fixture(autouse=True)
+def _reads_via_fake_app(monkeypatch):
+    """The poller reads through bacnet_read.read_present_value; these fakes
+    only model timing, so route it to their read_property."""
+    async def via_app(app, address, objid, prop="present-value"):
+        return await app.read_property(address, objid, prop)
+
+    monkeypatch.setattr(cm, "read_present_value", via_app)
+
+
 def test_failure_backoff_doubles_and_caps():
     assert failure_backoff(5.0, 0) == 5.0
     assert failure_backoff(5.0, 1) == 10.0

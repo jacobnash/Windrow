@@ -10,6 +10,7 @@ from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
 from windrow import mqtt_sink
+from windrow.bacnet_read import read_present_value
 from windrow.bacnet_values import normalize_value
 
 POLL_INTERVAL = 5.0
@@ -19,7 +20,7 @@ async def poll_forever(app: Application, device_address: str, points: list[str],
     while True:
         for point in points:
             try:
-                value = normalize_value(await app.read_property(device_address, point, "present-value"))
+                value = normalize_value(await read_present_value(app, device_address, point))
             except Exception as exc:
                 value = None
                 print(f"read failed for {point}: {exc!r}")
