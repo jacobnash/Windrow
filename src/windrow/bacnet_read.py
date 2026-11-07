@@ -13,18 +13,34 @@ read_present_value does what read_property does, plus that check: a
 response whose objectIdentifier/propertyIdentifier don't match raises
 MismatchedResponse, so the poll counts a failed read and publishes nothing
 rather than a plausible-looking wrong value.
+
+It also bounds the wait. bacpypes3 0.0.110's Application.request never
+returns once the device stops answering - no APDU timeout fires, and the
+await stays pending even after the device comes back (reproduced against
+windrow.mock_device: kill it mid-poll, restart it, the read never resolves).
+That is Baler#84: a device reboot silenced its connection until windrow_api
+restarted. A read that takes longer than READ_TIMEOUT raises TimeoutError,
+the caller counts a failure and retries, and the next request after the
+device is back succeeds.
 """
 
 from __future__ import annotations
 
+import asyncio
+import os
 from typing import Any
+
+# Seconds one ReadProperty may take before it counts as failed. Above
+# bacpypes3's own APDU timeout x retries (3 s x 3), so a slow device that
+# does answer isn't cut off.
+READ_TIMEOUT = float(os.environ.get("WINDROW_READ_TIMEOUT", "10"))
 
 
 class MismatchedResponse(RuntimeError):
     """The device answered, but for a different object or property."""
 
 
-async def read_present_value(app, address, objid, prop: str = "present-value") -> Any:
+async def read_present_value(app, address, objid, prop: str = "present-value", timeout: float | None = None) -> Any:
     from bacpypes3.apdu import ErrorRejectAbortNack, ReadPropertyACK, ReadPropertyRequest
     from bacpypes3.pdu import Address
     from bacpypes3.primitivedata import Atomic
@@ -37,8 +53,9 @@ async def read_present_value(app, address, objid, prop: str = "present-value") -
     prop_ref = await app.parse_property_reference(prop, vendor_info=vendor_info)
     prop_id = prop_ref.propertyIdentifier
 
-    response = await app.request(
-        ReadPropertyRequest(objectIdentifier=objid, propertyIdentifier=prop_id, destination=address)
+    response = await asyncio.wait_for(
+        app.request(ReadPropertyRequest(objectIdentifier=objid, propertyIdentifier=prop_id, destination=address)),
+        READ_TIMEOUT if timeout is None else timeout,
     )
     if isinstance(response, ErrorRejectAbortNack):
         return response  # same as read_property: the caller's normalize/handling decides

@@ -13,6 +13,7 @@ import os
 import random
 import time
 
+from bacpypes3.apdu import ErrorRejectAbortNack
 from bacpypes3.app import Application
 
 from windrow import bacnet_tagger, connection_store, discovery, mqtt_sink, tracing
@@ -91,6 +92,10 @@ COMMANDABLE_TYPES = {
 
 class PointWriteError(ValueError):
     pass
+
+
+class ReadFailed(RuntimeError):
+    """The device answered a read with an error, reject, abort or nothing."""
 
 
 def _object_type(object_identifier: str) -> str:
@@ -396,15 +401,21 @@ class ConnectionManager:
         while True:
             try:
                 async with self._slots():
-                    value = normalize_value(
-                        await read_present_value(self.app, record["device_address"], point["object_identifier"])
-                    )
-                failures = 0
-            except Exception as exc:
-                value = None
+                    raw = await read_present_value(self.app, record["device_address"], point["object_identifier"])
+                if raw is None or isinstance(raw, ErrorRejectAbortNack):
+                    raise ReadFailed(f"device answered {raw!r}")
+                value = normalize_value(raw)
+            except Exception as exc:  # noqa: BLE001 - every failure means "count it and retry"
+                # A failed read publishes nothing: a null reading made a dead
+                # device look like it was reporting downstream (Baler#83/#85).
                 failures += 1
                 if failures in (1, 5) or failures % 50 == 0:  # don't flood the log with a dead device
                     print(f"read failed for {point['object_identifier']} ({failures}x): {exc!r}")
+                await asyncio.sleep(failure_backoff(interval, failures))
+                continue
+            if failures:
+                print(f"read recovered for {point['object_identifier']} after {failures} failures")
+            failures = 0
 
             now = time.monotonic()
             if should_publish(
