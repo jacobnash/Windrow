@@ -35,6 +35,7 @@ from bacpypes3.argparse import SimpleArgumentParser
 from windrow import credentials, legacy, modbus_discovery, mqtt_sink, tracing
 from windrow.connection_manager import ConnectionManager
 from windrow.device_registry import DeviceRegistry
+from windrow.jobs import JobRunner
 from windrow.modbus_connection_manager import ModbusConnectionManager
 
 tracer = tracing.get_tracer(__name__)
@@ -111,6 +112,25 @@ async def handle_modbus_discover(body: dict) -> list:
         concurrency=body.get("concurrency", modbus_discovery.DEFAULT_CONCURRENCY),
         timeout=body.get("timeout", modbus_discovery.DEFAULT_TIMEOUT),
     )
+
+
+# --- background jobs (jobs.py, Baler#139) ---
+
+
+async def handle_start_job(jobs: JobRunner, body: dict) -> dict:
+    """{job: discover|learn|modbus_discover, ...} - answers at once; poll get_job."""
+    return await jobs.start(body)
+
+
+async def handle_get_job(jobs: JobRunner, body: dict) -> dict:
+    job = jobs.get(_target_id(body))
+    if job is None:
+        raise NotFound("no job with that id (finished jobs are kept for a while, and not across a restart)")
+    return job
+
+
+async def handle_list_jobs(jobs: JobRunner, body: dict | None = None) -> list:
+    return jobs.list()
 
 
 # --- BACnet connections ---
@@ -274,9 +294,13 @@ def make_handler(
     device_registry: DeviceRegistry,
     loop: asyncio.AbstractEventLoop,
     status_fn=None,
+    jobs: JobRunner | None = None,
 ):
     """`status_fn` builds GET /status - the same payload as the MQTT
-    heartbeat, for a node Baler reaches over HTTP (Baler#114)."""
+    heartbeat, for a node Baler reaches over HTTP (Baler#114). `jobs` runs
+    /jobs, the slow actions in the background (Baler#139)."""
+    if jobs is None:
+        jobs = JobRunner(manager, modbus_manager, device_registry)
     gateway_secret = os.environ.get("WINDROW_GATEWAY_SECRET") or None
     cors_origin = os.environ.get("WINDROW_CORS_ORIGIN") or None
 
@@ -393,6 +417,10 @@ def make_handler(
                 self._route("api.post_modbus_discover", handle_modbus_discover, count=True)
                 return
 
+            if self.path == "/jobs":
+                self._route("api.post_jobs", lambda body: handle_start_job(jobs, body), status=202)
+                return
+
             if self.path == "/modbus/test-read":
                 self._route("api.post_modbus_test_read", lambda body: handle_modbus_test_read(modbus_manager, body))
                 return
@@ -491,6 +519,15 @@ def make_handler(
                 self._route("api.get_devices", lambda _: handle_list_devices(device_registry), body={}, count=True)
                 return
 
+            if self.path == "/jobs":
+                self._route("api.get_jobs", lambda _: handle_list_jobs(jobs), body={}, count=True)
+                return
+
+            job_id = self._path_id("/jobs/")
+            if job_id is not None:
+                self._route("api.get_job", lambda body: handle_get_job(jobs, body), body={"id": job_id})
+                return
+
             if self.path == "/status" and status_fn is not None:
                 async def status(_body):  # on the loop, like every other read (module docstring)
                     return status_fn()
@@ -575,7 +612,7 @@ def make_handler(
 # the result like any other command's `id`.
 TARGETED_ACTIONS = {
     "set_device_status", "recheck_credentials", "update_connection", "delete_connection",
-    "modbus_update_connection", "modbus_delete_connection", "set_credential",
+    "modbus_update_connection", "modbus_delete_connection", "set_credential", "get_job",
 }
 
 
@@ -586,6 +623,7 @@ def _make_on_command(
     instance_id: str,
     modbus_manager: ModbusConnectionManager | None = None,
     device_registry: DeviceRegistry | None = None,
+    jobs: JobRunner | None = None,
 ):
     """multi-site.mdx's command channel: a {"action": ..., ...} message on
     cmd/{site_id}/{instance_id}/# dispatches to the same handler its own
@@ -599,7 +637,12 @@ def _make_on_command(
     skipped - otherwise every result, carrying its `action`, would be
     dispatched again as a new command, forever.
     """
+    if jobs is None:
+        jobs = JobRunner(manager, modbus_manager, device_registry)
     handlers = {
+        "start_job": lambda body: handle_start_job(jobs, body),
+        "get_job": lambda body: handle_get_job(jobs, body),
+        "list_jobs": lambda body: handle_list_jobs(jobs, body),
         "discover": lambda body: handle_discover(manager, body),
         "learn": lambda body: handle_learn(manager, body),
         "modbus_discover": lambda body: handle_modbus_discover(body),
@@ -819,6 +862,7 @@ async def async_main(args) -> None:
     device_registry = DeviceRegistry(args.devices_state_file)
     await device_registry.start()
 
+    jobs = JobRunner(manager, modbus_manager, device_registry)
     started_at = _now_iso()
     networks = node_networks(getattr(args, "address", None), args.modbus_scan_cidr)
 
@@ -830,7 +874,7 @@ async def async_main(args) -> None:
     if command_topic:
         mqtt_client.message_callback_add(
             command_topic,
-            _make_on_command(manager, loop, args.site_id, args.instance_id, modbus_manager, device_registry),
+            _make_on_command(manager, loop, args.site_id, args.instance_id, modbus_manager, device_registry, jobs),
         )
         heartbeat_task = loop.create_task(run_status_heartbeat(
             mqtt_client,
@@ -852,7 +896,7 @@ async def async_main(args) -> None:
         modbus_scan_task.add_done_callback(_crash_logger(f"modbus periodic scan ({cidr})"))
 
     server = ThreadingHTTPServer(
-        (args.host, args.port), make_handler(manager, modbus_manager, device_registry, loop, status_fn)
+        (args.host, args.port), make_handler(manager, modbus_manager, device_registry, loop, status_fn, jobs)
     )
     server.daemon_threads = True  # unset default is False - a hung request would otherwise block shutdown
 
@@ -875,6 +919,7 @@ async def async_main(args) -> None:
         # asyncio.run()'s default task-cancellation-on-shutdown
         # indefinitely - confirmed live (see test_modbus_connection_manager.py).
         await modbus_manager.close()
+        await jobs.close()
         if command_topic:
             publish_offline(mqtt_client, args.site_id, args.instance_id)
         mqtt_client.loop_stop()

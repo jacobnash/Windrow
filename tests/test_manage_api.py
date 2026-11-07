@@ -320,3 +320,33 @@ def test_modbus_test_read_route_and_action(harness):
     assert result["ok"] is False and "can't connect" in result["error"]
     status, body = harness.http("POST", "/modbus/test-read", {"host": "10.0.0.9"})
     assert status == 400
+
+
+def test_jobs_over_http_and_the_command_channel(harness, monkeypatch):
+    from windrow import jobs as jobs_mod
+
+    async def fake_sweep(cidr, port=502, concurrency=64, timeout=1.0, progress=None):
+        progress(1, 1)
+        return [{"host": "10.0.0.30", "port": 502, "vendor": None, "product_code": None, "revision": None}]
+
+    monkeypatch.setattr(jobs_mod.modbus_discovery, "sweep", fake_sweep)
+    status, job = harness.http("POST", "/jobs", {"job": "modbus_discover", "cidr": "10.0.0.0/24"})
+    assert status == 202 and job["state"] == "running"
+    for _ in range(100):
+        status, job = harness.http("GET", f"/jobs/{job['id']}")
+        if job["state"] != "running":
+            break
+    assert status == 200 and job["state"] == "done" and job["result"][0]["host"] == "10.0.0.30"
+    # the find is recorded as a device, like a periodic scan's
+    assert [d["host"] for d in harness.registry.list()] == ["10.0.0.30"]
+    assert harness.http("GET", "/jobs/nope")[0] == 404
+    assert harness.http("POST", "/jobs", {"job": "nope"})[0] == 400
+
+    started = harness.send({"action": "start_job", "job": "modbus_discover", "cidr": "10.0.0.0/24", "request_id": "r1"})
+    assert started["ok"] and started["request_id"] == "r1"
+    for _ in range(100):
+        got = harness.send({"action": "get_job", "id": started["result"]["id"], "request_id": "r2"})
+        if got["result"]["state"] != "running":
+            break
+    assert got["ok"] and got["result"]["state"] == "done"
+    assert harness.send({"action": "list_jobs"})["ok"]

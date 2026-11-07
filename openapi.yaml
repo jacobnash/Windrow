@@ -678,6 +678,72 @@ paths:
           description: No device with that id.
         "500":
           $ref: "#/components/responses/ServerError"
+  /jobs:
+    post:
+      operationId: startJob
+      summary: Start a slow action (discover, learn, Modbus sweep) in the background
+      description: >-
+        Answers at once with a job; poll `GET /jobs/{id}` for `progress` and,
+        once `state` is `done`, the `result` (what the synchronous route
+        would have returned). The synchronous routes give up after 15 s, so
+        a /24 sweep or a big learn should use this. A finished `discover` or
+        `modbus_discover` also records what it found as devices, like the
+        periodic scans. A second start of a discover or sweep while one is
+        running returns the running job. Jobs are in memory only: the newest
+        20 are kept, none across a restart.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartJobRequest"
+            examples:
+              sweep:
+                value: { "job": "modbus_discover", "cidr": "192.168.1.0/24" }
+              learn:
+                value: { "job": "learn", "device_address": "192.168.1.20", "device_instance": 10228 }
+      responses:
+        "202":
+          description: Started (or the same kind already running).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    get:
+      operationId: listJobs
+      summary: Recent jobs, without their results
+      responses:
+        "200":
+          description: Jobs, oldest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Job"
+  /jobs/{id}:
+    get:
+      operationId: getJob
+      summary: One job's state, progress and (when done) result
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The job.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          description: No job with that id (it was trimmed, or Windrow restarted).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
   /status:
     get:
       operationId: getStatus
@@ -871,6 +937,34 @@ components:
           type: array
           items: { type: string }
           description: Labels of the points whose last read failed (at most 20).
+    StartJobRequest:
+      type: object
+      required: [job]
+      description: "`job` plus that action's own fields (see /discover, /learn, /modbus/discover)."
+      properties:
+        job: { type: string, enum: [discover, learn, modbus_discover] }
+      additionalProperties: true
+    Job:
+      type: object
+      required: [id, job, state]
+      properties:
+        id: { type: string }
+        job: { type: string, enum: [discover, learn, modbus_discover] }
+        params: { type: object, additionalProperties: true }
+        state: { type: string, enum: [running, done, failed] }
+        started_at: { type: number, description: unix seconds }
+        finished_at: { type: [number, "null"] }
+        progress:
+          description: modbus_discover only - hosts probed so far.
+          oneOf:
+            - type: "null"
+            - type: object
+              properties:
+                done: { type: integer }
+                total: { type: integer }
+        result:
+          description: When done - what the synchronous route returns. Left out of the listing.
+        error: { type: [string, "null"] }
     ModbusTestReadRequest:
       type: object
       required: [host, register]

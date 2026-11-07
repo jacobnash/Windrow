@@ -61,6 +61,9 @@ equivalent calls (the `handle_*` functions in `src/windrow/api.py`):
 | `modbus_create_connection` | `POST /modbus/connections` | as the HTTP body: `host`, `topic_prefix`, `points` (`{label: register}`), optional `port`/`device_id`/`poll_interval`/`credential` |
 | `modbus_update_connection` | `PATCH /modbus/connections/{id}` | `id`, plus any of `points`, `poll_interval`, `topic_prefix`, `host`, `port`, `device_id` |
 | `modbus_delete_connection` | `DELETE /modbus/connections/{id}` | `id` |
+| `start_job` | `POST /jobs` | `job` (`discover`, `learn` or `modbus_discover`) plus that action's fields. Answers at once with the job; use it for anything that can take more than a few seconds |
+| `get_job` | `GET /jobs/{id}` | `id` (the job's): `state` (`running`/`done`/`failed`), `progress` (`{done, total}` for a sweep), `result` once done, `error` if failed |
+| `list_jobs` | `GET /jobs` | none |
 | `modbus_test_read` | `POST /modbus/test-read` | `host`, `register`, optional `port` (502) / `device_id` (1). Reads once; stores and publishes nothing |
 | `set_credential` | `PATCH .../{id}/credential` | `target` (`device`, `connection` or `modbus_connection`), `id`, `credential: {username, password}` |
 
@@ -75,7 +78,7 @@ is dropped without one.
 
 For the actions that act on one device or connection (`set_device_status`,
 `recheck_credentials`, `update_connection`, `delete_connection`, their
-`modbus_*` twins, and `set_credential`), `id` is the id of that device or
+`modbus_*` twins, `set_credential` and `get_job`), `id` is the id of that device or
 connection, so correlate those with `request_id`.
 
 Results are what the HTTP route returns: device and connection records
