@@ -148,9 +148,14 @@ From another machine, check the simulators are reachable:
 - `modbus`: `nc -z <pi> 502`.
 
 Re-running the script upgrades Windrow to the current `main`, or to
-`WINDROW_REF=<branch, tag or full sha>`. It compares commits, not version
-strings, so it upgrades even though the version stays `0.1.0`. It reinstalls
-Windrow only when the commit differs, and installs only the dependencies that
-are missing or need a newer version. It rewrites the unit, restarts the service
-only if Windrow or the unit changed, and prints the installed commit.
+`WINDROW_REF=<branch, tag, or full or short sha>`, which it resolves to the
+full commit and pins. It compares commits, not version strings, so it upgrades
+even though the version stays `0.1.0`. It reinstalls Windrow only when the
+commit differs, and installs only the dependencies that are missing or need a
+newer version. It rewrites the unit and restarts that role if the unit changed.
+
+All roles on a Pi share one install (`/opt/windrow`). So after any install,
+the script restarts **every** running `windrow-*` service whose process started
+before that install, whichever role you re-ran. Re-running for one role
+upgrades them all. It ends by listing each service's state and start time.
 `/etc/windrow/edge.env` is kept.

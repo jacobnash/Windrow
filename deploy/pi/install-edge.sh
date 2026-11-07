@@ -2,11 +2,14 @@
 # Sets up a Raspberry Pi (Raspberry Pi OS Lite 64-bit, or any Debian with
 # systemd) as a Windrow edge node for Baler (Baler#35). One role per run.
 # Re-running is safe and idempotent: it installs the requested Windrow ref
-# (WINDROW_REF, default main) if that isn't the commit already installed,
-# rewrites the unit, and restarts the service only if either changed.
+# (WINDROW_REF, default main) if that isn't the commit already installed and
+# rewrites the unit. It then restarts this role if its unit changed, and
+# every windrow-* service on the Pi whose process started before the
+# installed Windrow, whichever role's run installed it: all roles share one
+# venv (Windrow#22).
 #
 #   sudo bash install-edge.sh <role>
-#   sudo WINDROW_REF=<branch|tag|sha> bash install-edge.sh <role>
+#   sudo WINDROW_REF=<branch|tag|sha, full or short> bash install-edge.sh <role>
 #
 # Roles:
 #   bacnet   a simulated BACnet/IP device (windrow.mock_device) on this Pi's
@@ -74,17 +77,29 @@ id -u "$SVC_USER" >/dev/null 2>&1 || useradd --system --home /var/lib/windrow --
 [ -x "$VENV/bin/python" ] || python3 -m venv "$VENV"
 "$VENV/bin/pip" install -q --upgrade pip
 
-# Pin the ref to a commit. `pip install --upgrade windrow @ git+...@main`
-# is a no-op whenever the version string is unchanged (always 0.1.0), even
-# after main has moved (Windrow#6), so compare commits instead.
-if printf '%s' "$WINDROW_REF" | grep -qxE '[0-9a-f]{40}'; then
-  WANT="$WINDROW_REF"
-else
-  # A tag's peeled ^{} line (its commit) wins over the tag object itself.
-  WANT=$(git ls-remote "$WINDROW_GIT" "$WINDROW_REF" "${WINDROW_REF}^{}" \
+# Pin the ref to a full commit sha. `pip install --upgrade windrow @
+# git+...@main` is a no-op whenever the version string is unchanged (always
+# 0.1.0), even after main has moved (Windrow#6), so compare commits instead.
+resolve_ref() {
+  local ref=$1 sha tmp
+  # Branch or tag: ls-remote, no clone. A tag's peeled ^{} line (its
+  # commit) wins over the tag object itself.
+  sha=$(git ls-remote "$WINDROW_GIT" "refs/heads/$ref" "refs/tags/$ref" "refs/tags/$ref^{}" \
     | awk '{sha=$1} $2 ~ /\^\{\}$/ {peeled=$1} END {print (peeled != "" ? peeled : sha)}')
-  [ -n "$WANT" ] || { echo "no branch or tag '$WINDROW_REF' in $WINDROW_GIT (use a full 40-char sha for a commit)" >&2; exit 1; }
-fi
+  if [ -z "$sha" ] && printf '%s' "$ref" | grep -qxE '[0-9a-f]{4,40}'; then
+    # A sha, full or short: ls-remote can't look those up, so ask a
+    # throwaway treeless clone (commits only, no files) to expand it.
+    tmp=$(mktemp -d)
+    if git clone -q --bare --filter=tree:0 "$WINDROW_GIT" "$tmp" 2>/dev/null; then
+      sha=$(git -C "$tmp" rev-parse -q --verify "${ref}^{commit}" 2>/dev/null || true)
+    fi
+    rm -rf "$tmp"
+  fi
+  printf '%s' "$sha"
+}
+WANT=$(resolve_ref "$WINDROW_REF")
+[ -n "$WANT" ] || { echo "'$WINDROW_REF' is not a branch, tag or (unambiguous) commit in $WINDROW_GIT" >&2; exit 1; }
+[ "$WANT" = "$WINDROW_REF" ] || echo "    $WINDROW_REF = $WANT"
 # The commit pip recorded for the installed Windrow (PEP 610
 # direct_url.json), or nothing if it isn't installed yet.
 installed_commit() {
@@ -94,14 +109,22 @@ from importlib.metadata import distribution
 print(json.loads(distribution("windrow").read_text("direct_url.json") or "{}").get("vcs_info", {}).get("commit_id", ""))
 PY
 }
+# When that install happened (unix seconds): the mtime of the same
+# direct_url.json. A service process started before it runs older code.
+installed_at() {
+  "$VENV/bin/python" - <<'PY' 2>/dev/null || true
+import os
+from importlib.metadata import distribution
+d = distribution("windrow")
+print(next(int(os.path.getmtime(d.locate_file(f))) for f in d.files if f.name == "direct_url.json"))
+PY
+}
 HAVE=$(installed_commit)
-CHANGED=0
 if [ "$HAVE" != "$WANT" ]; then
   echo "    ${HAVE:-not installed} -> $WANT"
   # Windrow itself, unconditionally at that commit; --no-deps so this step
   # never reinstalls dependencies that haven't changed.
   "$VENV/bin/pip" install -q --force-reinstall --no-deps "windrow @ git+${WINDROW_GIT}@${WANT}"
-  CHANGED=1
 else
   echo "    already at $WANT"
 fi
@@ -192,23 +215,58 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 UNITEOF
+UNIT_CHANGED=0
 if ! cmp -s "$NEW_UNIT" "$UNIT"; then
   install -m 644 "$NEW_UNIT" "$UNIT"
-  CHANGED=1
+  UNIT_CHANGED=1
 fi
 
+# When a running unit's main process started (unix seconds), or nothing.
+started_at() {
+  local ts
+  ts=$(systemctl show -P ExecMainStartTimestamp "$1" 2>/dev/null || true)
+  [ -n "$ts" ] && date -d "$ts" +%s 2>/dev/null || true
+}
+
 systemctl daemon-reload
-if systemctl is-active --quiet "windrow-${ROLE}.service"; then
-  # enable --now leaves a running service alone, so a new commit or unit
-  # would only take effect at the next reboot without this.
-  systemctl enable --quiet "windrow-${ROLE}.service"
-  if [ "$CHANGED" = 1 ]; then
-    systemctl restart "windrow-${ROLE}.service"
+SVC="windrow-${ROLE}.service"
+if systemctl is-active --quiet "$SVC"; then
+  # enable --now leaves a running service alone, so a new unit would only
+  # take effect at the next reboot without the restart.
+  systemctl enable --quiet "$SVC"
+  if [ "$UNIT_CHANGED" = 1 ]; then
+    echo "==> $SVC: unit changed - restarting"
+    systemctl restart "$SVC"
   fi
 else
-  systemctl enable --now "windrow-${ROLE}.service"
+  systemctl enable --now "$SVC"
 fi
-echo "==> windrow-${ROLE} running ($(systemctl is-active "windrow-${ROLE}")) on Windrow $(installed_commit). Logs: journalctl -u windrow-${ROLE} -f"
+
+# Every role shares this venv, so whichever role's run installed a new
+# commit, the other roles' processes still run the old one until restarted
+# (Windrow#22). Restart each active windrow-* service whose main process
+# started before the install.
+INSTALLED_AT=$(installed_at)
+for unit_file in /etc/systemd/system/windrow-*.service; do
+  [ -e "$unit_file" ] || continue
+  unit=${unit_file##*/}
+  systemctl is-active --quiet "$unit" || continue
+  started=$(started_at "$unit")
+  if [ -n "$INSTALLED_AT" ] && [ -n "$started" ] && [ "$started" -lt "$INSTALLED_AT" ]; then
+    echo "==> $unit started $(date -d "@$started" '+%F %T') before Windrow was installed $(date -d "@$INSTALLED_AT" '+%F %T') - restarting"
+    systemctl restart "$unit"
+  fi
+done
+
+echo "==> Windrow $(installed_commit) installed $(date -d "@${INSTALLED_AT:-0}" '+%F %T'). Services:"
+for unit_file in /etc/systemd/system/windrow-*.service; do
+  [ -e "$unit_file" ] || continue
+  unit=${unit_file##*/}
+  started=$(started_at "$unit")
+  printf '    %-24s %-9s since %s\n' "$unit" "$(systemctl is-active "$unit" || true)" \
+    "$([ -n "$started" ] && date -d "@$started" '+%F %T' || echo -)"
+done
+echo "    Logs: journalctl -u ${SVC} -f"
 case "$ROLE" in weather|gateway)
   echo "    set MQTT_USERNAME/MQTT_PASSWORD (and WINDROW_SITE_ID for gateway) in ${ENV_FILE}, then: systemctl restart windrow-${ROLE}";;
 esac
