@@ -28,17 +28,55 @@ local development only. No CORS headers are sent unless
 curl -X POST localhost:8001/discover -d '{"address": "192.168.128.63:47808", "timeout": 5.0}'
 ```
 
-Omit `address` to broadcast Who-Is across the whole local network instead
-of targeting one device — the exact same code path, just without a
-destination. (A **locally-originated** broadcast doesn't loop back to
+Omit `address` to broadcast Who-Is instead of targeting one device. The
+broadcast is global (`*:*`), so routers pass it on to the networks behind
+them — see "Other subnets and MS/TP" below for devices that aren't on this
+subnet. (A **locally-originated** broadcast doesn't loop back to
 another process on the *same* machine over a real physical interface —
 that's a macOS/BSD networking limitation, not something this API works
 around; broadcast discovery works identically against real devices on a
 real network.)
 
 ```json
-[{"device_instance": 3456, "address": "192.168.128.63", "vendor_id": 999}]
+[{"device_instance": 3456, "address": "192.168.128.63", "network": null, "mac": "192.168.128.63",
+  "vendor_id": 999, "max_apdu": 1476}]
 ```
+
+### Other subnets and MS/TP (BBMDs, foreign devices, routers)
+
+A real building has BACnet on several IP subnets, joined by BBMDs, and MS/TP
+trunks behind BACnet routers. Windrow reaches all of them the standard ways:
+
+- **Another IP subnet, through a BBMD.** Register as a foreign device with
+  the site's BBMD: `--foreign 10.1.0.1 --ttl 300`, or in the environment
+  `WINDROW_BACNET_FOREIGN_BBMD=10.1.0.1` and `WINDROW_BACNET_FOREIGN_TTL=300`
+  (the command line wins). bacpypes3 renews the registration every TTL and
+  retries every 5 s until the BBMD answers; Who-Is broadcasts then go to the
+  BBMD, which distributes them to every subnet in its table. Windrow can
+  also *be* the BBMD (`--bbmd [peer ...]` / `WINDROW_BACNET_BBMD_BDT`, space-
+  or comma-separated peers, empty for none). `GET /bacnet/network` shows the
+  mode and whether the BBMD accepted the registration (`registered`,
+  `registering`, `unregistered`, `rejected (code)`); the status heartbeat
+  carries the same as `bacnet_network`.
+- **Behind a router (MS/TP, or a routed IP network).** A device there
+  answers the global Who-Is from a routed address, `net:mac`: `5:12` is MAC
+  12 on network 5, `7:10.0.1.20` a BACnet/IP device on routed network 7.
+  Create the connection with that address as `device_address`, the same as
+  any other. bacpypes3 finds the router for the network (from the I-Am, or by
+  asking Who-Is-Router-To-Network); after 3 failed reads in a row the cached
+  route is dropped and looked up again, so a router that was replaced or
+  re-addressed doesn't leave the connection asking the old one forever.
+  `{"network": 5}` in the discover body broadcasts on that one network;
+  `POST /discover/routers` lists every router and the networks it reaches.
+- `{"global_broadcast": false}` keeps the Who-Is to this subnet, as before.
+
+`max_apdu` comes from the device's I-Am; MS/TP devices are usually 480.
+
+`windrow.mock_router` simulates this: a BACnet/IP router + BBMD with mock
+devices on a virtual network behind it (`python -m windrow.mock_router
+--address 192.168.1.40/24:47808 --bbmd --device 5:4242`). It doesn't
+simulate MS/TP itself — token passing, timing and the small APDUs are not
+there.
 
 ## 2. Learn a device's points
 

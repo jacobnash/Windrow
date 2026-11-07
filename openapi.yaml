@@ -30,13 +30,19 @@ paths:
       operationId: discoverDevices
       summary: Find BACnet devices (Who-Is / I-Am)
       description: |
-        Broadcasts Who-Is across the local network by default. Pass
-        `address` to target one specific device instead (a directed
-        Who-Is) - useful for testing on a single host, since a
-        locally-originated broadcast doesn't loop back to another process
-        on the *same* machine over a real physical interface (a
-        macOS/BSD networking behavior, not something this endpoint works
-        around). Both modes use the exact same code path.
+        Broadcasts Who-Is globally (`*:*`) by default: every BACnet router
+        forwards it to the networks behind it (MS/TP trunks included), and
+        when Windrow is a foreign device (`--foreign` /
+        `WINDROW_BACNET_FOREIGN_BBMD`) its BBMD distributes it to the other
+        subnets. A device behind a router answers from a routed `net:mac`
+        address (e.g. `5:12`), which is what a connection to it uses.
+        Pass `network` to broadcast on one remote network only,
+        `global_broadcast: false` to stay on this subnet, or `address` to
+        target one specific device (a directed Who-Is) - useful for testing
+        on a single host, since a locally-originated broadcast doesn't loop
+        back to another process on the *same* machine over a real physical
+        interface (a macOS/BSD networking behavior, not something this
+        endpoint works around).
       requestBody:
         required: false
         content:
@@ -50,6 +56,9 @@ paths:
               directed:
                 summary: Target one known device (e.g. for same-host testing)
                 value: { "address": "192.168.128.63:47808", "timeout": 5.0 }
+              one_network:
+                summary: Every device on network 5 (e.g. one MS/TP trunk)
+                value: { "network": 5 }
       responses:
         "200":
           description: Every device that responded, as a JSON array (possibly empty).
@@ -59,11 +68,100 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Device"
-              example: [{ "device_instance": 3456, "address": "192.168.128.63", "vendor_id": 999 }]
+              example:
+                - { "device_instance": 3456, "address": "192.168.128.63", "network": null, "mac": "192.168.128.63", "vendor_id": 999, "max_apdu": 1476 }
+                - { "device_instance": 4242, "address": "5:12", "network": 5, "mac": "12", "vendor_id": 24, "max_apdu": 480 }
         "400":
           $ref: "#/components/responses/BadRequest"
         "504":
           $ref: "#/components/responses/Timeout"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /discover/routers:
+    post:
+      operationId: discoverRouters
+      summary: Find BACnet routers (Who-Is-Router-To-Network)
+      description: >-
+        Asks every router reachable from here (through the BBMD too, as a
+        foreign device) which networks it reaches. The network numbers are
+        what `POST /discover`'s `network` and a `net:mac` device address
+        refer to. The routes learned are also cached (see GET /bacnet/network).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                network:
+                  type: integer
+                  minimum: 1
+                  maximum: 65534
+                  description: Only routers to this network.
+                timeout:
+                  type: number
+                  default: 5.0
+      responses:
+        "200":
+          description: Each router that answered and the networks it reaches.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [address, networks]
+                  properties:
+                    address: { type: string, example: "10.0.0.1" }
+                    networks: { type: array, items: { type: integer }, example: [5, 6] }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "504":
+          $ref: "#/components/responses/Timeout"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /bacnet/network:
+    get:
+      operationId: getBacnetNetwork
+      summary: How this instance is attached to BACnet - BBMD / foreign-device state and known routes
+      description: >-
+        `mode` is `normal`, `foreign` (registered with a BBMD: set with
+        `--foreign`/`--ttl` or `WINDROW_BACNET_FOREIGN_BBMD`/`WINDROW_BACNET_FOREIGN_TTL`;
+        the registration renews itself at the TTL) or `bbmd` (`--bbmd` or
+        `WINDROW_BACNET_BBMD_BDT`). `registration` is the BBMD's answer to the
+        last registration: `registered`, `registering` (no answer yet),
+        `unregistered`, or `rejected (code)`. `routes` are the routers learned
+        so far, by network.
+      responses:
+        "200":
+          description: The current state.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [mode, routes]
+                properties:
+                  mode: { type: string, enum: [normal, foreign, bbmd] }
+                  bbmd: { type: ["string", "null"], example: "10.1.0.1" }
+                  ttl: { type: ["integer", "null"], example: 300 }
+                  registration: { type: string, example: registered }
+                  bdt: { type: array, items: { type: string } }
+                  foreign_devices:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        address: { type: string }
+                        ttl: { type: integer }
+                        remaining: { type: integer }
+                  networks: { type: array, items: { type: integer } }
+                  routes:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        network: { type: integer, example: 5 }
+                        router: { type: string, example: "10.0.0.1" }
         "500":
           $ref: "#/components/responses/ServerError"
   /write:
@@ -692,8 +790,17 @@ components:
           description: Upper bound of the device-instance range to scan. Requires low_limit.
         address:
           type: string
-          description: Target one specific device (directed Who-Is) instead of broadcasting.
+          description: Target one specific device (directed Who-Is) instead of broadcasting - a local `ip[:port]` or a routed `net:mac`.
           example: "192.168.128.63:47808"
+        network:
+          type: integer
+          minimum: 1
+          maximum: 65534
+          description: Broadcast on this one remote network (`net:*`) instead of globally.
+        global_broadcast:
+          type: boolean
+          default: true
+          description: "`false` keeps the Who-Is to this subnet (a local broadcast), as before Baler#126."
         timeout:
           type: number
           description: Seconds to wait for I-Am responses. Defaults to bacpypes3's own Who-Is timeout (3s) if omitted.
@@ -707,11 +814,25 @@ components:
           example: 3456
         address:
           type: string
-          description: BACnet/IP address the device responded from (no port - the standard BACnet/IP port 47808 is implied and works automatically in every other call that takes an address).
+          description: >-
+            The address the device responded from, as every other call takes
+            it: a BACnet/IP address (no port when it's the standard 47808), or
+            for a device behind a router `net:mac` - its network number and
+            its MAC on that network (`5:12` for MS/TP MAC 12 on network 5,
+            `7:10.0.1.20` for a BACnet/IP device on a routed IP network).
           example: "192.168.128.63"
+        network:
+          type: ["integer", "null"]
+          description: The device's network number when it's behind a router; null on this subnet.
+        mac:
+          type: string
+          description: The device's MAC on its network (the IP address on this subnet).
         vendor_id:
           type: integer
           example: 999
+        max_apdu:
+          type: integer
+          description: Largest APDU the device accepts, from its I-Am (480 is typical of MS/TP).
     LearnRequest:
       type: object
       required: [device_address, device_instance]
@@ -808,6 +929,7 @@ components:
       properties:
         device_address:
           type: string
+          description: "`ip[:port]` on this subnet, or `net:mac` for a device behind a router (`5:12`) - as `/discover` reports it. A broadcast address is a 400."
           example: "192.168.128.63:47808"
         device_instance:
           type: integer

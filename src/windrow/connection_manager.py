@@ -23,6 +23,7 @@ from bacpypes3.basetypes import ErrorType
 from windrow import (
     bacnet_batch,
     bacnet_cov,
+    bacnet_network,
     bacnet_tagger,
     bacnet_trend,
     connection_store,
@@ -249,6 +250,10 @@ def _object_type(object_identifier: str) -> str:
 MAX_CONCURRENT_READS = int(os.environ.get("WINDROW_MAX_CONCURRENT_READS", "16"))
 # A point whose reads keep failing backs off up to this long between tries.
 MAX_FAILURE_BACKOFF = 300.0
+# After this many failures in a row to a routed (net:mac) device, forget the
+# cached router for its network, so the next read looks for the router
+# again - one that was replaced or re-addressed is otherwise asked forever.
+ROUTE_RESET_FAILURES = 3
 
 
 def failure_backoff(interval: float, consecutive_failures: int) -> float:
@@ -339,6 +344,7 @@ class ConnectionManager:
         read_options: dict | None = None,
     ) -> dict:
         with tracer.start_as_current_span("connection_manager.create_connection") as span:
+            bacnet_network.parse_device_address(device_address)  # ValueError (a 400) for a broadcast or a typo
             record = {
                 "id": connection_store.new_connection_id(),
                 "device_address": device_address,
@@ -752,6 +758,8 @@ class ConnectionManager:
                     failures += 1
                     if failures in (1, 5) or failures % 50 == 0:  # don't flood the log with a dead device
                         print(f"read failed for {point['object_identifier']} ({failures}x): {exc!r}")
+                    if failures % ROUTE_RESET_FAILURES == 0 and bacnet_network.forget_route(self.app, address):
+                        print(f"forgot the route to {address} after {failures} failures; looking for its router again")
                     await wait_next(interval, failures)
                     continue
                 if failures:

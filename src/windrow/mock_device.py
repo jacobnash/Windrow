@@ -193,8 +193,12 @@ def _forward(rng) -> bool:
 
 
 class MockDevice:
-    def __init__(self, args, site_spec: list[dict] | None = None, trend_log_interval: float | None = None):
-        self.app = MockApplication.from_args(args)
+    def __init__(self, args=None, site_spec: list[dict] | None = None, trend_log_interval: float | None = None,
+                 app: Application | None = None):
+        # `app`: an already-built Application, e.g. one on a virtual
+        # network behind windrow.mock_router instead of on BACnet/IP (that
+        # one has no ReadRange server, so no trend logs there)
+        self.app = app if app is not None else MockApplication.from_args(args)
         self.objects: list[tuple] = []
 
         for spec in site_spec or _DEFAULT_SITE_SPEC:

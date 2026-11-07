@@ -45,7 +45,9 @@ equivalent calls (the `handle_*` functions in `src/windrow/api.py`):
 
 | action | same as | body fields |
 | --- | --- | --- |
-| `discover` | `POST /discover` | passed through as kwargs |
+| `discover` | `POST /discover` | passed through as kwargs (`address`, `network`, `global_broadcast`, `timeout`, `low_limit`/`high_limit`) |
+| `discover_routers` | `POST /discover/routers` | optional `network`, `timeout` |
+| `network_status` | `GET /bacnet/network` | none |
 | `learn` | `POST /learn` | `device_address`, `device_instance` |
 | `modbus_discover` | `POST /modbus/discover` | `cidr`, optional `port`/`concurrency`/`timeout` |
 | `point_write` | `POST /write` | `topic`, `value` (`null` relinquishes), `priority` 1-17 (17 sets BACnet relinquish-default; it cannot be relinquished), optional `expires_at` (unix s). A topic a Modbus connection publishes goes to its writable holding register or coil - see below |
@@ -151,11 +153,14 @@ on `cmd/<site-id>/<instance-id>/status`, published at startup, on every
  "version": "0.1.0", "started_at": "2026-11-07T09:00:00.123456+00:00",
  "ts": "2026-11-07T09:05:00.654321+00:00",
  "bacnet_connections": 3, "modbus_connections": 1, "devices": 9, "pending_devices": 2,
+ "bacnet_network": {"mode": "foreign", "bbmd": "10.1.0.1", "registration": "registered"},
  "bacnet_requests": {"read_property_multiple": 1200, "subscribe_cov": 40,
                      "cov_notifications": 310, "cov_subscriptions": 20},
  "spool": {"rows": 0, "capacity": 95040, "dropped": 0}}
 ```
 
+`bacnet_network` is how this instance reaches BACnet: `mode` `normal`,
+`foreign` (with the BBMD and whether it accepted the registration) or `bbmd`.
 `bacnet_requests` counts BACnet requests sent since startup, by kind, plus
 the number of live COV subscriptions - see bacnet-discovery-api.md 3c.
 
