@@ -15,7 +15,31 @@ sudo bash install-edge.sh bacnet     # or: modbus, weather, gateway
 | `bacnet` | `windrow.mock_device`, a simulated BACnet/IP device | UDP 47808 on the Pi's LAN address (its /24, so it hears Who-Is broadcasts); instance = last octet + 10000 unless `BACNET_INSTANCE` is set |
 | `modbus` | `windrow.mock_modbus_device`, a simulated Modbus TCP server | TCP 502 (via `AmbientCapabilities`, no root, no `setcap`) |
 | `weather` | `windrow.mock_weather`, a simulated weather station | publishes to Baler's MQTT broker |
-| `gateway` | `windrow.api`, Windrow itself | discovers and polls BACnet/Modbus devices on this LAN, publishes to Baler |
+| `gateway` | `windrow.api`, Windrow itself | discovers and polls BACnet/Modbus devices on this LAN, publishes to Baler; UDP 47808 on the Pi's LAN address, HTTP API on 127.0.0.1:8001 |
+
+`bacnet` and `gateway` can't share a Pi: both bind UDP 47808 on its address
+(Windrow has to, since bacpypes3 sends Who-Is to its own port). The script
+refuses the second one; `sudo systemctl disable --now windrow-<role>` first
+to switch.
+
+### The gateway's HTTP API stays on the Pi
+
+The `gateway` role's API binds to `127.0.0.1:8001`. That API can create
+connections and write points, and Baler doesn't need it: Baler reaches a
+gateway over the MQTT command channel (`cmd/<site-id>/<instance-id>/#`, see
+[command-channel.md](command-channel.md)), the same outbound connection it
+publishes on. To use the API from the Pi itself: `curl localhost:8001/devices`.
+
+To expose it on the LAN anyway, set `WINDROW_GATEWAY_SECRET` in
+`/etc/windrow/edge.env` (requests then need it in `X-Gateway-Secret`) and
+reinstall with:
+
+```bash
+sudo WINDROW_API_HOST=0.0.0.0 bash install-edge.sh gateway
+```
+
+Installs from before this change bound the API to `0.0.0.0`; re-running the
+script moves it to loopback.
 
 ## Broker account (weather, gateway)
 
@@ -44,6 +68,8 @@ outside the site looks like "connected but no data". Check the prefix first.
 systemctl status windrow-<role>
 journalctl -u windrow-<role> -f
 ```
+
+On a `gateway`, `curl -s localhost:8001/devices` lists what it has discovered.
 
 From another machine, check the simulators are reachable:
 - `bacnet`: a Who-Is from any BACnet tool, or add it as a connection in Baler's Devices page by IP.
