@@ -32,9 +32,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
-from windrow import announce, credentials, legacy, modbus_discovery, mqtt_sink, tracing
+from windrow import (
+    announce,
+    bacnet_network,
+    connection_store,
+    credentials,
+    legacy,
+    modbus_discovery,
+    mqtt_sink,
+    tracing,
+)
 from windrow.connection_manager import READ_OPTION_FIELDS, ConnectionManager
 from windrow.device_registry import DeviceRegistry
+from windrow.discovery import discover_params
+from windrow.jobs import JobRunner
 from windrow.modbus_connection_manager import ModbusConnectionManager
 
 tracer = tracing.get_tracer(__name__)
@@ -52,6 +63,17 @@ def _redact(record: dict) -> dict:
     through this - password_ciphertext never appears in an API response,
     same shape as baler/webhooks.py's `_redact_webhook`."""
     return {**record, "credential": credentials.redact(record.get("credential"))}
+
+
+def _with_poll_status(owner, record: dict) -> dict:
+    """A listed connection plus `poll_status` (poll_status.py, Baler#110):
+    whether it's actually reading. Added to the response only - the stored
+    record never carries it."""
+    out = _redact(record)
+    status = getattr(owner, "status", None)
+    if status is not None:
+        out["poll_status"] = status.snapshot(record["id"], len(record.get("points") or ()))
+    return out
 
 
 class NotFound(LookupError):
@@ -78,7 +100,20 @@ def _encrypt_credential(credential) -> dict:
 # request body as a dict and returns something JSON-serializable, with
 # credentials already redacted the way every HTTP GET redacts them.
 async def handle_discover(manager: ConnectionManager, body: dict) -> list:
-    return await manager.discover(**body)
+    return await manager.discover(**discover_params(body))
+
+
+async def handle_discover_routers(manager: ConnectionManager, body: dict) -> list:
+    """Who-Is-Router-To-Network: {network?, timeout?} -> [{address, networks}]."""
+    network = body.get("network")
+    if network is not None and (isinstance(network, bool) or not isinstance(network, int) or not 1 <= network <= 65534):
+        raise ValueError(f"network must be a BACnet network number 1-65534, got {network!r}")
+    timeout = connection_store.check_number("timeout", body.get("timeout", 5.0))
+    return await bacnet_network.discover_routers(manager.app, network=network, timeout=timeout)
+
+
+async def handle_network_status(manager: ConnectionManager, body: dict | None = None) -> dict:
+    return bacnet_network.network_status(manager.app)
 
 
 async def handle_learn(manager: ConnectionManager, body: dict) -> list:
@@ -107,11 +142,30 @@ async def handle_modbus_discover(body: dict) -> list:
     )
 
 
+# --- background jobs (jobs.py, Baler#139) ---
+
+
+async def handle_start_job(jobs: JobRunner, body: dict) -> dict:
+    """{job: discover|learn|modbus_discover, ...} - answers at once; poll get_job."""
+    return await jobs.start(body)
+
+
+async def handle_get_job(jobs: JobRunner, body: dict) -> dict:
+    job = jobs.get(_target_id(body))
+    if job is None:
+        raise NotFound("no job with that id (finished jobs are kept for a while, and not across a restart)")
+    return job
+
+
+async def handle_list_jobs(jobs: JobRunner, body: dict | None = None) -> list:
+    return jobs.list()
+
+
 # --- BACnet connections ---
 
 
 async def handle_list_connections(manager: ConnectionManager, body: dict | None = None) -> list:
-    return [_redact(c) for c in await manager.list_connections()]
+    return [_with_poll_status(manager, c) for c in await manager.list_connections()]
 
 
 async def handle_create_connection(manager: ConnectionManager, body: dict) -> dict:
@@ -151,7 +205,17 @@ async def handle_delete_connection(manager: ConnectionManager, body: dict) -> di
 
 
 async def handle_modbus_list_connections(modbus_manager: ModbusConnectionManager, body: dict | None = None) -> list:
-    return [_redact(c) for c in await modbus_manager.list_connections()]
+    return [_with_poll_status(modbus_manager, c) for c in await modbus_manager.list_connections()]
+
+
+async def handle_modbus_test_read(modbus_manager: ModbusConnectionManager, body: dict) -> dict:
+    """{host, register, port?, device_id?, point?} - one register from a
+    device before it's a connection, so a wrong host/unit/register shows up
+    before saving (Baler#110). Nothing is stored or published."""
+    return await modbus_manager.test_read(
+        body["host"], body["register"], port=body.get("port", 502), device_id=body.get("device_id", 1),
+        point=body.get("point"),
+    )
 
 
 async def handle_modbus_create_connection(modbus_manager: ModbusConnectionManager, body: dict) -> dict:
@@ -263,8 +327,15 @@ def make_handler(
     modbus_manager: ModbusConnectionManager,
     device_registry: DeviceRegistry,
     loop: asyncio.AbstractEventLoop,
+    status_fn=None,
+    jobs: JobRunner | None = None,
     announce_registry: "announce.AnnounceRegistry | None" = None,
 ):
+    """`status_fn` builds GET /status - the same payload as the MQTT
+    heartbeat, for a node Baler reaches over HTTP (Baler#114). `jobs` runs
+    /jobs, the slow actions in the background (Baler#139)."""
+    if jobs is None:
+        jobs = JobRunner(manager, modbus_manager, device_registry)
     gateway_secret = os.environ.get("WINDROW_GATEWAY_SECRET") or None
     cors_origin = os.environ.get("WINDROW_CORS_ORIGIN") or None
 
@@ -365,6 +436,10 @@ def make_handler(
                 self._route("api.post_discover", lambda body: handle_discover(manager, body), count=True)
                 return
 
+            if self.path == "/discover/routers":
+                self._route("api.post_discover_routers", lambda body: handle_discover_routers(manager, body), count=True)
+                return
+
             if self.path == "/write":
                 self._route("api.post_write", lambda body: handle_point_write(manager, body, modbus_manager))
                 return
@@ -379,6 +454,14 @@ def make_handler(
 
             if self.path == "/modbus/discover":
                 self._route("api.post_modbus_discover", handle_modbus_discover, count=True)
+                return
+
+            if self.path == "/jobs":
+                self._route("api.post_jobs", lambda body: handle_start_job(jobs, body), status=202)
+                return
+
+            if self.path == "/modbus/test-read":
+                self._route("api.post_modbus_test_read", lambda body: handle_modbus_test_read(modbus_manager, body))
                 return
 
             if self.path == "/modbus/connections":
@@ -481,6 +564,26 @@ def make_handler(
                 self._route("api.get_announced", _announced, body={}, count=True)
                 return
 
+            if self.path == "/jobs":
+                self._route("api.get_jobs", lambda _: handle_list_jobs(jobs), body={}, count=True)
+                return
+
+            job_id = self._path_id("/jobs/")
+            if job_id is not None:
+                self._route("api.get_job", lambda body: handle_get_job(jobs, body), body={"id": job_id})
+                return
+
+            if self.path == "/status" and status_fn is not None:
+                async def status(_body):  # on the loop, like every other read (module docstring)
+                    return status_fn()
+
+                self._route("api.get_status", status, body={})
+                return
+
+            if self.path == "/bacnet/network":
+                self._route("api.get_bacnet_network", lambda _: handle_network_status(manager), body={})
+                return
+
             if self.path == "/openapi.yaml":
                 with tracer.start_as_current_span("api.get_openapi_spec"):
                     with open(OPENAPI_SPEC_PATH, "rb") as f:
@@ -558,8 +661,24 @@ def make_handler(
 # the result like any other command's `id`.
 TARGETED_ACTIONS = {
     "set_device_status", "recheck_credentials", "update_connection", "delete_connection",
-    "modbus_update_connection", "modbus_delete_connection", "set_credential",
+    "modbus_update_connection", "modbus_delete_connection", "set_credential", "get_job",
 }
+
+
+# The command channel's own fields, around every action's parameters: the
+# action name, the correlation ids, and the sender's expiry. Stripped before
+# dispatch for every action (Baler#140), except where one is a parameter:
+# a targeted action's `id` names its device/connection/job, and point_write
+# refuses a command that arrives after its `expires_at`.
+ENVELOPE_FIELDS = ("action", "id", "request_id", "expires_at")
+ENVELOPE_PARAMS = {"point_write": {"expires_at"}}
+
+
+def command_body(action, payload: dict) -> dict:
+    keep = set(ENVELOPE_PARAMS.get(action, ()))
+    if action in TARGETED_ACTIONS:
+        keep.add("id")
+    return {k: v for k, v in payload.items() if k not in ENVELOPE_FIELDS or k in keep}
 
 
 def _make_on_command(
@@ -569,6 +688,7 @@ def _make_on_command(
     instance_id: str,
     modbus_manager: ModbusConnectionManager | None = None,
     device_registry: DeviceRegistry | None = None,
+    jobs: JobRunner | None = None,
 ):
     """multi-site.mdx's command channel: a {"action": ..., ...} message on
     cmd/{site_id}/{instance_id}/# dispatches to the same handler its own
@@ -582,8 +702,15 @@ def _make_on_command(
     skipped - otherwise every result, carrying its `action`, would be
     dispatched again as a new command, forever.
     """
+    if jobs is None:
+        jobs = JobRunner(manager, modbus_manager, device_registry)
     handlers = {
+        "start_job": lambda body: handle_start_job(jobs, body),
+        "get_job": lambda body: handle_get_job(jobs, body),
+        "list_jobs": lambda body: handle_list_jobs(jobs, body),
         "discover": lambda body: handle_discover(manager, body),
+        "discover_routers": lambda body: handle_discover_routers(manager, body),
+        "network_status": lambda body: handle_network_status(manager, body),
         "learn": lambda body: handle_learn(manager, body),
         "modbus_discover": lambda body: handle_modbus_discover(body),
         "point_write": lambda body: handle_point_write(manager, body, modbus_manager),
@@ -599,6 +726,7 @@ def _make_on_command(
         "modbus_create_connection": lambda body: handle_modbus_create_connection(modbus_manager, body),
         "modbus_update_connection": lambda body: handle_modbus_update_connection(modbus_manager, body),
         "modbus_delete_connection": lambda body: handle_modbus_delete_connection(modbus_manager, body),
+        "modbus_test_read": lambda body: handle_modbus_test_read(modbus_manager, body),
         "set_credential": lambda body: handle_set_credential(manager, modbus_manager, device_registry, body),
     }
     result_topic = f"cmd/{site_id}/{instance_id}/result"
@@ -631,8 +759,7 @@ def _make_on_command(
             if handler is None:
                 outcome = {"ok": False, "error": f"unknown action {action!r}"}
             else:
-                drop = ("action", "request_id") if action in TARGETED_ACTIONS else ("action", "id", "request_id")
-                body = {k: v for k, v in payload.items() if k not in drop}
+                body = command_body(action, payload)
                 try:
                     outcome = {"ok": True, "result": _run(handler(body), loop)}
                 except Exception as exc:  # noqa: BLE001 - one bad command must not crash the mqtt loop thread
@@ -673,8 +800,38 @@ def offline_payload(site_id: str, instance_id: str) -> str:
     return json.dumps({"online": False, "site_id": site_id, "instance_id": instance_id})
 
 
-def build_status(site_id: str, instance_id: str, started_at: str, manager, modbus_manager, device_registry,
-                 announce_registry=None) -> dict:
+def node_networks(address, modbus_cidrs) -> list[str]:
+    """The subnets this node sits on, as CIDRs: its BACnet interface
+    (--address, e.g. 192.168.1.20/24:47808) and any --modbus-scan-cidr.
+    The Connectors page prefills its subnet-sweep dialog from these
+    (Baler#114). A bare address with no mask, or anything unparsable, is
+    skipped rather than guessed at."""
+    out: list[str] = []
+    candidates = []
+    if isinstance(address, str) and "/" in address:
+        candidates.append(address.rsplit(":", 1)[0] if address.count(":") == 1 else address)
+    candidates.extend(modbus_cidrs or [])
+    for value in candidates:
+        try:
+            net = ipaddress.ip_interface(str(value).strip()).network
+        except ValueError:
+            continue
+        if net.num_addresses > 1 and str(net) not in out:
+            out.append(str(net))
+    return out
+
+
+def _network_summary(manager) -> dict:
+    """Mode and, for a foreign device, whether the BBMD took the registration
+    - the one BBMD fact worth seeing from Baler without asking."""
+    status = bacnet_network.network_status(getattr(manager, "app", None))
+    return {k: status[k] for k in ("mode", "bbmd", "registration") if k in status}
+
+
+def build_status(
+    site_id: str, instance_id: str, started_at: str, manager, modbus_manager, device_registry, networks=None,
+    announce_registry=None,
+) -> dict:
     devices = device_registry.list()
     extra = announce_registry.summary() if announce_registry else {}
     return {**extra,
@@ -685,10 +842,12 @@ def build_status(site_id: str, instance_id: str, started_at: str, manager, modbu
         "started_at": started_at,
         "ts": _now_iso(),
         "bacnet_connections": len(manager.connections),
+        "bacnet_network": _network_summary(manager),
         "bacnet_requests": manager.read_stats(),
         "modbus_connections": len(modbus_manager.connections),
         "devices": len(devices),
         "pending_devices": sum(1 for d in devices if d.get("status") == "pending"),
+        "networks": list(networks or []),
     }
 
 
@@ -743,6 +902,11 @@ def _crash_logger(task_name: str):
 async def async_main(args) -> None:
     app = Application.from_args(args)
     await asyncio.sleep(1)  # let transport setup finish, same as bridge.py
+    if getattr(args, "foreign", None):
+        print(f"BACnet: foreign device of BBMD {args.foreign}, ttl {args.ttl}s - "
+              f"registration {bacnet_network.network_status(app).get('registration')}")
+    elif getattr(args, "bbmd", None) is not None:
+        print(f"BACnet: acting as a BBMD, BDT {args.bbmd or '(no peers)'}")
 
     loop = asyncio.get_event_loop()
 
@@ -797,18 +961,25 @@ async def async_main(args) -> None:
                                       on_change=lambda: loop.call_soon_threadsafe(heartbeat_wake.set))
     resolver_task = loop.create_task(announce.run_resolver(announce_registry, manager, modbus_manager, args.resolve_interval))
     resolver_task.add_done_callback(_crash_logger("device name resolver"))
+    jobs = JobRunner(manager, modbus_manager, device_registry)
+    started_at = _now_iso()
+    networks = node_networks(getattr(args, "address", None), args.modbus_scan_cidr)
+
+    def status_fn() -> dict:
+        return build_status(
+            args.site_id, args.instance_id, started_at, manager, modbus_manager, device_registry, networks,
+            announce_registry=announce_registry,
+        )
 
     if command_topic:
         mqtt_client.message_callback_add(
             command_topic,
-            _make_on_command(manager, loop, args.site_id, args.instance_id, modbus_manager, device_registry),
+            _make_on_command(manager, loop, args.site_id, args.instance_id, modbus_manager, device_registry, jobs),
         )
-        started_at = _now_iso()
         heartbeat_task = loop.create_task(run_status_heartbeat(
             mqtt_client,
             status_topic(args.site_id, args.instance_id),
-            lambda: build_status(args.site_id, args.instance_id, started_at, manager, modbus_manager, device_registry,
-                                 announce_registry),
+            status_fn,
             heartbeat_wake,
         ))
         heartbeat_task.add_done_callback(_crash_logger("status heartbeat"))
@@ -825,7 +996,7 @@ async def async_main(args) -> None:
         modbus_scan_task.add_done_callback(_crash_logger(f"modbus periodic scan ({cidr})"))
 
     server = ThreadingHTTPServer(
-        (args.host, args.port), make_handler(manager, modbus_manager, device_registry, loop, announce_registry)
+        (args.host, args.port), make_handler(manager, modbus_manager, device_registry, loop, status_fn, jobs, announce_registry)
     )
     server.daemon_threads = True  # unset default is False - a hung request would otherwise block shutdown
 
@@ -848,6 +1019,7 @@ async def async_main(args) -> None:
         # asyncio.run()'s default task-cancellation-on-shutdown
         # indefinitely - confirmed live (see test_modbus_connection_manager.py).
         await modbus_manager.close()
+        await jobs.close()
         if command_topic:
             publish_offline(mqtt_client, args.site_id, args.instance_id)
         mqtt_client.loop_stop()
@@ -900,6 +1072,7 @@ def main() -> None:
     parser.add_argument("--announce-state-file", default="windrow-announced.json")
     parser.add_argument("--resolve-interval", type=float, default=300.0,
                         help="seconds between re-resolving connections' device_name by announcement or DNS")
+    bacnet_network.add_network_args(parser)
     args = parser.parse_args()
     for attr in ("state_file", "modbus_state_file", "devices_state_file"):
         legacy.adopt_state_file(getattr(args, attr))

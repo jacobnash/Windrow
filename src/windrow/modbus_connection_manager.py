@@ -25,6 +25,7 @@ import time
 import pymodbus.client as ModbusClient
 
 from windrow import bacnet_tagger, connection_store, modbus_points, mqtt_sink, tracing
+from windrow.poll_status import PollStatus
 
 tracer = tracing.get_tracer(__name__)
 
@@ -37,6 +38,9 @@ _TAGGER_RULES = bacnet_tagger.load_default_rules()
 RECONNECT_MAX = 60.0
 
 UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "host", "port", "device_id", "units", "device_name"}
+
+# A test read (Baler#110) answers within this, reachable device or not.
+TEST_READ_TIMEOUT = 5.0
 
 
 _READ_METHODS = {
@@ -111,6 +115,8 @@ class ModbusConnectionManager:
         # here - same as ConnectionManager does for BACnet.
         self.site_id = site_id
         self.instance_id = instance_id
+        # In-memory poll health per connection, never persisted (Baler#110).
+        self.status = PollStatus()
 
     async def start(self) -> None:
         with tracer.start_as_current_span("modbus_connection_manager.start") as span:
@@ -204,6 +210,7 @@ class ModbusConnectionManager:
             if client is not None:
                 client.close()
             del self.connections[connection_id]
+            self.status.reset(connection_id)
             self._save()
             span.set_attribute("found", True)
             return True
@@ -265,6 +272,7 @@ class ModbusConnectionManager:
             client = self.clients.pop(connection_id, None)
             if client is not None:
                 client.close()
+            self.status.reset(connection_id)
             self.connections[connection_id] = record
             self._save()
 
@@ -431,6 +439,45 @@ class ModbusConnectionManager:
             span.set_attribute("found", True)
             return record
 
+    async def test_read(self, host, register, port=502, device_id=1, point=None) -> dict:
+        """Read one point from a device that isn't a connection yet - the
+        Connectors page's "Test read" before saving (Baler#110). `point` is
+        an optional stored-form spec (type, function, byte order...), as in
+        a connection's points; without one, `register` as a holding
+        register. A fresh client, closed again whatever happens; an
+        unreachable host or a refused read is a ValueError saying so."""
+        with tracer.start_as_current_span("modbus_connection_manager.test_read") as span:
+            host = connection_store.check_text("host", host).strip()
+            port = connection_store.check_int("port", port, 1, 65535)
+            device_id = connection_store.check_int("device_id", device_id, 0, 255)
+            register = connection_store.check_int("register", register, 0, 65535)
+            spec = {**point, "register": register} if isinstance(point, dict) else register
+            resolved = modbus_points.resolve(spec)
+            span.set_attribute("host", host)
+            span.set_attribute("register", register)
+            where = f"{host}:{port}"
+            client = self._new_client({"host": host, "port": port})
+            try:
+                try:
+                    connected = await asyncio.wait_for(client.connect(), TEST_READ_TIMEOUT)
+                except (asyncio.TimeoutError, OSError) as exc:
+                    raise ValueError(f"can't connect to {where}: {exc or 'timed out'}") from exc
+                if not connected:
+                    raise ValueError(f"can't connect to {where}: nothing accepted the connection")
+                try:
+                    value = await asyncio.wait_for(
+                        self._read(client, {"device_id": device_id}, resolved), TEST_READ_TIMEOUT
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise ValueError(f"{where} didn't answer a read of register {register} (unit {device_id})") from exc
+                except Exception as exc:  # pymodbus raises many types; all mean "read failed"
+                    raise ValueError(f"reading register {register} from {where} failed: {exc}") from exc
+                if value is None:
+                    raise ValueError(f"{where} refused register {register} (unit {device_id}) or sent no usable value")
+                return {"host": host, "port": port, "device_id": device_id, "register": register, "value": value}
+            finally:
+                client.close()
+
     async def close(self) -> None:
         """Cancels every poll task and closes every client without
         touching persisted state - process-shutdown cleanup (api.py's
@@ -513,6 +560,7 @@ class ModbusConnectionManager:
                 client = await self._connect(record)
                 if client is None:
                     attempts += 1
+                    self.status.failure(record.get("id"), list(record["points"]), f"can't connect to {where}")
                     if down_since is None:
                         down_since = asyncio.get_event_loop().time()
                     if attempts in (1, 5) or attempts % 50 == 0:
@@ -533,10 +581,14 @@ class ModbusConnectionManager:
                     except Exception as exc:  # noqa: BLE001 - a lost session raises many types; all mean reconnect
                         raised += 1
                         print(f"modbus read failed for {label}@{point['register']}: {exc!r}")
+                        self.status.failure(record.get("id"), label, f"register {point['register']}: {exc}")
                         continue
                     if value is None:  # an exception code (or NaN): the session is fine, publish nothing
+                        self.status.failure(record.get("id"), label,
+                                            f"register {point['register']}: the device refused it or sent no usable value")
                         continue
                     mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], label, value)
+                    self.status.success(record.get("id"), label, published=True)
             if record["points"] and raised == len(record["points"]):
                 client.close()  # every read raised: next cycle reconnects
             await asyncio.sleep(record["poll_interval"])
