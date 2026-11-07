@@ -239,7 +239,8 @@ def test_modbus_topic_prefix_change_clears_all_old_points(modbus):
 
     updated = asyncio.run(run())
     assert updated["topic_prefix"] == "fbf/m2" and updated["poll_interval"] == 2.5
-    assert set(client.topics(b"")) == {"fbf/m1/a", "fbf/m1/a/tags", "fbf/m1/b", "fbf/m1/b/tags"}
+    # The old prefix's equipment record goes too (its tags moved, Baler#80).
+    assert set(client.topics(b"")) == {"fbf/m1/a", "fbf/m1/a/tags", "fbf/m1/b", "fbf/m1/b/tags", "fbf/m1/equip/tags"}
 
 
 def test_modbus_update_unknown_id_returns_none(modbus):
