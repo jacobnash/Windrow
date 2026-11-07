@@ -111,6 +111,7 @@ def connect(
     password: str | None = None,
     on_connect_extra=None,
     tls: bool | None = None,
+    will: tuple[str, str] | None = None,
 ) -> mqtt.Client:
     """client_id/clean_session are only worth setting once this process has
     a stable identity (see api.py's --site-id) - a persistent session lets
@@ -118,7 +119,10 @@ def connect(
     client is offline instead of dropping them; without a stable identity
     every restart would get a fresh session anyway, so there's nothing to
     persist. on_connect_extra runs after the spool flush on every (re)connect
-    - e.g. api.py uses it to resubscribe to its command topic."""
+    - e.g. api.py uses it to resubscribe to its command topic. `will` is a
+    (topic, payload) last will, retained: it has to be registered before
+    connect() - the broker only learns it from the CONNECT packet - which is
+    why it's a parameter here rather than something the caller sets after."""
     kwargs = {}
     if client_id is not None:
         kwargs["client_id"] = client_id
@@ -131,6 +135,8 @@ def connect(
         # Verified against the system CA store (a public Let's Encrypt cert
         # on Baler's broker), or MQTT_CA_FILE for a private CA.
         client.tls_set(ca_certs=os.environ.get("MQTT_CA_FILE") or None)
+    if will is not None:
+        client.will_set(will[0], will[1], qos=1, retain=True)
 
     def _combined_on_connect(client, userdata, flags, reason_code, properties) -> None:
         _on_connect(client, userdata, flags, reason_code, properties)
@@ -163,3 +169,16 @@ def publish_reading(client: mqtt.Client, topic_prefix: str, point: str, value, t
         _spool_append({"topic_prefix": topic_prefix, "point": point, "value": value, "ts": ts})
         return f"{topic_prefix}/{point}"
     return _publish(client, topic_prefix, point, value, ts)
+
+
+def clear_retained(client: mqtt.Client, topic_prefix: str, point: str) -> str:
+    """Publishes an empty retained payload to f"{topic_prefix}/{point}",
+    which is how MQTT deletes a retained message - without it a point
+    removed from a connection (or moved to a new topic_prefix) keeps
+    handing its last value and tags to every new subscriber forever.
+    Deliberately not spooled like publish_reading: replaying a delete from
+    the spool after a newer value could wipe a live reading, while paho
+    already queues a QoS 1 publish made while disconnected."""
+    topic = f"{topic_prefix}/{point}"
+    client.publish(topic, b"", qos=1, retain=True)
+    return topic
