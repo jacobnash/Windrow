@@ -37,6 +37,10 @@ tracer = tracing.get_tracer(__name__)
 # a second; a dead one shouldn't hold up the pass for long.
 DIRECTED_WHO_IS_TIMEOUT = 3.0
 
+DEVICE_STATUSES = ("pending", "provisioned", "ignored")
+BACNET_PORT = 47808
+MAX_BACNET_INSTANCE = 4194302  # 2^22 - 2; 4194303 is the "unconfigured" wildcard
+
 
 class DeviceRegistry:
     def __init__(self, state_file: str):
@@ -59,6 +63,8 @@ class DeviceRegistry:
         """async for consistency with the rest of this app's invariant
         (loop-thread-owned state mutated only via run_coroutine_threadsafe
         from api.py) even though the body itself doesn't await anything."""
+        if status not in DEVICE_STATUSES:
+            raise ValueError(f"status must be one of {', '.join(DEVICE_STATUSES)}, got {status!r}")
         record = self.records.get(device_id)
         if record is None:
             return None
@@ -86,6 +92,100 @@ class DeviceRegistry:
         record["default_credential_flag"] = result
         record["default_credential_checked_at"] = time.time()
         self._save()
+        return record
+
+    async def add_device(self, body: dict, connections: list[dict] | None = None) -> dict:
+        """A device a human already knows the address of, for the sites
+        where a scan can't find it (broadcasts filtered between subnets,
+        Modbus on a subnet nobody configured a sweep for). Creates the same
+        record reconcile_bacnet/reconcile_modbus would - keyed the same way,
+        so a later scan that does hear the device updates this record
+        instead of adding a twin - or returns the record that already
+        exists. Status is pending unless one of `connections` (that
+        protocol's) already polls the device, matching reconcile.
+
+        body: {"protocol": "bacnet", "device_address", "device_instance"}
+        or {"protocol": "modbus", "host", "port" (502), "device_id" (1)}.
+        Raises ValueError on anything else."""
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")  # noqa: TRY004 - ValueError means 400 / ok:false
+        protocol = body.get("protocol")
+        if protocol == "bacnet":
+            return self._add_bacnet(body, connections or [])
+        if protocol == "modbus":
+            return self._add_modbus(body, connections or [])
+        raise ValueError(f"protocol must be 'bacnet' or 'modbus', got {protocol!r}")
+
+    def _add_bacnet(self, body: dict, connections: list[dict]) -> dict:
+        address = connection_store.check_text("device_address", body.get("device_address")).strip()
+        instance = connection_store.check_int("device_instance", body.get("device_instance"), 0, MAX_BACNET_INSTANCE)
+        # Discovery reports a bare host when the device answers on the
+        # standard port; keep a non-standard one, since that's the only
+        # way "Create connection" can reach the device later.
+        host, _, port = address.partition(":")
+        if port == str(BACNET_PORT):
+            address = host
+        existing = self._find("bacnet", (instance, address))
+        if existing is not None:
+            return existing
+        connection_id = next(
+            (c["id"] for c in connections
+             if c.get("device_instance") == instance and c.get("device_address", "").split(":")[0] == host),
+            None,
+        )
+        now = time.time()
+        record = {
+            "id": connection_store.new_connection_id(),
+            "protocol": "bacnet",
+            "device_instance": instance,
+            "address": address,
+            "vendor_id": None,  # unknown until a scan hears its I-Am
+            "first_seen_at": now,
+            "last_seen_at": now,
+            "status": "provisioned" if connection_id else "pending",
+            "connection_id": connection_id,
+            "credential": None,
+            "default_credential_flag": None,
+            "default_credential_checked_at": None,
+        }
+        self.records[record["id"]] = record
+        self._save()
+        return record
+
+    def _add_modbus(self, body: dict, connections: list[dict]) -> dict:
+        host = connection_store.check_text("host", body.get("host")).strip()
+        port = connection_store.check_int("port", body.get("port", modbus_discovery.DEFAULT_PORT), 1, 65535)
+        device_id = connection_store.check_int("device_id", body.get("device_id", 1), 0, 255)
+        existing = self._find("modbus", (host, port))
+        if existing is not None:
+            return existing
+        connection_id = next((c["id"] for c in connections if (c.get("host"), c.get("port")) == (host, port)), None)
+        now = time.time()
+        record = {
+            "id": connection_store.new_connection_id(),
+            "protocol": "modbus",
+            "host": host,
+            "port": port,
+            # Not in a scanned record (a sweep can't learn the unit id);
+            # kept so "Create connection" can prefill what the human typed.
+            "device_id": device_id,
+            "vendor": None,
+            "product_code": None,
+            "revision": None,
+            "first_seen_at": now,
+            "last_seen_at": now,
+            "status": "provisioned" if connection_id else "pending",
+            "connection_id": connection_id,
+            "credential": None,
+            "default_credential_flag": None,
+            "default_credential_checked_at": None,
+        }
+        self.records[record["id"]] = record
+        self._save()
+        if connection_id is None:
+            # Same one-time default-credential check a newly scanned
+            # pending Modbus device gets (see reconcile_modbus).
+            asyncio.get_event_loop().create_task(self._run_default_check(record["id"], host))
         return record
 
     # --- BACnet ---
