@@ -113,6 +113,12 @@ async def handle_discover_routers(manager: ConnectionManager, body: dict) -> lis
     return await bacnet_network.discover_routers(manager.app, network=network, timeout=timeout)
 
 
+async def handle_list_announced(announce_registry, body: dict | None = None) -> list:
+    """Devices that announced themselves to this node (windrow.announce) -
+    the same list GET /announced returns, for the command channel too."""
+    return announce_registry.list() if announce_registry else []
+
+
 async def handle_network_status(manager: ConnectionManager, body: dict | None = None) -> dict:
     return bacnet_network.network_status(manager.app)
 
@@ -592,9 +598,7 @@ def make_handler(
                 return
 
             if self.path == "/announced":
-                async def _announced(_):
-                    return announce_registry.list() if announce_registry else []
-                self._route("api.get_announced", _announced, body={}, count=True)
+                self._route("api.get_announced", lambda _: handle_list_announced(announce_registry), body={}, count=True)
                 return
 
             if self.path == "/jobs":
@@ -735,6 +739,7 @@ def _make_on_command(
     modbus_manager: ModbusConnectionManager | None = None,
     device_registry: DeviceRegistry | None = None,
     jobs: JobRunner | None = None,
+    announce_registry=None,
 ):
     """multi-site.mdx's command channel: a {"action": ..., ...} message on
     cmd/{site_id}/{instance_id}/# dispatches to the same handler its own
@@ -763,6 +768,7 @@ def _make_on_command(
         "modbus_discover": lambda body: handle_modbus_discover(body),
         "point_write": lambda body: handle_point_write(manager, body, modbus_manager),
         "list_devices": lambda body: handle_list_devices(device_registry, body),
+        "list_announced": lambda body: handle_list_announced(announce_registry, body),
         "set_device_status": lambda body: handle_set_device_status(device_registry, body),
         "add_device": lambda body: handle_add_device(device_registry, manager, modbus_manager, body),
         "recheck_credentials": lambda body: handle_recheck_credentials(device_registry, body),
@@ -1033,7 +1039,8 @@ async def async_main(args) -> None:
     if command_topic:
         mqtt_client.message_callback_add(
             command_topic,
-            _make_on_command(manager, loop, args.site_id, args.instance_id, modbus_manager, device_registry, jobs),
+            _make_on_command(manager, loop, args.site_id, args.instance_id, modbus_manager, device_registry, jobs,
+                             announce_registry),
         )
         heartbeat_task = loop.create_task(run_status_heartbeat(
             mqtt_client,

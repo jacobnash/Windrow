@@ -423,6 +423,7 @@ def test_every_action_tolerates_the_full_command_envelope(harness, monkeypatch):
         "modbus_discover": {"cidr": "10.0.0.0/30"},
         "point_write": {"topic": "fbf/ahu-1/zone-temp", "value": 1, "priority": 8},
         "list_devices": {},
+        "list_announced": {},
         "set_device_status": {"id": device["id"], "status": "ignored"},
         "add_device": {"protocol": "bacnet", "device_address": "10.0.0.8", "device_instance": 8},
         "recheck_credentials": {"id": device["id"]},
