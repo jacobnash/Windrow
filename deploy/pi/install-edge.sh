@@ -117,6 +117,8 @@ WINDROW_SITE_ID=
 # gateway role, only if its API is exposed (WINDROW_API_HOST): requests
 # then need this in X-Gateway-Secret
 #WINDROW_GATEWAY_SECRET=
+# Traces: off unless a collector is named here (e.g. http://<host>:4318/v1/traces)
+#OTEL_EXPORTER_OTLP_ENDPOINT=
 ENV
 fi
 chown root:"$SVC_USER" "$ENV_FILE"
