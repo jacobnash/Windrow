@@ -69,6 +69,58 @@ The broker drops anything published outside the account's site prefixes, so
 a wrong `WEATHER_TOPIC_PREFIX` or a gateway connection's `topic_prefix`
 outside the site looks like "connected but no data". Check the prefix first.
 
+## Device announce: "I am here"
+
+Field devices move: a DHCP lease changes, a controller is swapped, a
+subnet is renumbered. A connection pinned to the old address then polls
+nothing. Give the connection a **`device_name`**, and Windrow keeps it
+pointed at wherever that device is now.
+
+There are two sources for the address, and an announcement always wins:
+
+1. **Announce.** A device that can run Python (a Pi next to the
+   equipment, or the Pi *as* the equipment, as in these demos) runs
+   `python -m windrow.announce`. It sends a small UDP datagram to its
+   Windrow every 30 s, and at once when its own address changes:
+
+   ```
+   sudo WINDROW_ANNOUNCE_TO=192.168.128.230 bash install-edge.sh announce
+   ```
+
+   This announces the Pi's hostname, plus the bacnet/modbus roles
+   installed on it (port, BACnet instance, Modbus unit). It needs no broker
+   account.
+
+2. **DNS.** For equipment that can't run anything, set `device_name` to its
+   DNS name. Windrow re-resolves it every `--resolve-interval` seconds
+   (default 300).
+
+The receiving Windrow listens on `--announce-port` (the gateway role
+uses 47900). It only accepts sources inside `--announce-allow` (the
+gateway role uses its own LAN subnet), and it takes the device's address
+from the datagram's **source IP**, never from the payload. Set the same
+`WINDROW_ANNOUNCE_KEY` in `edge.env` on both ends to require
+HMAC-signed announcements; signed ones older than 5 minutes are refused.
+
+When the address behind a `device_name` changes, every BACnet and Modbus
+connection with that name is re-pointed through the normal edit path,
+which validates, persists and restarts its poll. Re-pointing keeps the
+BACnet port and prefix length.
+
+Two places show it:
+- `GET /announced` lists every announced device: address, services,
+  online (false after 3 missed intervals), last seen, and a history of
+  address changes.
+- The status heartbeat carries `announced`, `announced_online` and
+  `announce_rejected`, so Baler's Connectors page can show them.
+
+Set the name when you create the connection, or later:
+
+```
+PATCH /connections/{id}         {"device_name": "bacnet"}
+PATCH /modbus/connections/{id}  {"device_name": "modbus"}
+```
+
 ## When the uplink is down
 
 Readings taken while the broker is unreachable are spooled to disk

@@ -37,7 +37,7 @@ _TAGGER_RULES = bacnet_tagger.load_default_rules()
 # Longest wait between reconnect attempts to an unreachable device.
 RECONNECT_MAX = 60.0
 
-UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "host", "port", "device_id", "units"}
+UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "host", "port", "device_id", "units", "device_name"}
 
 # A test read (Baler#110) answers within this, reachable device or not.
 TEST_READ_TIMEOUT = 5.0
@@ -139,10 +139,12 @@ class ModbusConnectionManager:
         poll_interval: float = 5.0,
         credential: dict | None = None,
         units: dict[str, str] | None = None,
+        device_name: str | None = None,
     ) -> dict:
         with tracer.start_as_current_span("modbus_connection_manager.create_connection") as span:
             points = validate_points(points)
             units = validate_units(units, points)
+            device_name = connection_store.check_device_name(device_name)
             record = {
                 "id": connection_store.new_connection_id(),
                 "host": host,
@@ -155,6 +157,8 @@ class ModbusConnectionManager:
             }
             if units:
                 record["units"] = units
+            if device_name:
+                record["device_name"] = device_name
             self.connections[record["id"]] = record
             self._save()
             self._publish_tags(record)
@@ -235,6 +239,11 @@ class ModbusConnectionManager:
                 record["topic_prefix"] = connection_store.check_topic_prefix(patch["topic_prefix"])
             if "host" in patch:
                 record["host"] = connection_store.check_text("host", patch["host"]).strip()
+            if "device_name" in patch:
+                name = connection_store.check_device_name(patch["device_name"])
+                record.pop("device_name", None)
+                if name:
+                    record["device_name"] = name
             if "port" in patch:
                 record["port"] = connection_store.check_int("port", patch["port"], 1, 65535)
             if "device_id" in patch:

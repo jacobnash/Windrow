@@ -72,6 +72,16 @@ def check_topic_prefix(value) -> str:
     return value
 
 
+def check_device_name(value) -> str | None:
+    """A connection's device_name (windrow.announce): the name a device
+    announces itself under, or a DNS host name. None/empty clears it."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or len(value.strip()) > 253 or any(c.isspace() for c in value.strip()):
+        raise ValueError(f"device_name must be a host or device name without spaces, got {value!r}")
+    return value.strip().lower()
+
+
 def check_patch(patch, allowed: set[str]) -> dict:
     """An unknown key is refused instead of ignored: a typo'd field
     (`poll_intervall`) silently doing nothing is worse than a 400."""

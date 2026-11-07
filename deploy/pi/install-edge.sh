@@ -17,6 +17,13 @@
 #            (windrow.mock_weather) with an edge-node account
 #   gateway  Windrow itself (windrow.api): discovers BACnet/Modbus devices on
 #            this LAN and publishes them to Baler with an edge-node account
+#   announce "I am here" (windrow.announce): tells a Windrow this Pi's name
+#            and current address every 30 s and whenever it changes, for the
+#            bacnet/modbus roles installed here, so connections that name
+#            this device (device_name) follow it. Needs the Windrow's address:
+#              sudo WINDROW_ANNOUNCE_TO=192.168.1.10 bash install-edge.sh announce
+#            (host[:port], comma separated; default port 47900). Optional
+#            WINDROW_ANNOUNCE_KEY in edge.env signs announcements.
 #
 # Broker settings for weather/gateway go in /etc/windrow/edge.env (created
 # here with placeholders, mode 640): MQTT_HOST, MQTT_PORT (8883 = TLS),
@@ -41,8 +48,8 @@ VENV=/opt/windrow
 ENV_FILE=/etc/windrow/edge.env
 SVC_USER=windrow
 
-case "$ROLE" in bacnet|modbus|weather|gateway) ;; *)
-  echo "usage: sudo bash $0 bacnet|modbus|weather|gateway" >&2; exit 2;;
+case "$ROLE" in bacnet|modbus|weather|gateway|announce) ;; *)
+  echo "usage: sudo bash $0 bacnet|modbus|weather|gateway|announce" >&2; exit 2;;
 esac
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)" >&2; exit 1; }
 
@@ -144,8 +151,22 @@ case "$ROLE" in
   weather)
     EXEC="$VENV/bin/python -m windrow.mock_weather --interval 60"
     CAPS="" ;;
+  announce)
+    TO="${WINDROW_ANNOUNCE_TO:-$(sed -n 's/^WINDROW_ANNOUNCE_TO=//p' "$ENV_FILE")}"
+    [ -n "$TO" ] || { echo "set WINDROW_ANNOUNCE_TO=<windrow host>[:port] (or put it in $ENV_FILE)" >&2; exit 1; }
+    grep -q '^WINDROW_ANNOUNCE_TO=' "$ENV_FILE" || echo "WINDROW_ANNOUNCE_TO=$TO" >> "$ENV_FILE"
+    SERVICES=""
+    if systemctl is-enabled --quiet windrow-bacnet.service 2>/dev/null; then
+      INST=$(grep -oE -- '--instance [0-9]+' /etc/systemd/system/windrow-bacnet.service | awk '{print $2}')
+      SERVICES="$SERVICES --service bacnet:47808${INST:+:$INST}"
+    fi
+    if systemctl is-enabled --quiet windrow-modbus.service 2>/dev/null; then
+      SERVICES="$SERVICES --service modbus:502:1"
+    fi
+    EXEC="$VENV/bin/python -m windrow.announce --name $(hostname)${SERVICES}"
+    CAPS="" ;;
   gateway)
-    EXEC="$VENV/bin/python -m windrow.api --address ${CIDR}:47808 --host ${WINDROW_API_HOST} --port 8001 --mqtt-host \${MQTT_HOST} --mqtt-port \${MQTT_PORT} --site-id \${WINDROW_SITE_ID} --modbus-scan-cidr ${CIDR}"
+    EXEC="$VENV/bin/python -m windrow.api --address ${CIDR}:47808 --host ${WINDROW_API_HOST} --port 8001 --mqtt-host \${MQTT_HOST} --mqtt-port \${MQTT_PORT} --site-id \${WINDROW_SITE_ID} --modbus-scan-cidr ${CIDR} --announce-port 47900 --announce-allow ${CIDR}"
     CAPS="" ;;
 esac
 

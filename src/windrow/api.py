@@ -33,6 +33,7 @@ from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
 from windrow import (
+    announce,
     bacnet_network,
     connection_store,
     credentials,
@@ -176,6 +177,7 @@ async def handle_create_connection(manager: ConnectionManager, body: dict) -> di
         points=body["points"],
         poll_interval=body.get("poll_interval", 5.0),
         credential=credential,
+        device_name=body.get("device_name"),
         read_options={k: body[k] for k in READ_OPTION_FIELDS if k in body},
     )
     return _redact(record)
@@ -227,6 +229,7 @@ async def handle_modbus_create_connection(modbus_manager: ModbusConnectionManage
         poll_interval=body.get("poll_interval", 5.0),
         credential=credential,
         units=body.get("units"),
+        device_name=body.get("device_name"),
     )
     return _redact(record)
 
@@ -326,6 +329,7 @@ def make_handler(
     loop: asyncio.AbstractEventLoop,
     status_fn=None,
     jobs: JobRunner | None = None,
+    announce_registry: "announce.AnnounceRegistry | None" = None,
 ):
     """`status_fn` builds GET /status - the same payload as the MQTT
     heartbeat, for a node Baler reaches over HTTP (Baler#114). `jobs` runs
@@ -552,6 +556,12 @@ def make_handler(
 
             if self.path == "/devices":
                 self._route("api.get_devices", lambda _: handle_list_devices(device_registry), body={}, count=True)
+                return
+
+            if self.path == "/announced":
+                async def _announced(_):
+                    return announce_registry.list() if announce_registry else []
+                self._route("api.get_announced", _announced, body={}, count=True)
                 return
 
             if self.path == "/jobs":
@@ -820,9 +830,11 @@ def _network_summary(manager) -> dict:
 
 def build_status(
     site_id: str, instance_id: str, started_at: str, manager, modbus_manager, device_registry, networks=None,
+    announce_registry=None,
 ) -> dict:
     devices = device_registry.list()
-    return {
+    extra = announce_registry.summary() if announce_registry else {}
+    return {**extra,
         "online": True,
         "site_id": site_id,
         "instance_id": instance_id,
@@ -938,6 +950,20 @@ async def async_main(args) -> None:
     device_registry = DeviceRegistry(args.devices_state_file)
     await device_registry.start()
 
+    # Device announce (windrow.announce): devices say "I am here" over UDP,
+    # and connections that name them (device_name) follow their address.
+    # DNS names are followed too, whether or not the listener is on.
+    announce_registry = announce.AnnounceRegistry(
+        args.announce_state_file, interval=args.announce_interval,
+        allow=[ipaddress.ip_network(c, strict=False) for c in args.announce_allow or []],
+        key=os.environ.get("WINDROW_ANNOUNCE_KEY") or None,
+    )
+    announce_registry.load()
+    if args.announce_port:
+        await announce.start_listener(announce_registry, manager, modbus_manager, args.announce_host, args.announce_port,
+                                      on_change=lambda: loop.call_soon_threadsafe(heartbeat_wake.set))
+    resolver_task = loop.create_task(announce.run_resolver(announce_registry, manager, modbus_manager, args.resolve_interval))
+    resolver_task.add_done_callback(_crash_logger("device name resolver"))
     jobs = JobRunner(manager, modbus_manager, device_registry)
     started_at = _now_iso()
     networks = node_networks(getattr(args, "address", None), args.modbus_scan_cidr)
@@ -945,6 +971,7 @@ async def async_main(args) -> None:
     def status_fn() -> dict:
         return build_status(
             args.site_id, args.instance_id, started_at, manager, modbus_manager, device_registry, networks,
+            announce_registry=announce_registry,
         )
 
     if command_topic:
@@ -972,7 +999,7 @@ async def async_main(args) -> None:
         modbus_scan_task.add_done_callback(_crash_logger(f"modbus periodic scan ({cidr})"))
 
     server = ThreadingHTTPServer(
-        (args.host, args.port), make_handler(manager, modbus_manager, device_registry, loop, status_fn, jobs)
+        (args.host, args.port), make_handler(manager, modbus_manager, device_registry, loop, status_fn, jobs, announce_registry)
     )
     server.daemon_threads = True  # unset default is False - a hung request would otherwise block shutdown
 
@@ -1034,6 +1061,21 @@ def main() -> None:
         "No default - periodic Modbus scanning only runs against subnets an operator explicitly configures.",
     )
     parser.add_argument("--modbus-scan-interval", type=float, default=600.0)
+    parser.add_argument(
+        "--announce-port", type=int, default=int(os.environ.get("WINDROW_ANNOUNCE_PORT", "0")),
+        help=f"UDP port to hear device announcements on (windrow.announce; {announce.DEFAULT_PORT} by convention). 0 = off",
+    )
+    parser.add_argument("--announce-host", default="0.0.0.0")
+    parser.add_argument(
+        "--announce-allow", action="append", default=None,
+        help="Source subnet allowed to announce, e.g. 192.168.1.0/24. Repeatable. Unset: any source "
+        "(set WINDROW_ANNOUNCE_KEY to require signed announcements).",
+    )
+    parser.add_argument("--announce-interval", type=float, default=30.0,
+                        help="the senders' interval; a device is offline after missing 3")
+    parser.add_argument("--announce-state-file", default="windrow-announced.json")
+    parser.add_argument("--resolve-interval", type=float, default=300.0,
+                        help="seconds between re-resolving connections' device_name by announcement or DNS")
     bacnet_network.add_network_args(parser)
     args = parser.parse_args()
     for attr in ("state_file", "modbus_state_file", "devices_state_file"):
