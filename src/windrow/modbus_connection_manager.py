@@ -15,6 +15,7 @@ building that would be over-parity for no requirement driving it.
 """
 
 import asyncio
+import contextlib
 
 import pymodbus.client as ModbusClient
 
@@ -25,6 +26,19 @@ tracer = tracing.get_tracer(__name__)
 
 # Longest wait between reconnect attempts to an unreachable device.
 RECONNECT_MAX = 60.0
+
+UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "host", "port", "device_id"}
+
+
+def validate_points(points) -> dict[str, int]:
+    """{label: holding-register address}, non-empty - the same shape
+    create_connection stores and modbus_bridge.parse_points produces."""
+    if not isinstance(points, dict) or not points:
+        raise ValueError("points must be a non-empty {label: register_address} object")
+    for label, address in points.items():
+        connection_store.check_text("point label", label)
+        connection_store.check_int(f"register address for {label!r}", address, 0, 65535)
+    return dict(points)
 
 
 class ModbusConnectionManager:
@@ -88,6 +102,60 @@ class ModbusConnectionManager:
             self._save()
             span.set_attribute("found", True)
             return True
+
+    async def update_connection(self, connection_id: str, patch: dict) -> dict | None:
+        """Edit any of points/poll_interval/topic_prefix/host/port/device_id:
+        validate, persist, then stop the poll task and close its client
+        before starting a fresh one - the old client is bound to the old
+        host/port, and a client left open keeps pymodbus's own tasks alive
+        (see close()). Points that no longer publish where they did (all of
+        them when the prefix moves) get their retained value and tags
+        topics cleared. Modbus connections publish no tags of their own;
+        clearing `/tags` too catches any a human added to the point."""
+        with tracer.start_as_current_span("modbus_connection_manager.update_connection") as span:
+            span.set_attribute("connection_id", connection_id)
+            old = self.connections.get(connection_id)
+            if old is None:
+                span.set_attribute("found", False)
+                return None
+            connection_store.check_patch(patch, UPDATABLE_FIELDS)
+            record = dict(old)
+            if "points" in patch:
+                record["points"] = validate_points(patch["points"])
+            if "poll_interval" in patch:
+                record["poll_interval"] = connection_store.check_number("poll_interval", patch["poll_interval"])
+            if "topic_prefix" in patch:
+                record["topic_prefix"] = connection_store.check_topic_prefix(patch["topic_prefix"])
+            if "host" in patch:
+                record["host"] = connection_store.check_text("host", patch["host"]).strip()
+            if "port" in patch:
+                record["port"] = connection_store.check_int("port", patch["port"], 1, 65535)
+            if "device_id" in patch:
+                record["device_id"] = connection_store.check_int("device_id", patch["device_id"], 0, 255)
+
+            task = self.tasks.pop(connection_id, None)
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            client = self.clients.pop(connection_id, None)
+            if client is not None:
+                client.close()
+            self.connections[connection_id] = record
+            self._save()
+
+            if record["topic_prefix"] != old["topic_prefix"]:
+                removed = list(old["points"])
+            else:
+                removed = [label for label in old["points"] if label not in record["points"]]
+            for label in removed:
+                mqtt_sink.clear_retained(self.mqtt_client, old["topic_prefix"], label)
+                mqtt_sink.clear_retained(self.mqtt_client, old["topic_prefix"], f"{label}/tags")
+
+            await self._start_poll_task(record)
+            span.set_attribute("found", True)
+            span.set_attribute("cleared_count", len(removed))
+            return record
 
     async def list_connections(self) -> list[dict]:
         with tracer.start_as_current_span("modbus_connection_manager.list_connections") as span:

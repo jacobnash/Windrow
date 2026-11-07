@@ -41,8 +41,7 @@ mosquitto_pub -h <broker> -u hospital-a -P <site-password> \
 ```
 
 Supported `action` values, each dispatching to the same code its HTTP
-equivalent calls (see `src/windrow/api.py`'s `handle_discover`/`handle_learn`/
-`handle_modbus_discover`):
+equivalent calls (the `handle_*` functions in `src/windrow/api.py`):
 
 | action | same as | body fields |
 | --- | --- | --- |
@@ -50,12 +49,97 @@ equivalent calls (see `src/windrow/api.py`'s `handle_discover`/`handle_learn`/
 | `learn` | `POST /learn` | `device_address`, `device_instance` |
 | `modbus_discover` | `POST /modbus/discover` | `cidr`, optional `port`/`concurrency`/`timeout` |
 | `point_write` | `POST /write` | `topic`, `value` (`null` relinquishes), `priority` 1-17 (17 sets BACnet relinquish-default; it cannot be relinquished), optional `expires_at` (unix s) |
+| `list_devices` | `GET /devices` | none |
+| `add_device` | `POST /devices` | `protocol: "bacnet"`, `device_address`, `device_instance` - or `protocol: "modbus"`, `host`, optional `port` (502) / `device_id` (1) |
+| `set_device_status` | `PATCH /devices/{id}` | `id`, `status` (`pending`/`provisioned`/`ignored`) |
+| `recheck_credentials` | `POST /devices/{id}/recheck-credentials` | `id` |
+| `list_connections` | `GET /connections` | none |
+| `create_connection` | `POST /connections` | as the HTTP body: `device_address`, `device_instance`, `topic_prefix`, `points`, optional `poll_interval`/`credential` |
+| `update_connection` | `PATCH /connections/{id}` | `id`, plus any of `points`, `poll_interval`, `topic_prefix` |
+| `delete_connection` | `DELETE /connections/{id}` | `id` |
+| `modbus_list_connections` | `GET /modbus/connections` | none |
+| `modbus_create_connection` | `POST /modbus/connections` | as the HTTP body: `host`, `topic_prefix`, `points` (`{label: register}`), optional `port`/`device_id`/`poll_interval`/`credential` |
+| `modbus_update_connection` | `PATCH /modbus/connections/{id}` | `id`, plus any of `points`, `poll_interval`, `topic_prefix`, `host`, `port`, `device_id` |
+| `modbus_delete_connection` | `DELETE /modbus/connections/{id}` | `id` |
+| `set_credential` | `PATCH .../{id}/credential` | `target` (`device`, `connection` or `modbus_connection`), `id`, `credential: {username, password}` |
 
 The outcome (`{"ok": true, "result": ...}` or `{"ok": false, "error": ...}`,
-plus the `action`, and the command's own `id` if it sent one) is published to
-`cmd/<site-id>/<instance-id>/result` - a command is observable, not
-fire-and-forget. Send an `id` when more than one caller may be waiting on
-results.
+plus the `action`, and the command's own `request_id` and/or `id` if it sent
+them) is published to `cmd/<site-id>/<instance-id>/result` - a command is
+observable, not fire-and-forget. Send a `request_id` when more than one caller
+may be waiting on results (older callers correlate on `id`, which is still
+echoed). An unknown (or missing) `action` gets an `{"ok": false, "error":
+"unknown action ..."}` result too; only a payload that isn't a JSON object
+is dropped without one.
+
+For the actions that act on one device or connection (`set_device_status`,
+`recheck_credentials`, `update_connection`, `delete_connection`, their
+`modbus_*` twins, and `set_credential`), `id` is the id of that device or
+connection, so correlate those with `request_id`.
+
+Results are what the HTTP route returns: device and connection records
+with `credential` redacted to `{"username": ..., "password": null}`, exactly
+as every HTTP GET shows them; a "not found" is `{"ok": false, "error": "no
+connection with that id"}` (or `"no device with that id"`);
+`delete_connection`/`modbus_delete_connection` return `{"id": ..., "deleted":
+true}`. One deliberate difference: `set_credential`'s result is the redacted
+record, not the plaintext echo `PATCH .../credential` answers with - a
+result topic can be read by anything subscribed to it, and the sender
+already knows the password.
+
+`update_connection` restarts that connection's polling with the new
+settings, republishes its point tags and `{prefix}/equip/tags`, and sends an
+empty retained message to `{old_prefix}/{label}` and `{old_prefix}/{label}/tags`
+for every point that no longer publishes there (a removed label, or all of
+them when `topic_prefix` changes), so Baler stops being handed their last
+value. `points` replaces the whole list (BACnet) or map (Modbus).
+
+```
+mosquitto_pub -h <broker> -u hospital-a -P <site-password> \
+  -t cmd/hospital-a/ahu-bridge-1/manage \
+  -m '{"action": "update_connection", "id": "419dff013a6d4d7783b43e6603ccefd7", "poll_interval": 10}'
+```
+
+publishes, on `cmd/hospital-a/ahu-bridge-1/result`:
+
+```json
+{"ok": true, "action": "update_connection", "id": "419dff013a6d4d7783b43e6603ccefd7",
+ "result": {"id": "419dff013a6d4d7783b43e6603ccefd7", "device_address": "192.168.128.63:47808",
+            "device_instance": 3456, "topic_prefix": "fbf/hospital-a/ahu-1", "poll_interval": 10,
+            "points": [{"object_identifier": "analog-value,1", "label": "zone-temp"}],
+            "credential": null}}
+```
+
+## Status heartbeat
+
+With the command channel on, `windrow.api` keeps a **retained** JSON message
+on `cmd/<site-id>/<instance-id>/status`, published at startup, on every
+(re)connect, and every 60 s (`STATUS_INTERVAL` in `api.py`):
+
+```json
+{"online": true, "site_id": "hospital-a", "instance_id": "ahu-bridge-1",
+ "version": "0.1.0", "started_at": "2026-11-07T09:00:00.123456+00:00",
+ "ts": "2026-11-07T09:05:00.654321+00:00",
+ "bacnet_connections": 3, "modbus_connections": 1, "devices": 9, "pending_devices": 2}
+```
+
+`version` is the installed `windrow` package version (`"dev"` if it isn't
+installed). The same topic is the MQTT client's last will, also retained:
+`{"online": false, "site_id": ..., "instance_id": ...}` - so if the edge
+drops off the network the broker flips it to offline itself. A clean
+shutdown (Ctrl-C, or SIGTERM from `docker stop`) publishes that offline
+message too. Because it's retained, a subscriber sees each instance's last
+state straight away; `ts` going stale while `online` is still true means
+the broker hasn't noticed a dead connection yet (it will within 1.5x the
+keepalive).
+
+```
+mosquitto_sub -h <broker> -u hospital-a -P <site-password> -t 'cmd/hospital-a/+/status' -v
+```
+
+`windrow.api` ignores its own `.../result` and `.../status` messages, which
+its `cmd/<site-id>/<instance-id>/#` subscription would otherwise hand back
+to it as commands.
 
 ### Point writes
 
