@@ -153,3 +153,93 @@ def test_scan_still_probes_known_addresses_when_the_broadcast_fails(tmp_path, mo
     devices = asyncio.run(registry.scan_bacnet(object(), [
         {"id": "a", "device_instance": 3456, "device_address": "172.30.0.10:47808"}]))
     assert [d["device_instance"] for d in devices] == [3456]
+
+
+# --- add_device (POST /devices, the add_device command) ---
+
+
+def test_add_bacnet_device_matches_the_record_a_scan_creates(tmp_path):
+    added = DeviceRegistry(str(tmp_path / "a.json"))
+    record = _run(added.add_device({"protocol": "bacnet", "device_address": "1.2.3.4:47808", "device_instance": 3456}))
+    scanned = DeviceRegistry(str(tmp_path / "b.json"))
+    _run(scanned.reconcile_bacnet([{"device_instance": 3456, "address": "1.2.3.4", "vendor_id": 5}], []))
+
+    assert set(record) == set(scanned.list()[0])
+    assert record["status"] == "pending"
+    assert record["address"] == "1.2.3.4"  # standard port dropped, like discovery reports it
+    assert record["vendor_id"] is None
+
+
+def test_add_bacnet_device_is_idempotent_and_a_later_scan_updates_it(tmp_path):
+    registry = DeviceRegistry(str(tmp_path / "devices.json"))
+    first = _run(registry.add_device({"protocol": "bacnet", "device_address": "1.2.3.4", "device_instance": 3456}))
+    again = _run(registry.add_device({"protocol": "bacnet", "device_address": "1.2.3.4", "device_instance": 3456}))
+    assert again is first
+    _run(registry.reconcile_bacnet([{"device_instance": 3456, "address": "1.2.3.4", "vendor_id": 5}], []))
+    assert len(registry.list()) == 1
+    assert registry.list()[0]["vendor_id"] == 5
+
+    reloaded = DeviceRegistry(str(tmp_path / "devices.json"))
+    _run(reloaded.start())
+    assert reloaded.get(first["id"])["vendor_id"] == 5
+
+
+def test_add_bacnet_device_keeps_a_non_standard_port(tmp_path):
+    registry = DeviceRegistry(str(tmp_path / "devices.json"))
+    record = _run(registry.add_device({"protocol": "bacnet", "device_address": "1.2.3.4:47809", "device_instance": 7}))
+    assert record["address"] == "1.2.3.4:47809"
+
+
+def test_add_device_already_polled_comes_back_provisioned(tmp_path):
+    registry = DeviceRegistry(str(tmp_path / "devices.json"))
+    record = _run(registry.add_device(
+        {"protocol": "bacnet", "device_address": "1.2.3.4", "device_instance": 3456},
+        [{"id": "conn-1", "device_instance": 3456, "device_address": "1.2.3.4:47808"}],
+    ))
+    assert record["status"] == "provisioned" and record["connection_id"] == "conn-1"
+
+
+def test_add_modbus_device(tmp_path):
+    registry = DeviceRegistry(str(tmp_path / "devices.json"))
+
+    async def run():
+        record = await registry.add_device({"protocol": "modbus", "host": "10.0.0.6", "port": 502, "device_id": 3})
+        again = await registry.add_device({"protocol": "modbus", "host": "10.0.0.6"})
+        await asyncio.sleep(0.05)  # let the stubbed default-credential check run
+        return record, again
+
+    record, again = _run(run())
+    assert again is record
+    assert record["status"] == "pending" and record["device_id"] == 3
+    assert record["default_credential_checked_at"] is not None
+    scanned = DeviceRegistry(str(tmp_path / "b.json"))
+    _run(scanned.reconcile_modbus([{"host": "10.0.0.7", "port": 502}], []))
+    assert set(scanned.list()[0]) <= set(record)
+
+
+@pytest.mark.parametrize("body", [
+    {},
+    {"protocol": "knx"},
+    {"protocol": "bacnet", "device_instance": 1},
+    {"protocol": "bacnet", "device_address": "1.2.3.4"},
+    {"protocol": "bacnet", "device_address": "1.2.3.4", "device_instance": "1"},
+    {"protocol": "bacnet", "device_address": "1.2.3.4", "device_instance": 4194303},
+    {"protocol": "bacnet", "device_address": " ", "device_instance": 1},
+    {"protocol": "modbus"},
+    {"protocol": "modbus", "host": "10.0.0.6", "port": 0},
+    {"protocol": "modbus", "host": "10.0.0.6", "device_id": -1},
+    ["protocol", "bacnet"],
+])
+def test_add_device_rejects_bad_input(tmp_path, body):
+    registry = DeviceRegistry(str(tmp_path / "devices.json"))
+    with pytest.raises(ValueError):
+        _run(registry.add_device(body))
+    assert registry.list() == []
+
+
+def test_set_status_rejects_an_unknown_status(tmp_path):
+    registry = DeviceRegistry(str(tmp_path / "devices.json"))
+    record = _run(registry.add_device({"protocol": "bacnet", "device_address": "1.2.3.4", "device_instance": 1}))
+    with pytest.raises(ValueError):
+        _run(registry.set_status(record["id"], "deleted"))
+    assert record["status"] == "pending"

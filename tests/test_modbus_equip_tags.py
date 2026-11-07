@@ -22,6 +22,9 @@ class FakeMqttClient:
 
     def publish(self, topic, payload, qos=0, retain=True):
         assert retain, "tags must be retained, like BACnet's"
+        if payload == b"":  # mqtt_sink.clear_retained
+            self.published.pop(topic, None)
+            return
         self.published[topic] = json.loads(json.loads(payload)["value"])
 
 
@@ -67,3 +70,25 @@ def test_bad_units_are_rejected(manager, units):
     mgr, _ = manager
     with pytest.raises(ValueError):
         asyncio.run(mgr.create_connection(host="h", topic_prefix="fbf/x", points={"zone_temp": 0}, units=units))
+
+
+def test_update_republishes_tags_and_keeps_surviving_units(manager):
+    """An edit (Windrow#2) republishes tags for the new shape: units of
+    removed points drop, a moved prefix clears the old equip record."""
+    mgr, client = manager
+    rec = asyncio.run(mgr.create_connection(
+        host="10.0.0.9", topic_prefix="fbf/home/modbus",
+        points={"zone_temp": 0, "fan_status": 1}, units={"zone_temp": "°F"},
+    ))
+    out = asyncio.run(mgr.update_connection(rec["id"], {"points": {"zone_temp": 0}, "topic_prefix": "fbf/home/mb2"}))
+    assert out["units"] == {"zone_temp": "°F"}
+    assert "fbf/home/modbus/equip/tags" not in client.published
+    assert "fbf/home/modbus/zone_temp/tags" not in client.published
+    assert client.published["fbf/home/mb2/equip/tags"] == {"tags": {}, "points": ["zone_temp"]}
+    assert client.published["fbf/home/mb2/zone_temp/tags"]["unit"] == "°F"
+
+    out = asyncio.run(mgr.update_connection(rec["id"], {"units": {}}))
+    assert "units" not in out
+    assert "unit" not in client.published["fbf/home/mb2/zone_temp/tags"]
+    with pytest.raises(ValueError):
+        asyncio.run(mgr.update_connection(rec["id"], {"units": {"nope": "°F"}}))

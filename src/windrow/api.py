@@ -17,9 +17,13 @@ HTTP thread forever with no way to answer the client.
 """
 
 import asyncio
+import contextlib
+import datetime
 import hmac
+import importlib.metadata
 import json
 import os
+import signal
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -49,10 +53,29 @@ def _redact(record: dict) -> dict:
     return {**record, "credential": credentials.redact(record.get("credential"))}
 
 
-# The three actions multi-site.mdx's command channel dispatches by name -
-# same logic the /discover, /learn, and /modbus/discover HTTP routes call,
-# extracted so both callers share one implementation instead of the MQTT
-# path re-deriving it.
+class NotFound(LookupError):
+    """No device/connection with the id a handler was given - a 404 over
+    HTTP, an {"ok": false} result over the command channel."""
+
+
+def _target_id(body: dict) -> str:
+    target = body.get("id")
+    if not isinstance(target, str) or not target:
+        raise ValueError("id is required")
+    return target
+
+
+def _encrypt_credential(credential) -> dict:
+    if not isinstance(credential, dict):
+        raise ValueError("credential must be an object with username and password")  # noqa: TRY004 - ValueError means 400 / ok:false
+    return credentials.encrypt(credential["username"], credential["password"])
+
+
+# Every action the command channel dispatches by name, and the code behind
+# the matching HTTP route - extracted so both callers share one
+# implementation instead of the MQTT path re-deriving it. Each takes the
+# request body as a dict and returns something JSON-serializable, with
+# credentials already redacted the way every HTTP GET redacts them.
 async def handle_discover(manager: ConnectionManager, body: dict) -> list:
     return await manager.discover(**body)
 
@@ -76,6 +99,152 @@ async def handle_modbus_discover(body: dict) -> list:
         concurrency=body.get("concurrency", modbus_discovery.DEFAULT_CONCURRENCY),
         timeout=body.get("timeout", modbus_discovery.DEFAULT_TIMEOUT),
     )
+
+
+# --- BACnet connections ---
+
+
+async def handle_list_connections(manager: ConnectionManager, body: dict | None = None) -> list:
+    return [_redact(c) for c in await manager.list_connections()]
+
+
+async def handle_create_connection(manager: ConnectionManager, body: dict) -> dict:
+    credential = _encrypt_credential(body["credential"]) if body.get("credential") else None
+    record = await manager.create_connection(
+        device_address=body["device_address"],
+        device_instance=body["device_instance"],
+        topic_prefix=body["topic_prefix"],
+        points=body["points"],
+        poll_interval=body.get("poll_interval", 5.0),
+        credential=credential,
+    )
+    return _redact(record)
+
+
+async def handle_update_connection(manager: ConnectionManager, body: dict) -> dict:
+    """{id, ...patch} - patch is any of points/poll_interval/topic_prefix."""
+    connection_id = _target_id(body)
+    record = await manager.update_connection(connection_id, {k: v for k, v in body.items() if k != "id"})
+    if record is None:
+        raise NotFound("no connection with that id")
+    return _redact(record)
+
+
+async def handle_delete_connection(manager: ConnectionManager, body: dict) -> dict:
+    connection_id = _target_id(body)
+    if not await manager.delete_connection(connection_id):
+        raise NotFound("no connection with that id")
+    return {"id": connection_id, "deleted": True}
+
+
+# --- Modbus connections ---
+
+
+async def handle_modbus_list_connections(modbus_manager: ModbusConnectionManager, body: dict | None = None) -> list:
+    return [_redact(c) for c in await modbus_manager.list_connections()]
+
+
+async def handle_modbus_create_connection(modbus_manager: ModbusConnectionManager, body: dict) -> dict:
+    credential = _encrypt_credential(body["credential"]) if body.get("credential") else None
+    record = await modbus_manager.create_connection(
+        host=body["host"],
+        topic_prefix=body["topic_prefix"],
+        points=body["points"],
+        port=body.get("port", 502),
+        device_id=body.get("device_id", 1),
+        poll_interval=body.get("poll_interval", 5.0),
+        credential=credential,
+        units=body.get("units"),
+    )
+    return _redact(record)
+
+
+async def handle_modbus_update_connection(modbus_manager: ModbusConnectionManager, body: dict) -> dict:
+    """{id, ...patch} - patch is any of points/poll_interval/topic_prefix/host/port/device_id."""
+    connection_id = _target_id(body)
+    record = await modbus_manager.update_connection(connection_id, {k: v for k, v in body.items() if k != "id"})
+    if record is None:
+        raise NotFound("no connection with that id")
+    return _redact(record)
+
+
+async def handle_modbus_delete_connection(modbus_manager: ModbusConnectionManager, body: dict) -> dict:
+    connection_id = _target_id(body)
+    if not await modbus_manager.delete_connection(connection_id):
+        raise NotFound("no connection with that id")
+    return {"id": connection_id, "deleted": True}
+
+
+# --- devices ---
+
+
+async def handle_list_devices(device_registry: DeviceRegistry, body: dict | None = None) -> list:
+    return [_redact(d) for d in device_registry.list()]
+
+
+async def handle_set_device_status(device_registry: DeviceRegistry, body: dict) -> dict:
+    record = await device_registry.set_status(_target_id(body), body["status"])
+    if record is None:
+        raise NotFound("no device with that id")
+    return _redact(record)
+
+
+async def add_device(
+    device_registry: DeviceRegistry,
+    manager: ConnectionManager,
+    modbus_manager: ModbusConnectionManager,
+    body: dict,
+) -> tuple[dict, bool]:
+    """(redacted record, whether it was newly created). Passes the
+    matching protocol's connections along so a device that's already
+    being polled comes back provisioned, the way a scan would mark it."""
+    before = set(device_registry.records)
+    owner = modbus_manager if isinstance(body, dict) and body.get("protocol") == "modbus" else manager
+    record = await device_registry.add_device(body, list(owner.connections.values()))
+    return _redact(record), record["id"] not in before
+
+
+async def handle_add_device(device_registry, manager, modbus_manager, body: dict) -> dict:
+    record, _ = await add_device(device_registry, manager, modbus_manager, body)
+    return record
+
+
+async def handle_recheck_credentials(device_registry: DeviceRegistry, body: dict) -> dict:
+    record = await device_registry.recheck_credentials(_target_id(body))
+    if record is None:
+        raise NotFound("no device with that id")
+    return _redact(record)
+
+
+CREDENTIAL_TARGETS = ("device", "connection", "modbus_connection")
+
+
+async def set_credential(target: str, target_id: str, credential: dict, manager, modbus_manager, device_registry) -> dict:
+    """Stores an already-encrypted credential on a device or connection;
+    the raw stored record (callers redact or echo as they need)."""
+    setters = {
+        "device": (device_registry, "no device with that id"),
+        "connection": (manager, "no connection with that id"),
+        "modbus_connection": (modbus_manager, "no connection with that id"),
+    }
+    if target not in setters:
+        raise ValueError(f"target must be one of {', '.join(CREDENTIAL_TARGETS)}, got {target!r}")
+    owner, missing = setters[target]
+    record = await owner.set_credential(target_id, credential)
+    if record is None:
+        raise NotFound(missing)
+    return record
+
+
+async def handle_set_credential(manager, modbus_manager, device_registry, body: dict) -> dict:
+    """{target, id, credential: {username, password}}. Unlike the HTTP
+    PATCH, the result doesn't echo the password back: a result topic is
+    readable by anything subscribed to it, and the sender already has it."""
+    record = await set_credential(
+        body["target"], _target_id(body), _encrypt_credential(body.get("credential")),
+        manager, modbus_manager, device_registry,
+    )
+    return _redact(record)
 
 
 def make_handler(
@@ -105,7 +274,10 @@ def make_handler(
             length = int(self.headers.get("Content-Length", 0))
             if length == 0:
                 return {}
-            return json.loads(self.rfile.read(length).decode("utf-8"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("request body must be a JSON object")  # noqa: TRY004 - ValueError means 400 / ok:false
+            return body
 
         def _respond_json(self, status: int, payload) -> None:
             body = json.dumps(payload).encode("utf-8")
@@ -119,6 +291,9 @@ def make_handler(
             with tracer.start_as_current_span(span_name) as span:
                 try:
                     fn(span)
+                except NotFound as exc:
+                    span.set_attribute("error", str(exc))
+                    self._respond_json(404, {"error": str(exc)})
                 except TimeoutError as exc:
                     span.set_attribute("error", str(exc))
                     self._respond_json(504, {"error": "timed out waiting on the BACnet/Modbus stack"})
@@ -128,6 +303,29 @@ def make_handler(
                 except Exception as exc:
                     span.set_attribute("error", str(exc))
                     self._respond_json(500, {"error": str(exc)})
+
+        def _route(self, span_name: str, handler, status: int = 200, body: dict | None = None, count: bool = False):
+            """The common shape: run one handle_* coroutine on the loop and
+            answer with its result as JSON. `body=None` reads the request's."""
+
+            def handle(span):
+                result = _run(handler(self._read_json_body() if body is None else body), loop)
+                if count:
+                    span.set_attribute("count", len(result))
+                self._respond_json(status, result)
+
+            self._handle(span_name, handle)
+
+        def _path_id(self, prefix: str, suffix: str = "") -> str | None:
+            """The {id} in prefix + {id} + suffix, or None if the path isn't
+            that shape - an id never contains a slash, which is what keeps
+            /connections/{id} from swallowing /connections/{id}/credential."""
+            if not (self.path.startswith(prefix) and self.path.endswith(suffix)):
+                return None
+            target = self.path[len(prefix) : len(self.path) - len(suffix)].rstrip("/") if suffix else self.path[len(prefix) :]
+            if not target or "/" in target:
+                return None
+            return target
 
         def _credential_body(self) -> tuple[str, dict]:
             """Shared by every .../credential PATCH handler: reads
@@ -139,109 +337,62 @@ def make_handler(
             username, password = body["username"], body["password"]
             return password, credentials.encrypt(username, password)
 
+        def _patch_credential(self, span_name: str, target: str, target_id: str) -> None:
+            def handle(span):
+                span.set_attribute("target_id", target_id)
+                password, credential = self._credential_body()
+                _run(set_credential(target, target_id, credential, manager, modbus_manager, device_registry), loop)
+                self._respond_json(200, {"username": credential["username"], "password": password})
+
+            self._handle(span_name, handle)
+
         def do_POST(self):
             if not self._allowed():
                 return
             if self.path == "/discover":
-                def handle(span):
-                    body = self._read_json_body()
-                    devices = _run(handle_discover(manager, body), loop)
-                    span.set_attribute("device_count", len(devices))
-                    self._respond_json(200, devices)
-
-                self._handle("api.post_discover", handle)
+                self._route("api.post_discover", lambda body: handle_discover(manager, body), count=True)
                 return
 
             if self.path == "/write":
-                def handle(span):
-                    body = self._read_json_body()
-                    result = _run(handle_point_write(manager, body), loop)
-                    span.set_attribute("topic", body["topic"])
-                    self._respond_json(200, result)
-
-                self._handle("api.post_write", handle)
+                self._route("api.post_write", lambda body: handle_point_write(manager, body))
                 return
 
             if self.path == "/learn":
-                def handle(span):
-                    body = self._read_json_body()
-                    points = _run(handle_learn(manager, body), loop)
-                    span.set_attribute("point_count", len(points))
-                    self._respond_json(200, points)
-
-                self._handle("api.post_learn", handle)
+                self._route("api.post_learn", lambda body: handle_learn(manager, body), count=True)
                 return
 
             if self.path == "/connections":
-                def handle(span):
-                    body = self._read_json_body()
-                    credential = None
-                    if body.get("credential"):
-                        credential = credentials.encrypt(body["credential"]["username"], body["credential"]["password"])
-                    record = _run(
-                        manager.create_connection(
-                            device_address=body["device_address"],
-                            device_instance=body["device_instance"],
-                            topic_prefix=body["topic_prefix"],
-                            points=body["points"],
-                            poll_interval=body.get("poll_interval", 5.0),
-                            credential=credential,
-                        ),
-                        loop,
-                    )
-                    span.set_attribute("connection_id", record["id"])
-                    self._respond_json(201, _redact(record))
-
-                self._handle("api.post_connections", handle)
+                self._route("api.post_connections", lambda body: handle_create_connection(manager, body), status=201)
                 return
 
             if self.path == "/modbus/discover":
-                def handle(span):
-                    body = self._read_json_body()
-                    devices = _run(handle_modbus_discover(body), loop)
-                    span.set_attribute("device_count", len(devices))
-                    self._respond_json(200, devices)
-
-                self._handle("api.post_modbus_discover", handle)
+                self._route("api.post_modbus_discover", handle_modbus_discover, count=True)
                 return
 
             if self.path == "/modbus/connections":
-                def handle(span):
-                    body = self._read_json_body()
-                    credential = None
-                    if body.get("credential"):
-                        credential = credentials.encrypt(body["credential"]["username"], body["credential"]["password"])
-                    record = _run(
-                        modbus_manager.create_connection(
-                            host=body["host"],
-                            topic_prefix=body["topic_prefix"],
-                            points=body["points"],
-                            port=body.get("port", 502),
-                            device_id=body.get("device_id", 1),
-                            poll_interval=body.get("poll_interval", 5.0),
-                            credential=credential,
-                            units=body.get("units"),
-                        ),
-                        loop,
-                    )
-                    span.set_attribute("connection_id", record["id"])
-                    self._respond_json(201, _redact(record))
-
-                self._handle("api.post_modbus_connections", handle)
+                self._route(
+                    "api.post_modbus_connections",
+                    lambda body: handle_modbus_create_connection(modbus_manager, body),
+                    status=201,
+                )
                 return
 
-            if self.path.startswith("/devices/") and self.path.endswith("/recheck-credentials"):
-                device_id = self.path[len("/devices/") : -len("/recheck-credentials")]
-
+            if self.path == "/devices":
                 def handle(span):
-                    span.set_attribute("device_id", device_id)
-                    record = _run(device_registry.recheck_credentials(device_id), loop)
-                    if record is None:
-                        self._respond_json(404, {"error": "no device with that id"})
-                        return
-                    self._respond_json(200, _redact(record))
+                    record, created = _run(add_device(device_registry, manager, modbus_manager, self._read_json_body()), loop)
+                    span.set_attribute("created", created)
+                    self._respond_json(201 if created else 200, record)
 
-                self._handle("api.post_recheck_credentials", handle)
+                self._handle("api.post_devices", handle)
+                return
+
+            device_id = self._path_id("/devices/", "/recheck-credentials")
+            if device_id is not None:
+                self._route(
+                    "api.post_recheck_credentials",
+                    lambda body: handle_recheck_credentials(device_registry, body),
+                    body={"id": device_id},
+                )
                 return
 
             self.send_response(404)
@@ -250,64 +401,45 @@ def make_handler(
         def do_PATCH(self):
             if not self._allowed():
                 return
-            if self.path.startswith("/connections/") and self.path.endswith("/credential"):
-                connection_id = self.path[len("/connections/") : -len("/credential")].rstrip("/")
-
-                def handle(span):
-                    span.set_attribute("connection_id", connection_id)
-                    password, credential = self._credential_body()
-                    record = _run(manager.set_credential(connection_id, credential), loop)
-                    if record is None:
-                        self._respond_json(404, {"error": "no connection with that id"})
-                        return
-                    self._respond_json(200, {"username": credential["username"], "password": password})
-
-                self._handle("api.patch_connection_credential", handle)
+            # .../credential first: the bare /{id} routes below would
+            # otherwise be the ones to match.
+            connection_id = self._path_id("/connections/", "/credential")
+            if connection_id is not None:
+                self._patch_credential("api.patch_connection_credential", "connection", connection_id)
                 return
 
-            if self.path.startswith("/modbus/connections/") and self.path.endswith("/credential"):
-                connection_id = self.path[len("/modbus/connections/") : -len("/credential")].rstrip("/")
-
-                def handle(span):
-                    span.set_attribute("connection_id", connection_id)
-                    password, credential = self._credential_body()
-                    record = _run(modbus_manager.set_credential(connection_id, credential), loop)
-                    if record is None:
-                        self._respond_json(404, {"error": "no connection with that id"})
-                        return
-                    self._respond_json(200, {"username": credential["username"], "password": password})
-
-                self._handle("api.patch_modbus_connection_credential", handle)
+            connection_id = self._path_id("/modbus/connections/", "/credential")
+            if connection_id is not None:
+                self._patch_credential("api.patch_modbus_connection_credential", "modbus_connection", connection_id)
                 return
 
-            if self.path.startswith("/devices/") and self.path.endswith("/credential"):
-                device_id = self.path[len("/devices/") : -len("/credential")].rstrip("/")
-
-                def handle(span):
-                    span.set_attribute("device_id", device_id)
-                    password, credential = self._credential_body()
-                    record = _run(device_registry.set_credential(device_id, credential), loop)
-                    if record is None:
-                        self._respond_json(404, {"error": "no device with that id"})
-                        return
-                    self._respond_json(200, {"username": credential["username"], "password": password})
-
-                self._handle("api.patch_device_credential", handle)
+            device_id = self._path_id("/devices/", "/credential")
+            if device_id is not None:
+                self._patch_credential("api.patch_device_credential", "device", device_id)
                 return
 
-            if self.path.startswith("/devices/"):
-                device_id = self.path[len("/devices/") :]
+            connection_id = self._path_id("/connections/")
+            if connection_id is not None:
+                self._route(
+                    "api.patch_connection",
+                    lambda body: handle_update_connection(manager, {**body, "id": connection_id}),
+                )
+                return
 
-                def handle(span):
-                    span.set_attribute("device_id", device_id)
-                    body = self._read_json_body()
-                    record = _run(device_registry.set_status(device_id, body["status"]), loop)
-                    if record is None:
-                        self._respond_json(404, {"error": "no device with that id"})
-                        return
-                    self._respond_json(200, _redact(record))
+            connection_id = self._path_id("/modbus/connections/")
+            if connection_id is not None:
+                self._route(
+                    "api.patch_modbus_connection",
+                    lambda body: handle_modbus_update_connection(modbus_manager, {**body, "id": connection_id}),
+                )
+                return
 
-                self._handle("api.patch_device", handle)
+            device_id = self._path_id("/devices/")
+            if device_id is not None:
+                self._route(
+                    "api.patch_device",
+                    lambda body: handle_set_device_status(device_registry, {**body, "id": device_id}),
+                )
                 return
 
             self.send_response(404)
@@ -317,30 +449,18 @@ def make_handler(
             if not self._allowed():
                 return
             if self.path == "/connections":
-                def handle(span):
-                    connections = _run(manager.list_connections(), loop)
-                    span.set_attribute("count", len(connections))
-                    self._respond_json(200, [_redact(c) for c in connections])
-
-                self._handle("api.get_connections", handle)
+                self._route("api.get_connections", lambda _: handle_list_connections(manager), body={}, count=True)
                 return
 
             if self.path == "/modbus/connections":
-                def handle(span):
-                    connections = _run(modbus_manager.list_connections(), loop)
-                    span.set_attribute("count", len(connections))
-                    self._respond_json(200, [_redact(c) for c in connections])
-
-                self._handle("api.get_modbus_connections", handle)
+                self._route(
+                    "api.get_modbus_connections", lambda _: handle_modbus_list_connections(modbus_manager),
+                    body={}, count=True,
+                )
                 return
 
             if self.path == "/devices":
-                def handle(span):
-                    devices = device_registry.list()
-                    span.set_attribute("count", len(devices))
-                    self._respond_json(200, [_redact(d) for d in devices])
-
-                self._handle("api.get_devices", handle)
+                self._route("api.get_devices", lambda _: handle_list_devices(device_registry), body={}, count=True)
                 return
 
             if self.path == "/openapi.yaml":
@@ -357,33 +477,36 @@ def make_handler(
             self.send_response(404)
             self.end_headers()
 
+        def _delete(self, span_name: str, handler, connection_id: str) -> None:
+            def handle(span):
+                span.set_attribute("connection_id", connection_id)
+                try:
+                    _run(handler({"id": connection_id}), loop)
+                except NotFound:
+                    deleted = False
+                else:
+                    deleted = True
+                span.set_attribute("deleted", deleted)
+                self.send_response(204 if deleted else 404)
+                self.end_headers()
+
+            self._handle(span_name, handle)
+
         def do_DELETE(self):
             if not self._allowed():
                 return
-            if self.path.startswith("/modbus/connections/"):
-                connection_id = self.path[len("/modbus/connections/") :]
-
-                def handle(span):
-                    span.set_attribute("connection_id", connection_id)
-                    deleted = _run(modbus_manager.delete_connection(connection_id), loop)
-                    span.set_attribute("deleted", deleted)
-                    self.send_response(204 if deleted else 404)
-                    self.end_headers()
-
-                self._handle("api.delete_modbus_connection", handle)
+            connection_id = self._path_id("/modbus/connections/")
+            if connection_id is not None:
+                self._delete(
+                    "api.delete_modbus_connection",
+                    lambda body: handle_modbus_delete_connection(modbus_manager, body),
+                    connection_id,
+                )
                 return
 
-            if self.path.startswith("/connections/"):
-                connection_id = self.path[len("/connections/") :]
-
-                def handle(span):
-                    span.set_attribute("connection_id", connection_id)
-                    deleted = _run(manager.delete_connection(connection_id), loop)
-                    span.set_attribute("deleted", deleted)
-                    self.send_response(204 if deleted else 404)
-                    self.end_headers()
-
-                self._handle("api.delete_connection", handle)
+            connection_id = self._path_id("/connections/")
+            if connection_id is not None:
+                self._delete("api.delete_connection", lambda body: handle_delete_connection(manager, body), connection_id)
                 return
 
             self.send_response(404)
@@ -412,46 +535,169 @@ def make_handler(
     return ConnectionsHandler
 
 
-def _make_on_command(manager: ConnectionManager, loop: asyncio.AbstractEventLoop, site_id: str, instance_id: str):
+# Actions whose `id` names the thing to act on (a device or connection)
+# rather than being only the caller's correlation id. It's still echoed on
+# the result like any other command's `id`.
+TARGETED_ACTIONS = {
+    "set_device_status", "recheck_credentials", "update_connection", "delete_connection",
+    "modbus_update_connection", "modbus_delete_connection", "set_credential",
+}
+
+
+def _make_on_command(
+    manager: ConnectionManager,
+    loop: asyncio.AbstractEventLoop,
+    site_id: str,
+    instance_id: str,
+    modbus_manager: ModbusConnectionManager | None = None,
+    device_registry: DeviceRegistry | None = None,
+):
     """multi-site.mdx's command channel: a {"action": ..., ...} message on
     cmd/{site_id}/{instance_id}/# dispatches to the same handler its own
     HTTP route calls, and the outcome is published to .../result so a
     command isn't fire-and-forget. Runs on paho's network thread (same
     blocking-call shape as an HTTP handler's worker thread) - one command
     processes at a time, which is fine for scans you don't want overlapping.
+
+    The subscription covers our own .../result and .../status topics too
+    (MQTT 3.1.1 echoes a client's own publishes back to it), so those are
+    skipped - otherwise every result, carrying its `action`, would be
+    dispatched again as a new command, forever.
     """
     handlers = {
         "discover": lambda body: handle_discover(manager, body),
         "learn": lambda body: handle_learn(manager, body),
         "modbus_discover": lambda body: handle_modbus_discover(body),
         "point_write": lambda body: handle_point_write(manager, body),
+        "list_devices": lambda body: handle_list_devices(device_registry, body),
+        "set_device_status": lambda body: handle_set_device_status(device_registry, body),
+        "add_device": lambda body: handle_add_device(device_registry, manager, modbus_manager, body),
+        "recheck_credentials": lambda body: handle_recheck_credentials(device_registry, body),
+        "list_connections": lambda body: handle_list_connections(manager, body),
+        "create_connection": lambda body: handle_create_connection(manager, body),
+        "update_connection": lambda body: handle_update_connection(manager, body),
+        "delete_connection": lambda body: handle_delete_connection(manager, body),
+        "modbus_list_connections": lambda body: handle_modbus_list_connections(modbus_manager, body),
+        "modbus_create_connection": lambda body: handle_modbus_create_connection(modbus_manager, body),
+        "modbus_update_connection": lambda body: handle_modbus_update_connection(modbus_manager, body),
+        "modbus_delete_connection": lambda body: handle_modbus_delete_connection(modbus_manager, body),
+        "set_credential": lambda body: handle_set_credential(manager, modbus_manager, device_registry, body),
     }
+    result_topic = f"cmd/{site_id}/{instance_id}/result"
+    own_topics = {result_topic, status_topic(site_id, instance_id)}
 
     def on_command(client, userdata, msg):
+        if msg.topic in own_topics:
+            return
         with tracer.start_as_current_span("api.on_command") as span:
             span.set_attribute("topic", msg.topic)
             try:
                 payload = json.loads(msg.payload.decode("utf-8"))
-                handler = handlers[payload["action"]]
-                # `id` is the caller's correlation id, echoed on the result
-                # so concurrent callers can tell their outcomes apart.
-                request_id = payload.get("id")
-                body = {k: v for k, v in payload.items() if k not in ("action", "id")}
-            except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as exc:
+                if not isinstance(payload, dict):
+                    raise ValueError("command must be a JSON object")  # noqa: TRY004 - caught below as malformed
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
                 span.set_attribute("error", str(exc))
                 print(f"malformed command on {msg.topic}: {exc!r}")
                 return
-            try:
-                outcome = {"ok": True, "result": _run(handler(body), loop)}
-            except Exception as exc:  # noqa: BLE001 - one bad command must not crash the mqtt loop thread
-                span.set_attribute("error", str(exc))
-                outcome = {"ok": False, "error": str(exc)}
-            outcome["action"] = payload["action"]
+            action = payload.get("action")
+            span.set_attribute("action", str(action))
+            # `request_id` is the caller's correlation id, echoed on the
+            # result so concurrent callers can tell their outcomes apart.
+            # Older callers (Baler's point writes before it) correlate on
+            # `id`, which is still echoed - but for TARGETED_ACTIONS `id`
+            # names the device/connection, so those callers must send
+            # request_id.
+            request_id = payload.get("request_id")
+            legacy_id = payload.get("id")
+            handler = handlers.get(action) if isinstance(action, str) else None
+            if handler is None:
+                outcome = {"ok": False, "error": f"unknown action {action!r}"}
+            else:
+                drop = ("action", "request_id") if action in TARGETED_ACTIONS else ("action", "id", "request_id")
+                body = {k: v for k, v in payload.items() if k not in drop}
+                try:
+                    outcome = {"ok": True, "result": _run(handler(body), loop)}
+                except Exception as exc:  # noqa: BLE001 - one bad command must not crash the mqtt loop thread
+                    span.set_attribute("error", str(exc))
+                    outcome = {"ok": False, "error": str(exc) if not isinstance(exc, KeyError) else f"missing {exc}"}
+            outcome["action"] = action
+            if legacy_id is not None:
+                outcome["id"] = legacy_id
             if request_id is not None:
-                outcome["id"] = request_id
-            client.publish(f"cmd/{site_id}/{instance_id}/result", json.dumps(outcome), qos=1)
+                outcome["request_id"] = request_id
+            client.publish(result_topic, json.dumps(outcome), qos=1)
 
     return on_command
+
+
+# --- heartbeat (cmd/{site}/{instance}/status) ---
+
+# Seconds between status heartbeats; a module constant so tests can shrink it.
+STATUS_INTERVAL = 60.0
+
+
+def status_topic(site_id: str, instance_id: str) -> str:
+    return f"cmd/{site_id}/{instance_id}/status"
+
+
+def package_version() -> str:
+    try:
+        return importlib.metadata.version("windrow")
+    except importlib.metadata.PackageNotFoundError:
+        return "dev"
+
+
+def _now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def offline_payload(site_id: str, instance_id: str) -> str:
+    return json.dumps({"online": False, "site_id": site_id, "instance_id": instance_id})
+
+
+def build_status(site_id: str, instance_id: str, started_at: str, manager, modbus_manager, device_registry) -> dict:
+    devices = device_registry.list()
+    return {
+        "online": True,
+        "site_id": site_id,
+        "instance_id": instance_id,
+        "version": package_version(),
+        "started_at": started_at,
+        "ts": _now_iso(),
+        "bacnet_connections": len(manager.connections),
+        "modbus_connections": len(modbus_manager.connections),
+        "devices": len(devices),
+        "pending_devices": sum(1 for d in devices if d.get("status") == "pending"),
+    }
+
+
+async def run_status_heartbeat(client, topic: str, build, wake: asyncio.Event | None = None) -> None:
+    """Retained, so Baler (or anyone) subscribing later sees this instance's
+    last state at once rather than waiting out an interval; the matching
+    last will flips it to offline if the connection dies. `wake` lets a
+    reconnect re-announce straight away - while disconnected the broker
+    will have published the will, and "offline" shouldn't stand for up to
+    a minute after the edge is back."""
+    wake = wake or asyncio.Event()
+    while True:
+        wake.clear()
+        try:
+            client.publish(topic, json.dumps(build()), qos=1, retain=True)
+        except Exception as exc:  # noqa: BLE001 - a failed heartbeat must not end the heartbeat
+            print(f"status heartbeat failed: {exc!r}")
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(wake.wait(), timeout=STATUS_INTERVAL)
+
+
+def publish_offline(client, site_id: str, instance_id: str, timeout: float = 2.0) -> None:
+    """On clean shutdown: the will only fires on an unclean disconnect, so
+    say it ourselves, and wait (briefly) for it to leave before the network
+    loop stops."""
+    try:
+        info = client.publish(status_topic(site_id, instance_id), offline_payload(site_id, instance_id), qos=1, retain=True)
+        info.wait_for_publish(timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 - shutting down regardless; the will covers it
+        print(f"couldn't publish offline status: {exc!r}")
 
 
 def _crash_logger(task_name: str):
@@ -483,9 +729,11 @@ async def async_main(args) -> None:
     # has a stable site/instance identity - a bare `windrow` run with neither
     # set behaves exactly as before (fresh session, no command topic).
     command_topic = f"cmd/{args.site_id}/{args.instance_id}/#" if args.site_id else None
+    heartbeat_wake = asyncio.Event()
 
     def _resubscribe_commands(client, userdata, flags, reason_code, properties):
         client.subscribe(command_topic, qos=1)
+        loop.call_soon_threadsafe(heartbeat_wake.set)
 
     mqtt_client = mqtt_sink.connect(
         args.mqtt_host,
@@ -496,6 +744,8 @@ async def async_main(args) -> None:
         password=args.mqtt_password,
         on_connect_extra=_resubscribe_commands if command_topic else None,
         tls=args.mqtt_tls,
+        will=(status_topic(args.site_id, args.instance_id), offline_payload(args.site_id, args.instance_id))
+        if command_topic else None,
     )
     manager = ConnectionManager(
         app, mqtt_client, args.state_file,
@@ -506,11 +756,22 @@ async def async_main(args) -> None:
     modbus_manager = ModbusConnectionManager(mqtt_client, args.modbus_state_file)
     await modbus_manager.start()
 
-    if command_topic:
-        mqtt_client.message_callback_add(command_topic, _make_on_command(manager, loop, args.site_id, args.instance_id))
-
     device_registry = DeviceRegistry(args.devices_state_file)
     await device_registry.start()
+
+    if command_topic:
+        mqtt_client.message_callback_add(
+            command_topic,
+            _make_on_command(manager, loop, args.site_id, args.instance_id, modbus_manager, device_registry),
+        )
+        started_at = _now_iso()
+        heartbeat_task = loop.create_task(run_status_heartbeat(
+            mqtt_client,
+            status_topic(args.site_id, args.instance_id),
+            lambda: build_status(args.site_id, args.instance_id, started_at, manager, modbus_manager, device_registry),
+            heartbeat_wake,
+        ))
+        heartbeat_task.add_done_callback(_crash_logger("status heartbeat"))
 
     bacnet_scan_task = loop.create_task(
         device_registry.run_periodic_bacnet_scan(app, manager, args.bacnet_discovery_interval)
@@ -532,8 +793,14 @@ async def async_main(args) -> None:
     server_thread.start()
     print(f"BACnet/Modbus discovery/connections API listening on {args.host}:{args.port}")
 
+    # SIGTERM (docker stop) otherwise kills the process without running the
+    # finally below - no offline status, no Modbus client cleanup.
+    stop = asyncio.Event()
+    with contextlib.suppress(NotImplementedError, RuntimeError):
+        loop.add_signal_handler(signal.SIGTERM, stop.set)
+
     try:
-        await asyncio.Event().wait()
+        await stop.wait()
     finally:
         server.shutdown()
         # modbus_manager.close() first: an unclosed AsyncModbusTcpClient
@@ -541,6 +808,8 @@ async def async_main(args) -> None:
         # asyncio.run()'s default task-cancellation-on-shutdown
         # indefinitely - confirmed live (see test_modbus_connection_manager.py).
         await modbus_manager.close()
+        if command_topic:
+            publish_offline(mqtt_client, args.site_id, args.instance_id)
         mqtt_client.loop_stop()
         app.close()
 

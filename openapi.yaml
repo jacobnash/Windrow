@@ -216,6 +216,58 @@ paths:
           description: No connection with that id.
         "500":
           $ref: "#/components/responses/ServerError"
+    patch:
+      operationId: updateConnection
+      summary: Edit a connection's points, poll interval or topic prefix
+      description: >-
+        Send any subset of `points`, `poll_interval` and `topic_prefix`;
+        anything else is a 400 (a typo'd field is refused, not ignored).
+        `points` replaces the whole list, and each point keeps only the
+        fields `PointRef` documents (so `/learn` output can be sent as-is;
+        its `present_value` snapshot is dropped). The connection's poll
+        tasks restart with the new settings, every point's tags and the
+        `{topic_prefix}/equip/tags` record are republished, and each point
+        that no longer publishes where it did - a removed label, or every
+        point when `topic_prefix` changes - gets an empty retained message
+        on `{old_prefix}/{label}` and `{old_prefix}/{label}/tags` (plus
+        `{old_prefix}/equip/tags` on a prefix change), so its last value
+        and tags stop being handed to new subscribers. The id is kept.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateConnectionRequest"
+            examples:
+              default:
+                value:
+                  poll_interval: 10.0
+                  points:
+                    - { "object_identifier": "analog-value,1", "label": "zone-temp" }
+                    - { "object_identifier": "analog-value,3", "label": "zone-sp", "his_collect_cov": 0.5 }
+      responses:
+        "200":
+          description: The updated connection, credential redacted. Polling has already restarted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Connection"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          description: No connection with that id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/ServerError"
   /connections/{id}/credential:
     patch:
       operationId: setConnectionCredential
@@ -357,6 +409,50 @@ paths:
           description: No connection with that id.
         "500":
           $ref: "#/components/responses/ServerError"
+    patch:
+      operationId: updateModbusConnection
+      summary: Edit a Modbus connection
+      description: >-
+        Same shape and reasoning as `PATCH /connections/{id}`, with any
+        subset of `points` (replaces the whole `{label: register}` map),
+        `poll_interval`, `topic_prefix`, `host`, `port` and `device_id`.
+        The poll task and its Modbus client are closed and reopened, so a
+        new host/port takes effect at once. Modbus connections publish no
+        tags of their own, but `{old_prefix}/{label}/tags` is cleared along
+        with the value topic for each removed point anyway, in case a
+        human tagged it.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateModbusConnectionRequest"
+            examples:
+              default:
+                value: { "host": "192.168.1.51", "points": { "zone-temp": 0, "return-temp": 2 } }
+      responses:
+        "200":
+          description: The updated connection, credential redacted. Polling has already restarted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModbusConnection"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          description: No connection with that id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/ServerError"
   /modbus/connections/{id}/credential:
     patch:
       operationId: setModbusConnectionCredential
@@ -410,6 +506,49 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/DeviceRecord"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    post:
+      operationId: addDevice
+      summary: Add a device by address
+      description: >-
+        For a device a scan can't find - broadcasts filtered between
+        subnets, or Modbus on a subnet no `--modbus-scan-cidr` covers.
+        Creates the same record a scan would (keyed the same way, so a
+        later scan that does hear the device updates this record rather
+        than adding a second one), with status `pending` - or
+        `provisioned` if a connection already polls that device. Adding a
+        device that's already known returns its existing record with 200.
+        A BACnet `device_address` on the standard port 47808 is stored
+        without the port, the way discovery reports it; a non-standard
+        port is kept. A new pending Modbus device gets the same one-time
+        default-credential check a scanned one does.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddDeviceRequest"
+            examples:
+              bacnet:
+                value: { "protocol": "bacnet", "device_address": "10.0.0.5", "device_instance": 1234 }
+              modbus:
+                value: { "protocol": "modbus", "host": "10.0.0.6", "port": 502, "device_id": 1 }
+      responses:
+        "201":
+          description: Added. The new device record, credentials redacted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceRecord"
+        "200":
+          description: Already known. The existing device record, unchanged, credentials redacted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/ServerError"
   /devices/{id}:
@@ -787,6 +926,79 @@ components:
             credential:
               $ref: "#/components/schemas/RedactedCredential"
         - $ref: "#/components/schemas/CreateModbusConnectionRequest"
+    UpdateConnectionRequest:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        points:
+          type: array
+          minItems: 1
+          description: Replaces every point. Labels must be unique.
+          items:
+            $ref: "#/components/schemas/PointRef"
+        poll_interval:
+          type: number
+          exclusiveMinimum: 0
+        topic_prefix:
+          type: string
+          description: No `+`/`#`; a trailing `/` is dropped.
+    UpdateModbusConnectionRequest:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        points:
+          $ref: "#/components/schemas/ModbusPoints"
+        poll_interval:
+          type: number
+          exclusiveMinimum: 0
+        topic_prefix:
+          type: string
+        host:
+          type: string
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        device_id:
+          type: integer
+          minimum: 0
+          maximum: 255
+    AddDeviceRequest:
+      oneOf:
+        - type: object
+          required: [protocol, device_address, device_instance]
+          properties:
+            protocol:
+              const: bacnet
+            device_address:
+              type: string
+              example: "10.0.0.5"
+            device_instance:
+              type: integer
+              minimum: 0
+              maximum: 4194302
+              example: 1234
+        - type: object
+          required: [protocol, host]
+          properties:
+            protocol:
+              const: modbus
+            host:
+              type: string
+              example: "10.0.0.6"
+            port:
+              type: integer
+              default: 502
+              minimum: 1
+              maximum: 65535
+            device_id:
+              type: integer
+              description: Modbus unit/slave id.
+              default: 1
+              minimum: 0
+              maximum: 255
     DeviceRecord:
       type: object
       required: [id, protocol, first_seen_at, last_seen_at, status]
@@ -821,6 +1033,9 @@ components:
         revision:
           type: ["string", "null"]
           description: Modbus only.
+        device_id:
+          type: ["integer", "null"]
+          description: Modbus only, and only on a device added by address (`POST /devices`) - a sweep can't learn the unit id.
         first_seen_at:
           type: number
           description: Unix epoch seconds.

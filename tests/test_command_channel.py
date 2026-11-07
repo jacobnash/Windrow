@@ -75,8 +75,37 @@ def test_malformed_json_does_not_crash_or_publish(loop_thread):
     assert client.published == []
 
 
-def test_unknown_action_does_not_crash_or_publish(loop_thread):
-    client = _send(loop_thread, {"action": "reboot_the_moon"})
+def test_unknown_action_reports_an_error_outcome(loop_thread):
+    client = _send(loop_thread, {"action": "reboot_the_moon", "id": "r-1"})
+    assert len(client.published) == 1
+    topic, payload, _ = client.published[0]
+    assert topic == "cmd/site-a/inst-1/result"
+    assert json.loads(payload) == {
+        "ok": False, "error": "unknown action 'reboot_the_moon'", "action": "reboot_the_moon", "id": "r-1",
+    }
+
+
+def test_missing_action_reports_an_error_outcome(loop_thread):
+    client = _send(loop_thread, {"id": "r-2"})
+    outcome = json.loads(client.published[0][1])
+    assert outcome["ok"] is False and outcome["error"] == "unknown action None" and outcome["id"] == "r-2"
+
+
+def test_own_result_and_status_topics_are_never_dispatched(loop_thread):
+    """MQTT 3.1.1 echoes our own publishes back on the cmd/.../# subscription;
+    a result carries its `action`, so dispatching it would loop forever."""
+    on_command = _make_on_command(FakeManager(), loop_thread, "site-a", "inst-1")
+    client = FakeMqttClient()
+    for suffix in ("result", "status"):
+        payload = json.dumps({"ok": True, "action": "discover", "result": []}).encode()
+        on_command(client, None, SimpleNamespace(topic=f"cmd/site-a/inst-1/{suffix}", payload=payload))
+    assert client.published == []
+
+
+def test_non_object_json_is_dropped_as_malformed(loop_thread):
+    on_command = _make_on_command(FakeManager(), loop_thread, "site-a", "inst-1")
+    client = FakeMqttClient()
+    on_command(client, None, SimpleNamespace(topic="cmd/site-a/inst-1", payload=b"[1, 2]"))  # must not raise
     assert client.published == []
 
 
@@ -92,3 +121,11 @@ def test_handler_exception_reports_error_outcome_instead_of_crashing(loop_thread
     outcome = json.loads(client.published[0][1])
     assert outcome["ok"] is False
     assert "error" in outcome
+
+
+def test_request_id_correlates_while_id_names_the_target(loop_thread):
+    """A targeted action's `id` is the device/connection; callers correlate on
+    request_id so concurrent outcomes don't mix (Baler's Commander does)."""
+    client = _send(loop_thread, {"action": "reboot_the_moon", "id": "conn-1", "request_id": "q-9"})
+    outcome = json.loads(client.published[0][1])
+    assert outcome["request_id"] == "q-9" and outcome["id"] == "conn-1"
