@@ -48,7 +48,7 @@ equivalent calls (the `handle_*` functions in `src/windrow/api.py`):
 | `discover` | `POST /discover` | passed through as kwargs |
 | `learn` | `POST /learn` | `device_address`, `device_instance` |
 | `modbus_discover` | `POST /modbus/discover` | `cidr`, optional `port`/`concurrency`/`timeout` |
-| `point_write` | `POST /write` | `topic`, `value` (`null` relinquishes), `priority` 1-17 (17 sets BACnet relinquish-default; it cannot be relinquished), optional `expires_at` (unix s) |
+| `point_write` | `POST /write` | `topic`, `value` (`null` relinquishes), `priority` 1-17 (17 sets BACnet relinquish-default; it cannot be relinquished), optional `expires_at` (unix s). A topic a Modbus connection publishes goes to its writable holding register or coil - see below |
 | `list_devices` | `GET /devices` | none |
 | `add_device` | `POST /devices` | `protocol: "bacnet"`, `device_address`, `device_instance` - or `protocol: "modbus"`, `host`, optional `port` (502) / `device_id` (1) |
 | `set_device_status` | `PATCH /devices/{id}` | `id`, `status` (`pending`/`provisioned`/`ignored`) |
@@ -58,8 +58,8 @@ equivalent calls (the `handle_*` functions in `src/windrow/api.py`):
 | `update_connection` | `PATCH /connections/{id}` | `id`, plus any of `points`, `poll_interval`, `topic_prefix` |
 | `delete_connection` | `DELETE /connections/{id}` | `id` |
 | `modbus_list_connections` | `GET /modbus/connections` | none |
-| `modbus_create_connection` | `POST /modbus/connections` | as the HTTP body: `host`, `topic_prefix`, `points` (`{label: register}`), optional `port`/`device_id`/`poll_interval`/`credential` |
-| `modbus_update_connection` | `PATCH /modbus/connections/{id}` | `id`, plus any of `points`, `poll_interval`, `topic_prefix`, `host`, `port`, `device_id` |
+| `modbus_create_connection` | `POST /modbus/connections` | as the HTTP body: `host`, `topic_prefix`, `points` (`{label: register or point object}`), optional `port`/`device_id`/`poll_interval`/`units`/`credential` |
+| `modbus_update_connection` | `PATCH /modbus/connections/{id}` | `id`, plus any of `points`, `units`, `poll_interval`, `topic_prefix`, `host`, `port`, `device_id` |
 | `modbus_delete_connection` | `DELETE /modbus/connections/{id}` | `id` |
 | `start_job` | `POST /jobs` | `job` (`discover`, `learn` or `modbus_discover`) plus that action's fields. Answers at once with the job; use it for anything that can take more than a few seconds |
 | `get_job` | `GET /jobs/{id}` | `id` (the job's): `state` (`running`/`done`/`failed`), `progress` (`{done, total}` for a sweep), `result` once done, `error` if failed |
@@ -98,6 +98,36 @@ record, not the plaintext echo `PATCH .../credential` answers with - a
 result topic can be read by anything subscribed to it, and the sender
 already knows the password.
 
+### Modbus points and writes
+
+A Modbus point is a bare holding-register address (read as one unsigned
+16-bit word - the original form, still valid) or an object:
+
+```json
+{"register": 4, "function": "holding", "type": "int16", "word_order": "big",
+ "byte_order": "big", "scale": 0.1, "offset": 0, "unit": "°F", "writable": true}
+```
+
+`function` is `holding` (default), `input`, `coil` or `discrete`; `type` is
+`int16`, `uint16` (default), `int32`, `uint32` or `float32`; `word_order`
+(32-bit types) and `byte_order` are `big` (default) or `little`. The
+published value is `raw * scale + offset`; coils and discrete inputs publish
+`true`/`false`. `register` is the 0-based protocol address: holding register
+40001 is `register: 0`, input register 30010 is `function: input,
+register: 9`. Every field is checked strictly - an unknown key or an option
+that doesn't apply (scale on a coil, `writable` on an input register) is
+refused. `src/windrow/modbus_points.py` has the details; the mock device's
+`POINTS` (`src/windrow/mock_modbus_device.py`) is a worked example of each.
+
+A `writable` point is tagged `writable` (so Baler accepts a pointWrite) and
+takes `point_write`, with the same `priority` and `expires_at` rules as
+BACnet. A value is in engineering units and is encoded back through the
+point's scale, offset and type. Modbus devices have no priority array, so
+Windrow keeps one per point, stored on the connection as `write_levels`, and
+writes the highest-priority level's value; a `null` relinquishes a level and
+the next one down is written. With every level relinquished nothing is
+written and the register keeps its last value.
+
 `update_connection` restarts that connection's polling with the new
 settings, republishes its point tags and `{prefix}/equip/tags`, and sends an
 empty retained message to `{old_prefix}/{label}` and `{old_prefix}/{label}/tags`
@@ -132,8 +162,13 @@ on `cmd/<site-id>/<instance-id>/status`, published at startup, on every
  "version": "0.1.0", "started_at": "2026-11-07T09:00:00.123456+00:00",
  "ts": "2026-11-07T09:05:00.654321+00:00",
  "bacnet_connections": 3, "modbus_connections": 1, "devices": 9, "pending_devices": 2,
+ "bacnet_requests": {"read_property_multiple": 1200, "subscribe_cov": 40,
+                     "cov_notifications": 310, "cov_subscriptions": 20},
  "networks": ["192.168.1.0/24"]}
 ```
+
+`bacnet_requests` counts BACnet requests sent since startup, by kind, plus
+the number of live COV subscriptions - see bacnet-discovery-api.md 3c.
 
 `networks` lists the subnets the node sits on (its BACnet `--address` and any
 `--modbus-scan-cidr`); Baler's Connectors page prefills its Modbus sweep with

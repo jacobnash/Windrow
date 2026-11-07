@@ -17,6 +17,7 @@ one if label/description alone turn out to under-match on real hardware.
 """
 
 import re
+from pathlib import Path
 
 import yaml
 
@@ -26,6 +27,19 @@ _TOKEN_SPLIT = re.compile(r"[-_,\s]+")
 def load_rules(path: str) -> list[dict]:
     with open(path) as f:
         return yaml.safe_load(f)["rules"]
+
+
+DEFAULT_RULES = "bacnet_to_haystack_tags.yaml"
+
+
+def load_default_rules() -> list[dict]:
+    """The rules shipped inside the package (src/windrow/rules/), so a plain
+    `pip install` has them too, not only a checkout (Windrow#8). The
+    repo-root rules/ file is a symlink to this one, for older paths.
+    Found next to this module rather than via importlib.resources: windrow
+    is a namespace package (no __init__.py), which resources.files() only
+    handles on newer Pythons than requires-python's 3.10."""
+    return load_rules(str(Path(__file__).resolve().parent / "rules" / DEFAULT_RULES))
 
 
 def _tokenize(point: dict) -> set[str]:

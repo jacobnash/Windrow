@@ -54,3 +54,33 @@ def test_haystack_unit_from_bacnet_units_any_spelling():
     assert haystack_unit("noUnits") is None
     assert haystack_unit(None) is None
     assert haystack_unit("furlongs-per-fortnight") is None
+
+
+def test_packaged_rules_are_the_repo_rules():
+    """windrow.api loads the rules from inside the package (Windrow#8); the
+    repo-root rules/ path older checkouts and Dockerfiles use still works."""
+    from windrow.bacnet_tagger import load_default_rules
+
+    assert load_default_rules() == RULES
+
+
+def test_built_wheel_ships_the_rules(tmp_path):
+    """A plain `pip install` (what install-edge.sh does) gets the rules: they
+    are in the wheel as package data, not left behind in the checkout."""
+    import pathlib
+    import shutil
+    import subprocess
+    import sys
+    import zipfile
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    # Built from a copy: setuptools writes build/ and *.egg-info in the tree.
+    src = tmp_path / "src-copy"
+    shutil.copytree(root / "src", src / "src", ignore=shutil.ignore_patterns("__pycache__", "*.egg-info"))
+    for name in ("pyproject.toml", "README.md", "LICENSE"):
+        shutil.copy(root / name, src / name)
+    subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps", "-q",
+                    "-w", str(tmp_path), str(src)], check=True)
+    (wheel,) = tmp_path.glob("windrow-*.whl")
+    names = zipfile.ZipFile(wheel).namelist()
+    assert "windrow/rules/bacnet_to_haystack_tags.yaml" in names

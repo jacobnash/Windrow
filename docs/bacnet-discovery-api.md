@@ -133,6 +133,50 @@ Omitting `his_collect_cov`/`his_collect_interval` entirely (as `fan-status`
 does) is the safe, backward-compatible default — nothing changes for a
 point that doesn't opt in.
 
+## 3c. How the device is read: ReadPropertyMultiple and COV
+
+Reads are batched per device with ReadPropertyMultiple by default. Every
+point on one device ticks on the same schedule (per interval), and the
+reads asked of a device within 20 ms (`WINDROW_RPM_WINDOW`) go out as one
+request per `read_multiple_max` objects - across all connections on that
+device, since one controller often backs many equipment connections. On
+the mock hospital site (492 points, 88 connections, one device) that is
+10 requests per poll cycle instead of 491.
+
+- The batch size defaults to what fits the device's max APDU (from its
+  I-Am: ~23 for a 480-byte MS/TP device), at most `WINDROW_RPM_MAX_POINTS`
+  (50). Set `read_multiple_max` on a connection to go lower.
+- A device that rejects RPM (Reject unrecognized-service, a services-class
+  Error) is read with single ReadProperty requests from then on. One that
+  aborts because the answer doesn't fit gets half-size batches. A timed-out
+  RPM fails the batch (the device is down) and the usual back-off applies;
+  an answer that names an object nobody asked for is discarded and each
+  point re-read on its own.
+- `"read_multiple": false` on a connection keeps one ReadProperty per point.
+
+`"subscribe_cov": true` on a connection (or on a point, which overrides the
+connection) subscribes each point with SubscribeCOV, so a change publishes
+as soon as the device notifies - tens of milliseconds against the mock
+device. A subscribed point is still polled every `cov_poll_interval`
+(default 300 s) in case a notification is lost. Subscriptions ask for
+`cov_lifetime` seconds (default 300) and are renewed at half that; when a
+subscribe or renewal fails the point drops back to its normal poll rate and
+re-subscribes with back-off, and a device that comes back after an outage is
+re-subscribed straight away. An object the device won't do COV for is just
+polled. `his_collect_cov` and friends apply the same way whether a value
+came from a poll or a notification.
+
+```json
+{"device_address": "10.0.4.20", "device_instance": 4020, "topic_prefix": "fbf/ahu-3",
+ "poll_interval": 5.0, "subscribe_cov": true, "cov_poll_interval": 120,
+ "points": [{"object_identifier": "analog-input,1", "label": "dat"},
+            {"object_identifier": "analog-input,7", "label": "oat", "subscribe_cov": false}]}
+```
+
+Requests sent so far, by kind, are in the command channel's status heartbeat
+as `bacnet_requests` (`read_property`, `read_property_multiple`,
+`subscribe_cov`, `cov_notifications`, and the live `cov_subscriptions`).
+
 ## 4. List / delete
 
 ```

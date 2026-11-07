@@ -156,3 +156,10 @@ def test_test_read_against_the_mock_device(tmp_path, mock_modbus_device):
     m = mcm.ModbusConnectionManager(mqtt_client=None, state_file=str(tmp_path / "m.json"))
     out = asyncio.run(m.test_read("127.0.0.1", 0, port=mock_modbus_device))
     assert out["value"] == 70
+
+
+def test_test_read_decodes_a_typed_point(mgr, monkeypatch):
+    client = FakeClient()
+    monkeypatch.setattr(mgr, "_new_client", lambda record: client)
+    out = asyncio.run(mgr.test_read("10.0.0.5", 4, point={"type": "int16", "scale": 0.5}))
+    assert out["register"] == 4 and out["value"] == 37.0
