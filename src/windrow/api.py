@@ -40,7 +40,7 @@ from windrow import (
     mqtt_sink,
     tracing,
 )
-from windrow.connection_manager import ConnectionManager
+from windrow.connection_manager import READ_OPTION_FIELDS, ConnectionManager
 from windrow.device_registry import DeviceRegistry
 from windrow.modbus_connection_manager import ModbusConnectionManager
 
@@ -105,10 +105,15 @@ async def handle_learn(manager: ConnectionManager, body: dict) -> list:
     return await manager.learn(body["device_address"], body["device_instance"])
 
 
-async def handle_point_write(manager: ConnectionManager, body: dict) -> dict:
+async def handle_point_write(
+    manager: ConnectionManager, body: dict, modbus_manager: ModbusConnectionManager | None = None
+) -> dict:
     """{topic, value (null = relinquish), priority 1-17 (17 = relinquish-default), optional expires_at}
-    - BACnet WriteProperty on the point that publishes `topic`."""
-    return await manager.write_point(
+    - BACnet WriteProperty on the point that publishes `topic`, or a Modbus
+    register/coil write if a Modbus connection publishes it (Baler#128).
+    Same command either way, so Baler needs no protocol switch."""
+    owner = modbus_manager if modbus_manager is not None and modbus_manager.owns(body["topic"]) else manager
+    return await owner.write_point(
         body["topic"], body.get("value"), body["priority"], expires_at=body.get("expires_at")
     )
 
@@ -138,12 +143,15 @@ async def handle_create_connection(manager: ConnectionManager, body: dict) -> di
         points=body["points"],
         poll_interval=body.get("poll_interval", 5.0),
         credential=credential,
+        read_options={k: body[k] for k in READ_OPTION_FIELDS if k in body},
     )
     return _redact(record)
 
 
 async def handle_update_connection(manager: ConnectionManager, body: dict) -> dict:
-    """{id, ...patch} - patch is any of points/poll_interval/topic_prefix."""
+    """{id, ...patch} - patch is any of points/poll_interval/topic_prefix and
+    the read options (read_multiple, read_multiple_max, subscribe_cov,
+    cov_lifetime, cov_poll_interval)."""
     connection_id = _target_id(body)
     record = await manager.update_connection(connection_id, {k: v for k, v in body.items() if k != "id"})
     if record is None:
@@ -379,7 +387,7 @@ def make_handler(
                 return
 
             if self.path == "/write":
-                self._route("api.post_write", lambda body: handle_point_write(manager, body))
+                self._route("api.post_write", lambda body: handle_point_write(manager, body, modbus_manager))
                 return
 
             if self.path == "/learn":
@@ -599,7 +607,7 @@ def _make_on_command(
         "network_status": lambda body: handle_network_status(manager, body),
         "learn": lambda body: handle_learn(manager, body),
         "modbus_discover": lambda body: handle_modbus_discover(body),
-        "point_write": lambda body: handle_point_write(manager, body),
+        "point_write": lambda body: handle_point_write(manager, body, modbus_manager),
         "list_devices": lambda body: handle_list_devices(device_registry, body),
         "set_device_status": lambda body: handle_set_device_status(device_registry, body),
         "add_device": lambda body: handle_add_device(device_registry, manager, modbus_manager, body),
@@ -704,6 +712,7 @@ def build_status(site_id: str, instance_id: str, started_at: str, manager, modbu
         "ts": _now_iso(),
         "bacnet_connections": len(manager.connections),
         "bacnet_network": _network_summary(manager),
+        "bacnet_requests": manager.read_stats(),
         "modbus_connections": len(modbus_manager.connections),
         "devices": len(devices),
         "pending_devices": sum(1 for d in devices if d.get("status") == "pending"),
@@ -797,7 +806,10 @@ async def async_main(args) -> None:
     )
     await manager.start()
 
-    modbus_manager = ModbusConnectionManager(mqtt_client, args.modbus_state_file)
+    modbus_manager = ModbusConnectionManager(
+        mqtt_client, args.modbus_state_file,
+        site_id=args.site_id, instance_id=args.instance_id if args.site_id else None,
+    )
     await modbus_manager.start()
 
     device_registry = DeviceRegistry(args.devices_state_file)

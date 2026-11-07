@@ -20,7 +20,8 @@ class FakeMqttClient:
 
 
 def _managers():
-    manager = SimpleNamespace(connections={"a": {}, "b": {}})
+    manager = SimpleNamespace(connections={"a": {}, "b": {}},
+                              read_stats=lambda: {"read_property_multiple": 4, "cov_subscriptions": 1})
     modbus_manager = SimpleNamespace(connections={"m": {}})
     registry = SimpleNamespace(list=lambda: [{"status": "pending"}, {"status": "provisioned"}, {"status": "pending"}])
     return manager, modbus_manager, registry
@@ -30,7 +31,7 @@ def test_build_status_shape():
     status = api.build_status("site-a", "inst-1", "2026-01-01T00:00:00+00:00", *_managers())
     assert set(status) == {
         "online", "site_id", "instance_id", "version", "started_at", "ts",
-        "bacnet_connections", "bacnet_network", "modbus_connections", "devices", "pending_devices",
+        "bacnet_connections", "bacnet_network", "bacnet_requests", "modbus_connections", "devices", "pending_devices",
     }
     assert status["online"] is True
     assert (status["site_id"], status["instance_id"]) == ("site-a", "inst-1")
@@ -40,6 +41,7 @@ def test_build_status_shape():
     assert (status["bacnet_connections"], status["modbus_connections"]) == (2, 1)
     assert (status["devices"], status["pending_devices"]) == (3, 2)
     assert status["bacnet_network"] == {"mode": "normal"}  # no app in this fake: a plain local link
+    assert status["bacnet_requests"] == {"read_property_multiple": 4, "cov_subscriptions": 1}
     json.dumps(status)
 
 

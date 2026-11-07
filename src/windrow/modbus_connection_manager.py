@@ -5,7 +5,10 @@ connection, same as modbus_bridge.py already does) and no learn() (Modbus
 has no self-describing object-list the way BACnet's object-list property
 does - register addresses are opaque and vendor-documented, so a human
 supplies {label: address} points at connection-creation time, same shape
-modbus_bridge.py's --points flag already produces via parse_points()).
+modbus_bridge.py's --points flag already produces via parse_points()). A
+point can also be an object naming its function code, data type, word/byte
+order, scale/offset, unit and whether it's writable - see modbus_points.py
+(Baler#128).
 
 One poll task per *connection*, not per point: modbus_bridge.poll_forever's
 loop-over-all-points-per-interval body, adapted to a configurable interval
@@ -17,20 +20,18 @@ building that would be over-parity for no requirement driving it.
 import asyncio
 import contextlib
 import json
-import os
+import time
 
 import pymodbus.client as ModbusClient
 
-from windrow import bacnet_tagger, connection_store, mqtt_sink, tracing
-from windrow.modbus_bridge import normalize_value
+from windrow import bacnet_tagger, connection_store, modbus_points, mqtt_sink, tracing
 
 tracer = tracing.get_tracer(__name__)
 
 # The same label -> Haystack markers rules the BACnet connections use: a
 # Modbus point has no object type or description, but its label carries the
 # same words ("zone_temp", "fan_status").
-_TAGGER_RULES_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "rules", "bacnet_to_haystack_tags.yaml")
-_TAGGER_RULES = bacnet_tagger.load_rules(_TAGGER_RULES_PATH)
+_TAGGER_RULES = bacnet_tagger.load_default_rules()
 
 # Longest wait between reconnect attempts to an unreachable device.
 RECONNECT_MAX = 60.0
@@ -38,19 +39,41 @@ RECONNECT_MAX = 60.0
 UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "host", "port", "device_id", "units"}
 
 
-def validate_points(points) -> dict[str, int]:
-    """{label: holding-register address}, non-empty - the same shape
-    create_connection stores and modbus_bridge.parse_points produces."""
+_READ_METHODS = {
+    "holding": "read_holding_registers",  # FC3
+    "input": "read_input_registers",  # FC4
+    "coil": "read_coils",  # FC1
+    "discrete": "read_discrete_inputs",  # FC2
+}
+
+# Haystack/BACnet priority levels; 17 is the default (relinquish-default).
+LEVELS = range(1, 18)
+
+
+class PointWriteError(ValueError):
+    """A write refused before or by the device - a 400 / ok:false, like
+    connection_manager.PointWriteError for BACnet."""
+
+
+def validate_points(points) -> dict[str, int | dict]:
+    """{label: register address or point object}, non-empty. A bare
+    address is the original holding-register form and is stored as-is;
+    modbus_points.validate_point checks the object form."""
     if not isinstance(points, dict) or not points:
-        raise ValueError("points must be a non-empty {label: register_address} object")
-    for label, address in points.items():
+        raise ValueError("points must be a non-empty {label: register_address or point object} object")
+    out: dict[str, int | dict] = {}
+    for label, spec in points.items():
         connection_store.check_text("point label", label)
-        connection_store.check_int(f"register address for {label!r}", address, 0, 65535)
-    return dict(points)
+        if "+" in label or "#" in label:
+            raise ValueError(f"point label {label!r} can't contain MQTT wildcards (+ or #)")
+        out[label] = modbus_points.validate_point(label, spec)
+    return out
 
 
 def validate_units(units, points) -> dict[str, str]:
-    """Optional {label: Haystack unit} for some of the points (Baler#82)."""
+    """Optional {label: Haystack unit} for some of the points (Baler#82).
+    A point object can carry its own `unit` instead; naming one point's
+    unit in both places is refused rather than picking a winner."""
     if units is None:
         return {}
     if not isinstance(units, dict):
@@ -60,16 +83,34 @@ def validate_units(units, points) -> dict[str, str]:
             raise ValueError(f"units names {label!r}, which is not one of the points")
         if not isinstance(unit, str) or not unit.strip():
             raise ValueError(f"unit for {label!r} must be a non-empty string")
+        if isinstance(points[label], dict) and "unit" in points[label]:
+            raise ValueError(f"{label!r} has a unit on the point itself; don't also name it in units")
     return {label: unit.strip() for label, unit in units.items()}
 
 
+def _effective(levels: dict[str, object]):
+    """(level, value) of the highest-priority (lowest-numbered) level set."""
+    if not levels:
+        return None, None
+    level = min(levels, key=int)
+    return int(level), levels[level]
+
+
 class ModbusConnectionManager:
-    def __init__(self, mqtt_client, state_file: str):
+    def __init__(self, mqtt_client, state_file: str, site_id: str | None = None, instance_id: str | None = None):
         self.mqtt_client = mqtt_client
         self.state_file = state_file
         self.connections: dict[str, dict] = {}
         self.clients: dict[str, ModbusClient.AsyncModbusTcpClient] = {}
         self.tasks: dict[str, asyncio.Task] = {}
+        # One request at a time per device: a write mustn't interleave
+        # with the poll loop's reads on the same client.
+        self.locks: dict[str, asyncio.Lock] = {}
+        # Advertised on the equipment record as windrowSite/windrowInstance
+        # when the command channel is on, so Baler can route point writes
+        # here - same as ConnectionManager does for BACnet.
+        self.site_id = site_id
+        self.instance_id = instance_id
 
     async def start(self) -> None:
         with tracer.start_as_current_span("modbus_connection_manager.start") as span:
@@ -86,7 +127,7 @@ class ModbusConnectionManager:
         self,
         host: str,
         topic_prefix: str,
-        points: dict[str, int],
+        points: dict[str, int | dict],
         port: int = 502,
         device_id: int = 1,
         poll_interval: float = 5.0,
@@ -94,6 +135,7 @@ class ModbusConnectionManager:
         units: dict[str, str] | None = None,
     ) -> dict:
         with tracer.start_as_current_span("modbus_connection_manager.create_connection") as span:
+            points = validate_points(points)
             units = validate_units(units, points)
             record = {
                 "id": connection_store.new_connection_id(),
@@ -122,16 +164,25 @@ class ModbusConnectionManager:
         made the points but no equipment, so they never appeared in its
         equipment tree. Equipment identity is the topic_prefix, as for
         BACnet. A point's markers come from its label; its `unit` from the
-        connection's optional units map (a register is just a number)."""
+        point object or the connection's units map (a register is just a
+        number); `writable` from the point object (Baler#128) - Baler only
+        accepts a pointWrite to a point tagged writable, and routes it by
+        the equipment's windrowSite/windrowInstance."""
         with tracer.start_as_current_span("modbus_connection_manager.publish_tags") as span:
             prefix = record["topic_prefix"]
             units = record.get("units") or {}
-            for label in record["points"]:
+            for label, spec in record["points"].items():
+                point = modbus_points.resolve(spec)
                 tags: dict = dict(bacnet_tagger.tag_point({"label": label}, _TAGGER_RULES))
-                if units.get(label):
-                    tags["unit"] = units[label]
+                if point["writable"]:
+                    tags["writable"] = True
+                    tags.pop("sensor", None)  # Haystack: a commanded point isn't a sensor
+                unit = point.get("unit") or units.get(label)
+                if unit:
+                    tags["unit"] = unit
                 mqtt_sink.publish_reading(self.mqtt_client, prefix, f"{label}/tags", json.dumps(tags))
-            equip = {"tags": {}, "points": list(record["points"])}
+            equip_tags = {"windrowSite": self.site_id, "windrowInstance": self.instance_id} if self.site_id else {}
+            equip = {"tags": equip_tags, "points": list(record["points"])}
             mqtt_sink.publish_reading(self.mqtt_client, prefix, "equip/tags", json.dumps(equip))
             span.set_attribute("point_count", len(record["points"]))
 
@@ -185,13 +236,17 @@ class ModbusConnectionManager:
                 # A patch's units replace the map; otherwise keep the units
                 # of the points that survived a points edit.
                 units = patch["units"] if "units" in patch else {
-                    label: unit for label, unit in (old.get("units") or {}).items() if label in record["points"]
+                    label: unit for label, unit in (old.get("units") or {}).items()
+                    if label in record["points"]
+                    and not (isinstance(record["points"][label], dict) and "unit" in record["points"][label])
                 }
                 units = validate_units(units, record["points"])
                 if units:
                     record["units"] = units
                 else:
                     record.pop("units", None)
+            if "points" in patch or "topic_prefix" in patch:
+                self._prune_write_levels(record)
 
             task = self.tasks.pop(connection_id, None)
             if task is not None:
@@ -219,6 +274,135 @@ class ModbusConnectionManager:
             span.set_attribute("found", True)
             span.set_attribute("cleared_count", len(removed))
             return record
+
+    @staticmethod
+    def _prune_write_levels(record: dict) -> None:
+        """Commanded levels (see write_point) survive an edit only for
+        points that still exist, are still writable and still publish on
+        the same topic - otherwise nothing could ever relinquish them."""
+        levels = record.get("write_levels") or {}
+        kept = {
+            label: lv for label, lv in levels.items()
+            if label in record["points"] and modbus_points.resolve(record["points"][label])["writable"]
+        }
+        if kept:
+            record["write_levels"] = kept
+        else:
+            record.pop("write_levels", None)
+
+    def _find_point(self, topic: str) -> tuple[dict, str]:
+        for record in self.connections.values():
+            prefix = record["topic_prefix"].rstrip("/") + "/"
+            if topic.startswith(prefix) and topic[len(prefix):] in record["points"]:
+                return record, topic[len(prefix):]
+        raise PointWriteError(f"no Modbus point publishes {topic!r}")
+
+    def owns(self, topic) -> bool:
+        """Whether `topic` is one of this manager's points - api.py's
+        point_write sends it here instead of to the BACnet manager."""
+        try:
+            self._find_point(topic)
+        except PointWriteError:
+            return False
+        return True
+
+    def _lock(self, connection_id: str) -> asyncio.Lock:
+        return self.locks.setdefault(connection_id, asyncio.Lock())
+
+    async def write_point(self, topic: str, value, priority: int, expires_at: float | None = None) -> dict:
+        """Command a writable holding register or coil (Baler#128), on the
+        same command shape and expiry rule as BACnet's write_point.
+
+        Modbus has no priority array, so this keeps one per point (persisted
+        on the connection as `write_levels`) and writes the highest-priority
+        level's value to the device - the same thing a BACnet controller
+        does with its own array. A null value relinquishes that level and
+        the next one down is written; with every level relinquished nothing
+        is written and the register keeps its last value (there's no
+        relinquish-default on the device; level 17 plays that role when
+        set). The value is read back and published straight away."""
+        with tracer.start_as_current_span("modbus_connection_manager.write_point") as span:
+            span.set_attribute("topic", topic)
+            span.set_attribute("priority", str(priority))
+            if expires_at is not None and time.time() > expires_at:
+                raise PointWriteError("command expired before it reached the site; not applied")
+            if not isinstance(priority, int) or isinstance(priority, bool) or priority not in LEVELS:
+                raise PointWriteError(f"priority must be 1-17, got {priority!r}")
+            if priority == 17 and value is None:
+                raise PointWriteError("level 17 (default) can be set but not relinquished")
+            record, label = self._find_point(topic)
+            point = modbus_points.resolve(record["points"][label])
+            if not point["writable"]:
+                raise PointWriteError(f"{topic} isn't writable (its point needs \"writable\": true)")
+            if value is not None:
+                try:
+                    modbus_points.encode(point, value)
+                except ValueError as exc:
+                    raise PointWriteError(f"{topic}: {exc}") from exc
+
+            levels = dict((record.get("write_levels") or {}).get(label, {}))
+            if value is None:
+                levels.pop(str(priority), None)
+            else:
+                levels[str(priority)] = value
+            level, effective = _effective(levels)
+
+            async with self._lock(record["id"]):
+                client = self.clients.get(record["id"])
+                if client is None or not client.connected:
+                    raise PointWriteError(f"Modbus device {record['host']}:{record['port']} isn't connected right now")
+                try:
+                    if effective is not None:
+                        await self._write(client, record, point, modbus_points.encode(point, effective))
+                    present = await self._read(client, record, point)
+                except PointWriteError:
+                    raise
+                except Exception as exc:  # a lost session raises many types
+                    raise PointWriteError(f"Modbus write to {topic} failed: {exc!r}") from exc
+
+            # Only a write the device accepted changes the recorded array -
+            # on the connection as it is now, in case an edit replaced it.
+            record = self.connections.get(record["id"], record)
+            write_levels = dict(record.get("write_levels") or {})
+            if levels:
+                write_levels[label] = levels
+            else:
+                write_levels.pop(label, None)
+            if write_levels:
+                record["write_levels"] = write_levels
+            else:
+                record.pop("write_levels", None)
+            self._save()
+            if present is not None:
+                mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], label, present)
+            span.set_attribute("effective_level", str(level))
+            return {"topic": topic, "priority": priority, "value": value, "present_value": present,
+                    "effective_level": level}
+
+    async def _write(self, client, record: dict, point: dict, encoded) -> None:
+        device_id = record["device_id"]
+        if point["function"] == "coil":
+            rr = await client.write_coil(point["register"], encoded, device_id=device_id)
+        elif len(encoded) == 1:
+            rr = await client.write_register(point["register"], encoded[0], device_id=device_id)
+        else:
+            rr = await client.write_registers(point["register"], encoded, device_id=device_id)
+        if rr.isError():
+            raise PointWriteError(f"device refused the write: {rr}")
+
+    async def _read(self, client, record: dict, point: dict):
+        """One point's decoded value, or None if the device answered with
+        an exception code. Raises if the session itself failed."""
+        read = getattr(client, _READ_METHODS[point["function"]])
+        rr = await read(point["register"], count=point["count"], device_id=record["device_id"])
+        if rr.isError():
+            print(f"modbus read error for {point['function']}@{point['register']}: {rr}")
+            return None
+        words = rr.bits if point["function"] in modbus_points.BIT_FUNCTIONS else rr.registers
+        if len(words) < point["count"]:
+            print(f"modbus read short for {point['function']}@{point['register']}: {rr}")
+            return None
+        return modbus_points.decode(point, words)
 
     async def list_connections(self) -> list[dict]:
         with tracer.start_as_current_span("modbus_connection_manager.list_connections") as span:
@@ -332,17 +516,18 @@ class ModbusConnectionManager:
                 down_since, attempts, backoff = None, 0, record["poll_interval"]
 
             raised = 0
-            for label, address in record["points"].items():
-                try:
-                    rr = await client.read_holding_registers(address, count=1, device_id=record["device_id"])
-                except Exception as exc:  # noqa: BLE001 - a lost session raises many types; all mean reconnect
-                    raised += 1
-                    print(f"modbus read failed for {label}@{address}: {exc!r}")
-                    continue
-                if rr.isError():  # the device answered with an exception code: the session is fine
-                    print(f"modbus read error for {label}@{address}: {rr}")
-                    continue
-                mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], label, normalize_value(rr.registers))
+            async with self._lock(record["id"]):
+                for label, spec in record["points"].items():
+                    point = modbus_points.resolve(spec)
+                    try:
+                        value = await self._read(client, record, point)
+                    except Exception as exc:  # noqa: BLE001 - a lost session raises many types; all mean reconnect
+                        raised += 1
+                        print(f"modbus read failed for {label}@{point['register']}: {exc!r}")
+                        continue
+                    if value is None:  # an exception code (or NaN): the session is fine, publish nothing
+                        continue
+                    mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], label, value)
             if record["points"] and raised == len(record["points"]):
                 client.close()  # every read raised: next cycle reconnects
             await asyncio.sleep(record["poll_interval"])

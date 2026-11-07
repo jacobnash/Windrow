@@ -60,6 +60,12 @@ def _make_object(spec: dict):
         return BinaryValueObjectCmd(**kwargs)
     if spec.get("units"):
         kwargs["units"] = spec["units"]
+    # COV (Baler#127): bacpypes3's analog COV detection compares against
+    # covIncrement, and without one every presentValue change after a
+    # SubscribeCOV raises inside the object - a write answers
+    # operational-problem and the simulation task dies. Real controllers
+    # ship a default increment too.
+    kwargs["covIncrement"] = spec.get("cov_increment", 0.1)
     return AnalogValueObjectCmd(**kwargs)
 
 
