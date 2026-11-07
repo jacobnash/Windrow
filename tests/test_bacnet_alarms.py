@@ -311,3 +311,35 @@ def test_forward_alarms_is_validated():
     assert cm.validate_read_options({"forward_alarms": True}) == {"forward_alarms": True}
     with pytest.raises(ValueError):
         cm.validate_read_options({"forward_alarms": "yes"})
+
+
+def test_moving_a_forward_alarms_connection_unregisters_at_the_old_address(tmp_path, monkeypatch):
+    removed = []
+
+    async def classes(app, address, instance):
+        return ["notification-class,1"]
+
+    async def remove(app, address, nc):
+        removed.append(address)
+        return True
+
+    async def idle(*a, **k):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(cm.bacnet_alarms, "notification_classes", classes)
+    monkeypatch.setattr(cm.bacnet_alarms, "remove_recipient", remove)
+    monkeypatch.setattr(cm.ConnectionManager, "_keep_alarms", idle)
+    monkeypatch.setattr(cm.ConnectionManager, "_poll_point", idle)
+
+    async def run():
+        manager = cm.ConnectionManager(None, CapturingMqtt(), str(tmp_path / "c.json"))
+        a = await manager.create_connection("10.0.0.5", 5, "fbf/a", RECORD["points"], read_options={"forward_alarms": True})
+        await manager.update_connection(a["id"], {"device_address": "10.0.0.50"})
+        await asyncio.sleep(0.05)
+        await manager.update_connection(a["id"], {"poll_interval": 9})  # same address: nothing to remove
+        await asyncio.sleep(0.05)
+        await manager.delete_connection(a["id"])
+        await asyncio.sleep(0.05)
+
+    asyncio.run(run())
+    assert removed == ["10.0.0.5", "10.0.0.50"]
