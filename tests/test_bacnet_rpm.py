@@ -479,3 +479,45 @@ def test_create_and_update_store_read_options_and_cap_the_batch(tmp_path, monkey
         await manager.delete_connection(record["id"])
 
     asyncio.run(run())
+
+
+# --- bacpypes3 raises Error/Reject/Abort, as BaseExceptions ---
+
+
+class Raising(RpmApp):
+    """What bacpypes3 really does: app.request raises the Error/Reject/Abort
+    (which derive from BaseException, not Exception) instead of returning it."""
+
+    async def request(self, req):
+        self.requests.append(req)
+        raise self.answer(req)
+
+
+def test_a_raised_reject_still_means_no_rpm():
+    with pytest.raises(RPMUnsupported):
+        _rpm(Raising(lambda req: RejectPDU(reason="unrecognizedService")), ["analog-value,1", "analog-value,2"])
+
+
+def test_a_raised_error_on_a_single_read_is_returned_as_a_failed_read():
+    from windrow.bacnet_read import read_present_value
+
+    app = Raising(lambda req: Error(service_choice=ConfirmedServiceChoice.readProperty, errorClass="object",
+                                    errorCode="unknownObject"))
+    answer = asyncio.run(read_present_value(app, "10.0.0.5", "analog-value,99"))
+    assert isinstance(answer, Error)
+
+
+def test_a_raised_cov_refusal_is_cov_unsupported():
+    class RaisingCov(CovApp):
+        def request(self, req):
+            future = asyncio.get_event_loop().create_future()
+            future.set_exception(Error(service_choice=ConfirmedServiceChoice.subscribeCOV, errorClass="object",
+                                       errorCode="optionalFunctionalityNotSupported"))
+            return future
+
+    async def run():
+        sub = bacnet_cov.Subscription(RaisingCov(), "10.0.0.5", "analog-value,1", lambda v: None)
+        with pytest.raises(bacnet_cov.CovUnsupported):
+            await sub.subscribe(60)
+
+    asyncio.run(run())

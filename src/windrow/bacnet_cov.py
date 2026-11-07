@@ -24,7 +24,7 @@ import random
 from collections.abc import Callable
 from typing import Any
 
-from windrow.bacnet_read import READ_TIMEOUT, cast_value, enum_name
+from windrow.bacnet_read import READ_TIMEOUT, cast_value, enum_name, request
 
 # Subscriber process ids are per subscriber, 22 bits. Start somewhere random
 # so a restart doesn't reuse the last run's ids while the device still holds
@@ -81,14 +81,13 @@ class Subscription:
         if not self._registered:
             self.app._cov_contexts[(self._address, self.process_id)] = self
             self._registered = True
-        request = SubscribeCOVRequest(
+        response = await request(self.app, SubscribeCOVRequest(
             subscriberProcessIdentifier=self.process_id,
             monitoredObjectIdentifier=self._objid,
             issueConfirmedNotifications=confirmed,
             lifetime=int(lifetime),
             destination=self._address,
-        )
-        response = await asyncio.wait_for(self.app.request(request), READ_TIMEOUT if timeout is None else timeout)
+        ), READ_TIMEOUT if timeout is None else timeout)
         if isinstance(response, SimpleAckPDU):
             return
         if isinstance(response, Error) and enum_name(response.errorCode) in _UNSUPPORTED_CODES:
@@ -124,10 +123,9 @@ class Subscription:
     async def _cancel(self) -> None:
         from bacpypes3.apdu import SubscribeCOVRequest
 
-        request = SubscribeCOVRequest(
-            subscriberProcessIdentifier=self.process_id,
-            monitoredObjectIdentifier=self._objid,
-            destination=self._address,
-        )
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(self.app.request(request), READ_TIMEOUT)
+            await request(self.app, SubscribeCOVRequest(
+                subscriberProcessIdentifier=self.process_id,
+                monitoredObjectIdentifier=self._objid,
+                destination=self._address,
+            ))

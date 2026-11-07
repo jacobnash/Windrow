@@ -46,6 +46,20 @@ from typing import Any
 READ_TIMEOUT = float(os.environ.get("WINDROW_READ_TIMEOUT", "10"))
 
 
+async def request(app, apdu, timeout: float | None = None):
+    """app.request(apdu), bounded, with an Error/Reject/Abort answer
+    returned rather than raised. bacpypes3 raises those, and they derive
+    from BaseException, not Exception: a caller's `except Exception` lets
+    them through, which ended a point's poll task on the first
+    unknown-object answer instead of counting a failed read."""
+    from bacpypes3.apdu import ErrorRejectAbortNack
+
+    try:
+        return await asyncio.wait_for(app.request(apdu), READ_TIMEOUT if timeout is None else timeout)
+    except ErrorRejectAbortNack as answer:
+        return answer
+
+
 class MismatchedResponse(RuntimeError):
     """The device answered, but for a different object or property."""
 
@@ -99,9 +113,8 @@ async def read_present_value(app, address, objid, prop: str = "present-value", t
     prop_ref = await app.parse_property_reference(prop, vendor_info=vendor_info)
     prop_id = prop_ref.propertyIdentifier
 
-    response = await asyncio.wait_for(
-        app.request(ReadPropertyRequest(objectIdentifier=objid, propertyIdentifier=prop_id, destination=address)),
-        READ_TIMEOUT if timeout is None else timeout,
+    response = await request(
+        app, ReadPropertyRequest(objectIdentifier=objid, propertyIdentifier=prop_id, destination=address), timeout
     )
     if isinstance(response, ErrorRejectAbortNack):
         return response  # same as read_property: the caller's normalize/handling decides
@@ -155,10 +168,10 @@ async def read_present_values(
             listOfPropertyReferences=[PropertyReference(propertyIdentifier=prop_id)],
         ))
 
-    request = ReadPropertyMultipleRequest(
-        listOfReadAccessSpecs=SequenceOf(ReadAccessSpecification)(specs), destination=address
+    response = await request(
+        app, ReadPropertyMultipleRequest(listOfReadAccessSpecs=SequenceOf(ReadAccessSpecification)(specs), destination=address),
+        timeout,
     )
-    response = await asyncio.wait_for(app.request(request), READ_TIMEOUT if timeout is None else timeout)
 
     if isinstance(response, RejectPDU) and enum_name(response.apduAbortRejectReason) == "unrecognizedservice":
         raise RPMUnsupported(f"{address} rejected ReadPropertyMultiple: {response.apduAbortRejectReason}")

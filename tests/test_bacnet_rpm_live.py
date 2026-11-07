@@ -149,6 +149,37 @@ def test_a_cov_point_publishes_a_change_within_a_second(mock_site, tmp_path):
 
 
 @pytest.mark.integration
+def test_a_point_the_device_doesnt_have_fails_alone(mock_site, tmp_path):
+    """bacpypes3 raises an unknown-object Error as a BaseException; it used
+    to end that point's poll task. Now it's a failed read, and its
+    siblings in the same RPM still publish."""
+    address, _ = mock_site
+
+    async def run():
+        app = _client_app()
+        mqtt = CapturingMqtt()
+        manager = ConnectionManager(app, mqtt, str(tmp_path / "c.json"))
+        try:
+            await asyncio.sleep(0.5)
+            await manager.create_connection(address, 3456, "fbf/bad", [
+                {"object_identifier": "analog-value,1", "label": "good-1"},
+                {"object_identifier": "analog-value,2", "label": "good-2"},
+                {"object_identifier": "analog-value,99999", "label": "missing"},
+            ], poll_interval=0.5)
+            await asyncio.sleep(3)
+            topics = {topic for _, topic, _ in mqtt.published}
+            assert {"fbf/bad/good-1", "fbf/bad/good-2"} <= topics
+            assert "fbf/bad/missing" not in topics
+            assert not any(t.done() for t in manager.tasks.values())
+        finally:
+            for record in list(manager.connections):
+                await manager.delete_connection(record)
+            app.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.integration
 def test_batched_polling_survives_a_device_restart(tmp_path, monkeypatch):
     """Baler#84 with RPM on: kill the device mid-poll, publish nothing while
     it's gone, resume on its own when it's back on the same address."""
