@@ -29,6 +29,7 @@ import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from bacpypes3.apdu import ErrorRejectAbortNack
 from bacpypes3.argparse import SimpleArgumentParser
 
 from windrow import (
@@ -408,6 +409,12 @@ def make_handler(
                 except Exception as exc:
                     span.set_attribute("error", str(exc))
                     self._respond_json(500, {"error": str(exc)})
+                except ErrorRejectAbortNack as exc:
+                    # A device's Error/Reject/Abort that a handler let through
+                    # (bacpypes3 raises them, as BaseExceptions): still an
+                    # answer to the client, not a dropped connection.
+                    span.set_attribute("error", str(exc))
+                    self._respond_json(502, {"error": f"the device answered: {exc}"})
 
         def _route(self, span_name: str, handler, status: int = 200, body: dict | None = None, count: bool = False):
             """The common shape: run one handle_* coroutine on the loop and
@@ -807,6 +814,11 @@ def _make_on_command(
                 except Exception as exc:  # noqa: BLE001 - one bad command must not crash the mqtt loop thread
                     span.set_attribute("error", str(exc))
                     outcome = {"ok": False, "error": str(exc) if not isinstance(exc, KeyError) else f"missing {exc}"}
+                except ErrorRejectAbortNack as exc:
+                    # bacpypes3's Error/Reject/Abort are BaseExceptions: past
+                    # `except Exception` they'd escape into paho's network thread
+                    span.set_attribute("error", str(exc))
+                    outcome = {"ok": False, "error": f"the device answered: {exc}"}
             outcome["action"] = action
             if legacy_id is not None:
                 outcome["id"] = legacy_id

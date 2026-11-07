@@ -198,7 +198,10 @@ paths:
                 expires_at: { type: number, description: "Unix seconds; refused if already past." }
       responses:
         "200":
-          description: Written; includes the read-back present value.
+          description: >-
+            Written; includes the read-back present value. `present_value` is
+            null when the write succeeded but the read-back didn't (the next
+            poll reports it).
           content:
             application/json:
               schema:
@@ -212,9 +215,15 @@ paths:
                     type: [integer, "null"]
                     description: Modbus only - the level whose value is now on the device, or null if every level is relinquished.
         "400":
-          description: Unknown point, not commandable/writable, bad priority/value, expired, or the Modbus device isn't connected or refused the write.
+          description: >-
+            Unknown point, not commandable/writable, bad priority/value,
+            expired, the Modbus device isn't connected or refused the write,
+            or the BACnet device refused it (the error says why, e.g.
+            `property: write-access-denied`).
+        "502":
+          description: The device answered with an error the handler didn't expect (any endpoint can return this).
         "504":
-          description: The device didn't answer.
+          description: The device didn't answer (WINDROW_WRITE_TIMEOUT, default 10 s, for a BACnet write).
   /schedules:
     post:
       operationId: readSchedules
