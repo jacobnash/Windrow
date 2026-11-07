@@ -21,6 +21,7 @@ import contextlib
 import datetime
 import hmac
 import importlib.metadata
+import ipaddress
 import json
 import os
 import signal
@@ -31,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
-from windrow import credentials, legacy, modbus_discovery, mqtt_sink, tracing
+from windrow import announce, credentials, legacy, modbus_discovery, mqtt_sink, tracing
 from windrow.connection_manager import ConnectionManager
 from windrow.device_registry import DeviceRegistry
 from windrow.modbus_connection_manager import ModbusConnectionManager
@@ -117,6 +118,7 @@ async def handle_create_connection(manager: ConnectionManager, body: dict) -> di
         points=body["points"],
         poll_interval=body.get("poll_interval", 5.0),
         credential=credential,
+        device_name=body.get("device_name"),
     )
     return _redact(record)
 
@@ -155,6 +157,7 @@ async def handle_modbus_create_connection(modbus_manager: ModbusConnectionManage
         poll_interval=body.get("poll_interval", 5.0),
         credential=credential,
         units=body.get("units"),
+        device_name=body.get("device_name"),
     )
     return _redact(record)
 
@@ -252,6 +255,7 @@ def make_handler(
     modbus_manager: ModbusConnectionManager,
     device_registry: DeviceRegistry,
     loop: asyncio.AbstractEventLoop,
+    announce_registry: "announce.AnnounceRegistry | None" = None,
 ):
     gateway_secret = os.environ.get("WINDROW_GATEWAY_SECRET") or None
     cors_origin = os.environ.get("WINDROW_CORS_ORIGIN") or None
@@ -463,6 +467,12 @@ def make_handler(
                 self._route("api.get_devices", lambda _: handle_list_devices(device_registry), body={}, count=True)
                 return
 
+            if self.path == "/announced":
+                async def _announced(_):
+                    return announce_registry.list() if announce_registry else []
+                self._route("api.get_announced", _announced, body={}, count=True)
+                return
+
             if self.path == "/openapi.yaml":
                 with tracer.start_as_current_span("api.get_openapi_spec"):
                     with open(OPENAPI_SPEC_PATH, "rb") as f:
@@ -655,9 +665,11 @@ def offline_payload(site_id: str, instance_id: str) -> str:
     return json.dumps({"online": False, "site_id": site_id, "instance_id": instance_id})
 
 
-def build_status(site_id: str, instance_id: str, started_at: str, manager, modbus_manager, device_registry) -> dict:
+def build_status(site_id: str, instance_id: str, started_at: str, manager, modbus_manager, device_registry,
+                 announce_registry=None) -> dict:
     devices = device_registry.list()
-    return {
+    extra = announce_registry.summary() if announce_registry else {}
+    return {**extra,
         "online": True,
         "site_id": site_id,
         "instance_id": instance_id,
@@ -759,6 +771,21 @@ async def async_main(args) -> None:
     device_registry = DeviceRegistry(args.devices_state_file)
     await device_registry.start()
 
+    # Device announce (windrow.announce): devices say "I am here" over UDP,
+    # and connections that name them (device_name) follow their address.
+    # DNS names are followed too, whether or not the listener is on.
+    announce_registry = announce.AnnounceRegistry(
+        args.announce_state_file, interval=args.announce_interval,
+        allow=[ipaddress.ip_network(c, strict=False) for c in args.announce_allow or []],
+        key=os.environ.get("WINDROW_ANNOUNCE_KEY") or None,
+    )
+    announce_registry.load()
+    if args.announce_port:
+        await announce.start_listener(announce_registry, manager, modbus_manager, args.announce_host, args.announce_port,
+                                      on_change=lambda: loop.call_soon_threadsafe(heartbeat_wake.set))
+    resolver_task = loop.create_task(announce.run_resolver(announce_registry, manager, modbus_manager, args.resolve_interval))
+    resolver_task.add_done_callback(_crash_logger("device name resolver"))
+
     if command_topic:
         mqtt_client.message_callback_add(
             command_topic,
@@ -768,7 +795,8 @@ async def async_main(args) -> None:
         heartbeat_task = loop.create_task(run_status_heartbeat(
             mqtt_client,
             status_topic(args.site_id, args.instance_id),
-            lambda: build_status(args.site_id, args.instance_id, started_at, manager, modbus_manager, device_registry),
+            lambda: build_status(args.site_id, args.instance_id, started_at, manager, modbus_manager, device_registry,
+                                 announce_registry),
             heartbeat_wake,
         ))
         heartbeat_task.add_done_callback(_crash_logger("status heartbeat"))
@@ -785,7 +813,7 @@ async def async_main(args) -> None:
         modbus_scan_task.add_done_callback(_crash_logger(f"modbus periodic scan ({cidr})"))
 
     server = ThreadingHTTPServer(
-        (args.host, args.port), make_handler(manager, modbus_manager, device_registry, loop)
+        (args.host, args.port), make_handler(manager, modbus_manager, device_registry, loop, announce_registry)
     )
     server.daemon_threads = True  # unset default is False - a hung request would otherwise block shutdown
 
@@ -845,6 +873,21 @@ def main() -> None:
         "No default - periodic Modbus scanning only runs against subnets an operator explicitly configures.",
     )
     parser.add_argument("--modbus-scan-interval", type=float, default=600.0)
+    parser.add_argument(
+        "--announce-port", type=int, default=int(os.environ.get("WINDROW_ANNOUNCE_PORT", "0")),
+        help=f"UDP port to hear device announcements on (windrow.announce; {announce.DEFAULT_PORT} by convention). 0 = off",
+    )
+    parser.add_argument("--announce-host", default="0.0.0.0")
+    parser.add_argument(
+        "--announce-allow", action="append", default=None,
+        help="Source subnet allowed to announce, e.g. 192.168.1.0/24. Repeatable. Unset: any source "
+        "(set WINDROW_ANNOUNCE_KEY to require signed announcements).",
+    )
+    parser.add_argument("--announce-interval", type=float, default=30.0,
+                        help="the senders' interval; a device is offline after missing 3")
+    parser.add_argument("--announce-state-file", default="windrow-announced.json")
+    parser.add_argument("--resolve-interval", type=float, default=300.0,
+                        help="seconds between re-resolving connections' device_name by announcement or DNS")
     args = parser.parse_args()
     for attr in ("state_file", "modbus_state_file", "devices_state_file"):
         legacy.adopt_state_file(getattr(args, attr))

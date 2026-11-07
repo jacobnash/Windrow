@@ -98,7 +98,7 @@ POINT_FIELDS = {
     "object_identifier", "label", "units", "description", "poll_interval",
     "his_collect_cov", "his_collect_cov_rate_limit", "his_collect_interval",
 }
-UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix"}
+UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "device_address", "device_name"}
 
 
 def validate_points(points) -> list[dict]:
@@ -230,8 +230,10 @@ class ConnectionManager:
         points: list[dict],
         poll_interval: float = 5.0,
         credential: dict | None = None,
+        device_name: str | None = None,
     ) -> dict:
         with tracer.start_as_current_span("connection_manager.create_connection") as span:
+            device_name = connection_store.check_device_name(device_name)
             record = {
                 "id": connection_store.new_connection_id(),
                 "device_address": device_address,
@@ -241,6 +243,8 @@ class ConnectionManager:
                 "points": points,
                 "credential": credential,
             }
+            if device_name:
+                record["device_name"] = device_name
             self.connections[record["id"]] = record
             self._save()
             self._tag_points(topic_prefix, points)
@@ -386,6 +390,13 @@ class ConnectionManager:
                 record["poll_interval"] = connection_store.check_number("poll_interval", patch["poll_interval"])
             if "topic_prefix" in patch:
                 record["topic_prefix"] = connection_store.check_topic_prefix(patch["topic_prefix"])
+            if "device_address" in patch:
+                record["device_address"] = connection_store.check_text("device_address", patch["device_address"]).strip()
+            if "device_name" in patch:
+                name = connection_store.check_device_name(patch["device_name"])
+                record.pop("device_name", None)
+                if name:
+                    record["device_name"] = name
 
             await stop_task(self.tasks.pop(connection_id, None))
             self.connections[connection_id] = record

@@ -648,6 +648,27 @@ paths:
           description: No device with that id.
         "500":
           $ref: "#/components/responses/ServerError"
+  /announced:
+    get:
+      operationId: listAnnounced
+      summary: Devices that announced themselves ("I am here")
+      description: >-
+        Filled by `python -m windrow.announce` senders on the LAN, when this
+        Windrow listens (`--announce-port`). A device's address is the
+        datagram's source IP. `online` is false after 3 missed intervals.
+        `history` lists address changes; connections whose `device_name`
+        matches were re-pointed.
+      responses:
+        "200":
+          description: Every device ever announced.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AnnouncedDevice"
+        "500":
+          $ref: "#/components/responses/ServerError"
   /openapi.yaml:
     get:
       operationId: getOpenApiSpec
@@ -770,6 +791,15 @@ components:
       type: object
       required: [device_address, device_instance, topic_prefix, points]
       properties:
+        device_name:
+          type: string
+          nullable: true
+          description: >-
+            Name of the device this connection polls - what it announces
+            itself as (windrow.announce), or a DNS host name. When set,
+            Windrow re-points the connection's address when the device
+            announces (or resolves to) a new one. Empty clears it.
+          example: bacnet
         device_address:
           type: string
           example: "192.168.128.63:47808"
@@ -886,6 +916,15 @@ components:
       type: object
       required: [host, topic_prefix, points]
       properties:
+        device_name:
+          type: string
+          nullable: true
+          description: >-
+            Name of the device this connection polls - what it announces
+            itself as (windrow.announce), or a DNS host name. When set,
+            Windrow re-points the connection's address when the device
+            announces (or resolves to) a new one. Empty clears it.
+          example: bacnet
         host:
           type: string
           example: "192.168.1.50"
@@ -931,6 +970,19 @@ components:
       minProperties: 1
       additionalProperties: false
       properties:
+        device_name:
+          type: string
+          nullable: true
+          description: >-
+            Name of the device this connection polls - what it announces
+            itself as (windrow.announce), or a DNS host name. When set,
+            Windrow re-points the connection's address when the device
+            announces (or resolves to) a new one. Empty clears it.
+          example: bacnet
+        device_address:
+          type: string
+          description: Re-point the connection (also done automatically for a named device that moves).
+          example: "192.168.128.63:47808"
         points:
           type: array
           minItems: 1
@@ -948,6 +1000,15 @@ components:
       minProperties: 1
       additionalProperties: false
       properties:
+        device_name:
+          type: string
+          nullable: true
+          description: >-
+            Name of the device this connection polls - what it announces
+            itself as (windrow.announce), or a DNS host name. When set,
+            Windrow re-points the connection's address when the device
+            announces (or resolves to) a new one. Empty clears it.
+          example: bacnet
         points:
           $ref: "#/components/schemas/ModbusPoints"
         poll_interval:
@@ -1068,6 +1129,52 @@ components:
               description: Unix epoch seconds.
         default_credential_checked_at:
           type: ["number", "null"]
+    AnnouncedDevice:
+      type: object
+      properties:
+        name:
+          type: string
+          example: bacnet
+        address:
+          type: string
+          example: 192.168.128.228
+        fqdn:
+          type: string
+          nullable: true
+        services:
+          type: array
+          items:
+            type: object
+            properties:
+              kind:
+                type: string
+                enum: [bacnet, modbus, other]
+              port:
+                type: integer
+              instance:
+                type: integer
+              unit:
+                type: integer
+        online:
+          type: boolean
+        last_seen:
+          type: string
+          format: date-time
+        first_seen:
+          type: string
+          format: date-time
+          nullable: true
+        history:
+          type: array
+          items:
+            type: object
+            properties:
+              at:
+                type: string
+              from:
+                type: string
+              to:
+                type: string
     Error:
       type: object
       required: [error]
