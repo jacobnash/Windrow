@@ -29,11 +29,11 @@ import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from bacpypes3.app import Application
 from bacpypes3.argparse import SimpleArgumentParser
 
 from windrow import (
     announce,
+    bacnet_alarms,
     bacnet_network,
     connection_store,
     credentials,
@@ -186,12 +186,20 @@ async def handle_create_connection(manager: ConnectionManager, body: dict) -> di
 async def handle_update_connection(manager: ConnectionManager, body: dict) -> dict:
     """{id, ...patch} - patch is any of points/poll_interval/topic_prefix and
     the read options (read_multiple, read_multiple_max, subscribe_cov,
-    cov_lifetime, cov_poll_interval)."""
+    cov_lifetime, cov_poll_interval, forward_alarms)."""
     connection_id = _target_id(body)
     record = await manager.update_connection(connection_id, {k: v for k, v in body.items() if k != "id"})
     if record is None:
         raise NotFound("no connection with that id")
     return _redact(record)
+
+
+async def handle_connection_alarms(manager: ConnectionManager, body: dict) -> list:
+    """{id} -> the device's active alarms, read now (GetEventInformation)."""
+    events = await manager.active_alarms(_target_id(body))
+    if events is None:
+        raise NotFound("no connection with that id")
+    return events
 
 
 async def handle_delete_connection(manager: ConnectionManager, body: dict) -> dict:
@@ -568,6 +576,12 @@ def make_handler(
                 self._route("api.get_jobs", lambda _: handle_list_jobs(jobs), body={}, count=True)
                 return
 
+            connection_id = self._path_id("/connections/", "/alarms")
+            if connection_id is not None:
+                self._route("api.get_connection_alarms", lambda body: handle_connection_alarms(manager, body),
+                            body={"id": connection_id})
+                return
+
             job_id = self._path_id("/jobs/")
             if job_id is not None:
                 self._route("api.get_job", lambda body: handle_get_job(jobs, body), body={"id": job_id})
@@ -661,7 +675,7 @@ def make_handler(
 # the result like any other command's `id`.
 TARGETED_ACTIONS = {
     "set_device_status", "recheck_credentials", "update_connection", "delete_connection",
-    "modbus_update_connection", "modbus_delete_connection", "set_credential", "get_job",
+    "modbus_update_connection", "modbus_delete_connection", "set_credential", "get_job", "connection_alarms",
 }
 
 
@@ -719,6 +733,7 @@ def _make_on_command(
         "add_device": lambda body: handle_add_device(device_registry, manager, modbus_manager, body),
         "recheck_credentials": lambda body: handle_recheck_credentials(device_registry, body),
         "list_connections": lambda body: handle_list_connections(manager, body),
+        "connection_alarms": lambda body: handle_connection_alarms(manager, body),
         "create_connection": lambda body: handle_create_connection(manager, body),
         "update_connection": lambda body: handle_update_connection(manager, body),
         "delete_connection": lambda body: handle_delete_connection(manager, body),
@@ -901,7 +916,8 @@ def _crash_logger(task_name: str):
 
 
 async def async_main(args) -> None:
-    app = Application.from_args(args)
+    # an Application that also takes EventNotifications (Baler#164)
+    app = bacnet_alarms.WindrowApplication.from_args(args)
     await asyncio.sleep(1)  # let transport setup finish, same as bridge.py
     if getattr(args, "foreign", None):
         print(f"BACnet: foreign device of BBMD {args.foreign}, ttl {args.ttl}s - "
@@ -937,6 +953,7 @@ async def async_main(args) -> None:
         app, mqtt_client, args.state_file,
         site_id=args.site_id, instance_id=args.instance_id if args.site_id else None,
     )
+    app.event_listeners.append(manager.on_event_notification)
     await manager.start()
 
     modbus_manager = ModbusConnectionManager(

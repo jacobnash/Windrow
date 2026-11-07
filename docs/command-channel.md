@@ -56,6 +56,7 @@ equivalent calls (the `handle_*` functions in `src/windrow/api.py`):
 | `set_device_status` | `PATCH /devices/{id}` | `id`, `status` (`pending`/`provisioned`/`ignored`) |
 | `recheck_credentials` | `POST /devices/{id}/recheck-credentials` | `id` |
 | `list_connections` | `GET /connections` | none |
+| `connection_alarms` | `GET /connections/{id}/alarms` | `id` |
 | `create_connection` | `POST /connections` | as the HTTP body: `device_address`, `device_instance`, `topic_prefix`, `points`, optional `poll_interval`/`credential` |
 | `update_connection` | `PATCH /connections/{id}` | `id`, plus any of `points`, `poll_interval`, `topic_prefix` |
 | `delete_connection` | `DELETE /connections/{id}` | `id` |
