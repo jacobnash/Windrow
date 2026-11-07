@@ -30,6 +30,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Rules windrow loads at import (Windrow#8): shipped in the wheel, not only
+# present in a checkout.
+[tool.setuptools.package-data]
+windrow = ["rules/*.yaml"]
+
 [tool.pytest.ini_options]
 markers = [
     "integration: requires live services (Haxall, mosquitto, mock devices)",

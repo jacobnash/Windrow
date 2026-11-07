@@ -53,6 +53,11 @@ def harness(tmp_path, monkeypatch):
         return 1.0
 
     monkeypatch.setattr(cm, "read_present_value", fake_read)
+
+    async def fake_read_many(app, address, objids):  # the batched (RPM) path
+        return {objid: await fake_read(app, address, objid) for objid in objids}
+
+    monkeypatch.setattr(cm, "read_present_values", fake_read_many)
     monkeypatch.setattr(mcm, "RECONNECT_MAX", 60.0)
 
     loop = asyncio.new_event_loop()

@@ -49,6 +49,11 @@ def bacnet(tmp_path, monkeypatch):
         return 70.0
 
     monkeypatch.setattr(cm, "read_present_value", fake_read)
+
+    async def fake_read_many(app, address, objids):  # the batched (RPM) path
+        return {objid: await fake_read(app, address, objid) for objid in objids}
+
+    monkeypatch.setattr(cm, "read_present_values", fake_read_many)
     client = FakeMqttClient()
     mgr = cm.ConnectionManager(app=None, mqtt_client=client, state_file=str(tmp_path / "c.json"))
     return mgr, client, reads
