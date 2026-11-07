@@ -21,6 +21,7 @@ from bacpypes3.app import Application
 from bacpypes3.basetypes import ErrorType
 
 from windrow import (
+    bacnet_alarms,
     bacnet_batch,
     bacnet_cov,
     bacnet_network,
@@ -120,17 +121,25 @@ POINT_FIELDS = {
 #                      subscribe_cov overrides it), polling slowly underneath
 #   cov_lifetime       seconds each subscription asks for; renewed at half
 #   cov_poll_interval  the slow fallback poll for a subscribed point
-READ_OPTION_FIELDS = {"read_multiple", "read_multiple_max", "subscribe_cov", "cov_lifetime", "cov_poll_interval"}
+#   forward_alarms     register as a recipient in the device's notification
+#                      classes and publish its alarms (Baler#164) - off by
+#                      default: it changes the controller's configuration
+READ_OPTION_FIELDS = {
+    "read_multiple", "read_multiple_max", "subscribe_cov", "cov_lifetime", "cov_poll_interval", "forward_alarms",
+}
 UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix"} | READ_OPTION_FIELDS
 DEFAULT_COV_LIFETIME = 300
 DEFAULT_COV_POLL_INTERVAL = 300.0
+# How often a forward_alarms connection re-checks its recipient entries (a
+# controller restored from a backup loses them) and re-reads active alarms.
+ALARM_REFRESH_INTERVAL = float(os.environ.get("WINDROW_ALARM_REFRESH", "3600"))
 
 
 def validate_read_options(options: dict) -> dict:
     """The READ_OPTION_FIELDS present in `options`, type-checked. ValueError
     (a 400) for a wrong type, same as every other connection field."""
     cleaned = {}
-    for key in ("read_multiple", "subscribe_cov"):
+    for key in ("read_multiple", "subscribe_cov", "forward_alarms"):
         if key in options:
             if not isinstance(options[key], bool):
                 raise ValueError(f"{key} must be true or false, got {options[key]!r}")
@@ -262,6 +271,7 @@ class ConnectionManager:
         self.tasks: dict[str, asyncio.Task] = {}
         # In-memory poll health per connection, never persisted (Baler#110).
         self.status = PollStatus()
+        self._side_tasks: set[asyncio.Task] = set()
         self._read_slots: asyncio.Semaphore | None = None
         # one per device address, shared by every connection on it
         self.batchers: dict[str, bacnet_batch.ReadBatcher] = {}
@@ -448,7 +458,10 @@ class ConnectionManager:
             task = self.tasks.pop(connection_id, None)
             if task is not None:
                 task.cancel()
-            address = self.connections.pop(connection_id)["device_address"]
+            removed = self.connections.pop(connection_id)
+            if removed.get("forward_alarms"):
+                self._background(self._unregister_alarms(removed))
+            address = removed["device_address"]
             self._apply_batch_limit(address)
             self.status.reset(connection_id)
             self._save()
@@ -478,6 +491,8 @@ class ConnectionManager:
             record.update(validate_read_options(patch))
 
             await stop_task(self.tasks.pop(connection_id, None))
+            if old.get("forward_alarms") and not record.get("forward_alarms"):
+                self._background(self._unregister_alarms(old))
             self.status.reset(connection_id)
             self.connections[connection_id] = record
             self._apply_batch_limit(record["device_address"])
@@ -603,6 +618,8 @@ class ConnectionManager:
         does NOT auto-cancel its children just because the task awaiting
         it was cancelled - confirmed, not assumed."""
         point_tasks = [asyncio.get_event_loop().create_task(self._poll_point(record, point)) for point in record["points"]]
+        if record.get("forward_alarms"):
+            point_tasks.append(asyncio.get_event_loop().create_task(self._keep_alarms(record)))
         try:
             await asyncio.gather(*point_tasks)
         except asyncio.CancelledError:
@@ -709,6 +726,94 @@ class ConnectionManager:
             state.last_published_at = now
         self.status.success(record.get("id"), point["label"], published=publish)
 
+    # --- alarms (Baler#164) ---
+
+    def _background(self, coro) -> None:
+        """Fire and forget, but keep a reference and log a failure."""
+        task = asyncio.get_running_loop().create_task(coro)
+        self._side_tasks.add(task)
+
+        def done(t: asyncio.Task) -> None:
+            self._side_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                print(f"background task failed: {t.exception()!r}")
+
+        task.add_done_callback(done)
+
+    async def _keep_alarms(self, record: dict) -> None:
+        """Register in every notification class on the device, publish what's
+        already in alarm, and do both again every ALARM_REFRESH_INTERVAL (and
+        with back-off after a failure). Never ends the poll loop it runs in."""
+        address = record["device_address"]
+        failures = 0
+        while True:
+            try:
+                async with self._slots():
+                    classes = await bacnet_alarms.notification_classes(self.app, address, record["device_instance"])
+                for nc in classes:
+                    async with self._slots():
+                        if await bacnet_alarms.ensure_recipient(self.app, address, nc):
+                            print(f"registered for alarms from {address} {nc}")
+                async with self._slots():
+                    active = await bacnet_alarms.get_event_information(self.app, address)
+                for event in active:
+                    self._publish_alarm(record, event["object"], {**event, "ts": time.time(), "source": "summary"})
+                if failures:
+                    print(f"alarm setup for {address} recovered after {failures} failures")
+                failures = 0
+                if not classes:
+                    print(f"{address} has no notification-class objects; no alarms to forward")
+                delay = ALARM_REFRESH_INTERVAL
+            except Exception as exc:  # noqa: BLE001 - retried; polling carries on regardless
+                failures += 1
+                if failures in (1, 5) or failures % 50 == 0:
+                    print(f"alarm setup for {address} failed ({failures}x): {exc!r}")
+                delay = failure_backoff(30.0, failures)
+            await asyncio.sleep(delay)
+
+    async def _unregister_alarms(self, record: dict) -> None:
+        address = record["device_address"]
+        try:
+            for nc in await bacnet_alarms.notification_classes(self.app, address, record["device_instance"]):
+                await bacnet_alarms.remove_recipient(self.app, address, nc)
+        except Exception as exc:  # noqa: BLE001 - best effort; the entry is harmless if left behind
+            print(f"couldn't remove the alarm recipient entries on {address}: {exc!r}")
+
+    def on_event_notification(self, apdu) -> None:
+        """An EventNotification from a device: publish it on every
+        forward_alarms connection to that device."""
+        self.stats["event_notifications"] += 1
+        source = bacnet_network.address_key(str(apdu.pduSource))
+        event = bacnet_alarms.notification_to_dict(apdu)
+        matched = False
+        for record in self.connections.values():
+            if record.get("forward_alarms") and bacnet_network.address_key(record["device_address"]) == source:
+                self._publish_alarm(record, event["object"], event)
+                matched = True
+        if not matched:
+            print(f"event notification from {apdu.pduSource} for {event['object']} matches no forward_alarms connection")
+
+    def _publish_alarm(self, record: dict, objid: str, event: dict) -> None:
+        """Retained, so a subscriber sees the current state: on the point's
+        `{label}/alarm` when the object is one of the connection's points,
+        else on `alarms/{type}-{instance}` (a controller alarms on objects
+        nobody polls, e.g. a fault on a device-level object)."""
+        label = None
+        for point in record["points"]:
+            if _same_object(point["object_identifier"], objid):
+                label = point["label"]
+                break
+        topic = f"{label}/alarm" if label else "alarms/" + objid.replace(",", "-")
+        mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], topic, event, ts=event.get("ts"))
+
+    async def active_alarms(self, connection_id: str) -> list[dict] | None:
+        """The device's active alarms now (GetEventInformation), for the API."""
+        record = self.connections.get(connection_id)
+        if record is None:
+            return None
+        async with self._slots():
+            return await bacnet_alarms.get_event_information(self.app, record["device_address"])
+
     def _set_cov_live(self, state: _PointState, live: bool) -> None:
         if state.cov_active == live:
             return
@@ -762,6 +867,16 @@ class ConnectionManager:
         finally:
             self._cov_live.discard(id(state))
             subscription.close()
+
+
+def _same_object(a: str, b: str) -> bool:
+    """`analog-value,1` and `analogValue,1` name the same object."""
+    from bacpypes3.primitivedata import ObjectIdentifier
+
+    try:
+        return ObjectIdentifier(a) == ObjectIdentifier(b)
+    except Exception:  # noqa: BLE001 - unparseable: compare the text
+        return a.replace(" ", "") == b.replace(" ", "")
 
 
 def _to_bacnet(value, obj_type: str):
