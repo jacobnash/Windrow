@@ -537,6 +537,14 @@ class ConnectionManager:
             self._apply_batch_limit(address)
             self.status.reset(connection_id)
             self._save()
+            # Clear the retained value/tags/alarm/equip topics this connection
+            # published. Left on the broker, every listener restart replays
+            # them and Baler re-creates the deleted points (Windrow #29).
+            prefix = removed["topic_prefix"]
+            for label in [p["label"] for p in removed["points"]]:
+                for suffix in ("", "/tags", "/alarm"):
+                    mqtt_sink.clear_retained(self.mqtt_client, prefix, f"{label}{suffix}")
+            mqtt_sink.clear_retained(self.mqtt_client, prefix, "equip/tags")
             span.set_attribute("found", True)
             return True
 

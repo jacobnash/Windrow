@@ -281,3 +281,45 @@ def test_modbus_update_rejects_bad_patches(modbus, patch):
 
     asyncio.run(run())
     assert client.topics(b"") == []
+
+
+# --- delete clears what the connection published (Windrow #29) ---
+
+
+def test_bacnet_delete_clears_every_retained_topic(bacnet):
+    """A deleted connection's retained value/tags/alarm/equip topics are
+    emptied; otherwise every listener restart replays them and Baler
+    re-creates the deleted points."""
+    mgr, client, _ = bacnet
+
+    async def run():
+        record = await mgr.create_connection("10.0.0.5", 5, "fbf/ahu-1", POINTS, poll_interval=30)
+        client.published.clear()
+        assert await mgr.delete_connection(record["id"]) is True
+
+    asyncio.run(run())
+    assert set(client.topics(b"")) == {
+        "fbf/ahu-1/zone-temp", "fbf/ahu-1/zone-temp/tags", "fbf/ahu-1/zone-temp/alarm",
+        "fbf/ahu-1/zone-sp", "fbf/ahu-1/zone-sp/tags", "fbf/ahu-1/zone-sp/alarm",
+        "fbf/ahu-1/equip/tags",
+    }
+    assert mgr.connections == {}
+
+
+def test_modbus_delete_clears_every_retained_topic(modbus):
+    mgr, client, _ = modbus
+
+    async def run():
+        record = await mgr.create_connection("10.0.0.6", "fbf/m1", {"a": 0, "b": 1}, poll_interval=30)
+        assert await mgr.delete_connection(record["id"]) is True
+        await mgr.close()
+
+    asyncio.run(run())
+    assert set(client.topics(b"")) == {"fbf/m1/a", "fbf/m1/a/tags", "fbf/m1/b", "fbf/m1/b/tags", "fbf/m1/equip/tags"}
+    assert mgr.connections == {}
+
+
+def test_delete_unknown_id_clears_nothing(bacnet, modbus):
+    for mgr, client, _ in (bacnet, modbus):
+        assert asyncio.run(mgr.delete_connection("nope")) is False
+        assert list(client.topics(b"")) == []

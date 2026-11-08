@@ -155,7 +155,9 @@ class CapturingMqtt:
         return True
 
     def publish(self, topic, payload, qos=0, retain=False):
-        self.published.append((topic, json.loads(payload), retain))
+        # An empty retained payload is mqtt_sink.clear_retained (deleting a
+        # connection empties its topics, Windrow #29), not a JSON reading.
+        self.published.append((topic, json.loads(payload) if payload else None, retain))
 
 
 @pytest.fixture
