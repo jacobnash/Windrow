@@ -37,6 +37,14 @@ _TAGGER_RULES = bacnet_tagger.load_default_rules()
 # Longest wait between reconnect attempts to an unreachable device.
 RECONNECT_MAX = 60.0
 
+
+def _clear_published(mqtt_client, topic_prefix: str, labels: list[str]) -> None:
+    """Empty retained publish for every topic a deleted connection owned."""
+    for label in labels:
+        mqtt_sink.clear_retained(mqtt_client, topic_prefix, label)
+        mqtt_sink.clear_retained(mqtt_client, topic_prefix, f"{label}/tags")
+    mqtt_sink.clear_retained(mqtt_client, topic_prefix, "equip/tags")
+
 UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "host", "port", "device_id", "units", "device_name"}
 
 # A test read (Baler#110) answers within this, reachable device or not.
@@ -209,9 +217,13 @@ class ModbusConnectionManager:
             client = self.clients.pop(connection_id, None)
             if client is not None:
                 client.close()
-            del self.connections[connection_id]
+            removed = self.connections.pop(connection_id)
             self.status.reset(connection_id)
             self._save()
+            # Clear the retained value/tags/equip topics this connection
+            # published. Left on the broker, every listener restart replays
+            # them and Baler re-creates the deleted points (Windrow #29).
+            _clear_published(self.mqtt_client, removed["topic_prefix"], list(removed["points"]))
             span.set_attribute("found", True)
             return True
 
