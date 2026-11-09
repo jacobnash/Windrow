@@ -907,7 +907,7 @@ class ConnectionManager:
             # quality only when there is some: a healthy point's call (and
             # envelope) is exactly what it was before Windrow#20
             extra = {"quality": quality} if quality else {}
-            mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value, **extra)
+            mqtt_sink.publish_live(self.mqtt_client, record["topic_prefix"], point["label"], value, **extra)
             state.last_value = value
             state.last_quality = quality
             state.last_published_at = now
