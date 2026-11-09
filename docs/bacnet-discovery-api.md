@@ -277,6 +277,11 @@ same as `read_schedules` and `connection_schedules`.
 calendar exception and an early close on the fourth Thursday of November) driving the first binary
 object, and `calendar,1`.
 
+Writing them back (Windrow#26) goes over the command channel only, as
+`write_schedule` / `write_calendar` in this same format, with `expires_at`
+and a read-back result. See `docs/command-channel.md`, "Schedule and
+calendar writes".
+
 ## 3f. Alarms (intrinsic reporting)
 
 With `"forward_alarms": true` on a connection, a controller's own alarms -

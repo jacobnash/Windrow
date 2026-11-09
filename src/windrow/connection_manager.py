@@ -13,6 +13,7 @@ import json
 import math
 import os
 import random
+import re
 import time
 from collections import Counter
 
@@ -25,6 +26,7 @@ from windrow import (
     bacnet_batch,
     bacnet_cov,
     bacnet_network,
+    bacnet_schedule_write,
     bacnet_schedules,
     bacnet_tagger,
     bacnet_trend,
@@ -366,6 +368,73 @@ class ConnectionManager:
             return None
         labels = {str(_objid(p["object_identifier"])): p["label"] for p in record["points"]}
         return await self.read_schedules(record["device_address"], record["device_instance"], labels)
+
+    async def write_schedule(self, connection_id: str, body: dict, expires_at: float | None = None,
+                             who: str | None = None, reason: str | None = None) -> dict | None:
+        """Write a Schedule object on a connection's device (Windrow#26):
+        body = {object: "schedule,N", and any of weekly, exceptions,
+        default, effective_period} in bacnet_schedules' read format; keys
+        left out aren't written. Refused after `expires_at`, like a point
+        write. The object is read first (it must exist; its controlled
+        objects decide how values are encoded), every field is validated
+        before anything is sent, then one WriteProperty per field, and the
+        object is read back and returned in the read format. None if there's
+        no such connection."""
+        return await self._write_schedule_object(connection_id, "schedule", body, expires_at, who, reason)
+
+    async def write_calendar(self, connection_id: str, body: dict, expires_at: float | None = None,
+                             who: str | None = None, reason: str | None = None) -> dict | None:
+        """Write a Calendar's date-list: body = {object: "calendar,N", dates:
+        [period, ...]}. Same rules as write_schedule."""
+        return await self._write_schedule_object(connection_id, "calendar", body, expires_at, who, reason)
+
+    async def _write_schedule_object(self, connection_id: str, kind: str, body: dict, expires_at, who, reason):
+        with tracer.start_as_current_span(f"connection_manager.write_{kind}") as span:
+            span.set_attribute("connection_id", connection_id)
+            if expires_at is not None and time.time() > expires_at:
+                raise PointWriteError("command expired before it reached the site; not applied")
+            record = self.connections.get(connection_id)
+            if record is None:
+                return None
+            if not isinstance(body, dict):
+                raise PointWriteError(f"a {kind} write is a JSON object")
+            objid = body.get("object")
+            if not isinstance(objid, str) or not re.fullmatch(rf"{kind},\d+", objid.replace(" ", "")):
+                raise PointWriteError(f'object is a {kind} object id like "{kind},1"')
+            objid = objid.replace(" ", "")
+            span.set_attribute("object", objid)
+            fields = {k: v for k, v in body.items() if k != "object"}
+            address = record["device_address"]
+            labels = {str(_objid(p["object_identifier"])): p["label"] for p in record["points"]}
+            read = (bacnet_schedules.read_schedule if kind == "schedule"
+                    else lambda app, a, o, _labels: bacnet_schedules.read_calendar(app, a, o))
+            try:
+                async with self._slots():
+                    current = await read(self.app, address, objid, labels)
+            except bacnet_schedules.ScheduleReadError as exc:
+                raise PointWriteError(f"can't read {objid} on {address} before writing it: {exc}") from None
+            try:
+                if kind == "schedule":
+                    writes = bacnet_schedule_write.validate_schedule(fields, current)
+                else:
+                    writes = bacnet_schedule_write.validate_calendar(fields)
+            except bacnet_schedule_write.ScheduleWriteError as exc:
+                raise PointWriteError(str(exc)) from None
+            print(f"writing {objid} on {address} ({', '.join(p for p, _ in writes)})"
+                  f"{f' for {who}' if who else ''}{f': {reason}' if reason else ''}")
+            done: list[str] = []
+            for prop, value in writes:
+                try:
+                    async with self._slots():
+                        await bacnet_schedule_write.write_property(self.app, address, objid, prop, value, WRITE_TIMEOUT)
+                except (bacnet_schedule_write.ScheduleWriteError, TimeoutError, asyncio.TimeoutError) as exc:
+                    why = str(exc) or "no answer"
+                    partly = f"; already written: {', '.join(done)}" if done else "; nothing was written"
+                    span.set_attribute("error", why)
+                    raise PointWriteError(f"{why}{partly}") from None
+                done.append(prop)
+            async with self._slots():
+                return await read(self.app, address, objid, labels)
 
     async def create_connection(
         self,
