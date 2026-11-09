@@ -11,9 +11,9 @@ import os
 
 from bacpypes3.apdu import AbortPDU, ErrorRejectAbortNack
 from bacpypes3.app import Application
-from bacpypes3.basetypes import ErrorType
+from bacpypes3.basetypes import DeviceObjectReference, ErrorType
 from bacpypes3.pdu import Address
-from bacpypes3.primitivedata import ObjectIdentifier
+from bacpypes3.primitivedata import ObjectIdentifier, Real
 
 from windrow import bacnet_network, tracing
 from windrow.bacnet_values import normalize_value
@@ -25,6 +25,35 @@ tracer = tracing.get_tracer(__name__)
 LEARN_TIMEOUT = float(os.environ.get("WINDROW_LEARN_TIMEOUT", "60"))
 
 LEARN_PROPERTIES = ["object-name", "present-value", "units", "description"]
+# Asked on top of LEARN_PROPERTIES, by object type (Windrow#19): the raw
+# evidence a bad name leaves - range, COV increment, state texts, and
+# whether the object is commandable. relinquish-default stands in for
+# priority-array: the standard requires one exactly when the other is
+# present, and it is one value where the array is sixteen.
+_ANALOG = ["min-pres-value", "max-pres-value", "cov-increment"]
+_BINARY = ["active-text", "inactive-text"]
+_MULTISTATE = ["state-text"]
+TYPE_PROPERTIES = {
+    "analog-input": _ANALOG,
+    "analog-output": [*_ANALOG, "relinquish-default"],
+    "analog-value": [*_ANALOG, "relinquish-default"],
+    "binary-input": _BINARY,
+    "binary-output": [*_BINARY, "relinquish-default"],
+    "binary-value": [*_BINARY, "relinquish-default"],
+    "multi-state-input": _MULTISTATE,
+    "multi-state-output": [*_MULTISTATE, "relinquish-default"],
+    "multi-state-value": [*_MULTISTATE, "relinquish-default"],
+}
+# Object types whose commandability is worth asking (the ones above that
+# ask relinquish-default, plus any that might).
+_COMMANDABLE_ASKED = {t for t, props in TYPE_PROPERTIES.items() if "relinquish-default" in props}
+# A structured view is the integrator's own equipment grouping, when they
+# built one: not a point, but its subordinate-list says which points belong
+# together.
+STRUCTURED_VIEW = "structured-view"
+VIEW_PROPERTIES = ["object-name", "subordinate-list"]
+# The device object's identity, read once per learn, best effort.
+DEVICE_PROPERTIES = ["object-name", "vendor-name", "model-name", "location"]
 # Objects per ReadPropertyMultiple. One request for a whole big device came
 # back "apdu-too-long" (the mock hospital, and any controller without
 # segmentation); a batch that's still too long is split in half and retried.
@@ -104,13 +133,44 @@ async def discover_devices(
         return devices
 
 
+def properties_for(obj_id) -> list[str]:
+    """What learn asks of one object: LEARN_PROPERTIES and its type's extras,
+    or a structured view's name and members."""
+    object_type = str(obj_id[0])
+    if object_type == STRUCTURED_VIEW:
+        return VIEW_PROPERTIES
+    return LEARN_PROPERTIES + TYPE_PROPERTIES.get(object_type, [])
+
+
+def raw_value(value):
+    """A property value as plain JSON, uninterpreted: arrays and lists as
+    lists (state-text), enumerations and object identifiers as their text,
+    a DeviceObjectReference as {object_identifier[, device_identifier]}.
+    A read error is None."""
+    if value is None or isinstance(value, ErrorType):
+        return None
+    if isinstance(value, DeviceObjectReference):
+        ref = {"object_identifier": str(value.objectIdentifier)}
+        if value.deviceIdentifier is not None:
+            ref["device_identifier"] = str(value.deviceIdentifier)
+        return ref
+    if isinstance(value, ObjectIdentifier):
+        return str(value)
+    if isinstance(value, list):
+        return [raw_value(v) for v in value]
+    if isinstance(value, Real):
+        # a BACnet Real is single precision: 0.1 comes back 0.10000000149011612
+        return float(f"{float(value):.7g}")
+    return normalize_value(value)
+
+
 async def _read_batch(app: Application, device_address: str, object_ids: list) -> list:
-    """LEARN_PROPERTIES for each object in one ReadPropertyMultiple, halving
+    """properties_for() each object in one ReadPropertyMultiple, halving
     the batch while the device says the answer won't fit in one APDU."""
     parameter_list = []
     for obj_id in object_ids:
         parameter_list.append(obj_id)
-        parameter_list.append(LEARN_PROPERTIES)
+        parameter_list.append(properties_for(obj_id))
     try:
         results = await app.read_property_multiple(device_address, parameter_list)
     except AbortPDU as exc:
@@ -135,7 +195,16 @@ async def learn_points(app: Application, device_address: str, device_instance: i
     read failures (bacpypes3 embeds an ErrorType in the result tuple
     rather than raising) are reported as None fields, not a crashed call -
     a device that can't report e.g. units for one point shouldn't hide
-    every other point on it."""
+    every other point on it.
+
+    Each point also carries the raw evidence a bad name leaves (Windrow#19),
+    uninterpreted: `object_type`; `commandable` (it has a priority array)
+    for the types that can be; `state_text` / `active_text` /
+    `inactive_text`; `min_pres_value`, `max_pres_value`, `cov_increment`;
+    `structured_views`, the names of the integrator's structured-view
+    objects that list it; and `device`, the device object's name, vendor,
+    model and location. A property the object doesn't have is left out.
+    Structured views themselves aren't points and aren't returned."""
     with tracer.start_as_current_span("discovery.learn_points") as span:
         span.set_attribute("device_address", device_address)
         span.set_attribute("device_instance", device_instance)
@@ -172,17 +241,81 @@ async def learn_points(app: Application, device_address: str, device_instance: i
         by_object: dict[str, dict] = {str(obj_id): {} for obj_id in object_ids}
         for obj_id, prop_id, _array_index, value in results:
             field = str(prop_id).replace("-", "_")
-            by_object[str(obj_id)][field] = None if isinstance(value, ErrorType) else normalize_value(value)
+            by_object.setdefault(str(obj_id), {})[field] = value
 
-        points = [
-            {
+        device = await read_device_identity(app, device_address, device_instance)
+        views = _structured_views(object_ids, by_object)
+
+        points = []
+        for obj_id in object_ids:
+            if str(obj_id[0]) == STRUCTURED_VIEW:
+                continue
+            props = by_object[str(obj_id)]
+            point = {
                 "object_identifier": str(obj_id),
-                "label": by_object[str(obj_id)].get("object_name") or str(obj_id),
-                "present_value": by_object[str(obj_id)].get("present_value"),
-                "units": by_object[str(obj_id)].get("units"),
-                "description": by_object[str(obj_id)].get("description"),
+                "label": raw_value(props.get("object_name")) or str(obj_id),
+                "present_value": raw_value(props.get("present_value")),
+                "units": raw_value(props.get("units")),
+                "description": raw_value(props.get("description")),
+                "object_type": str(obj_id[0]),
             }
-            for obj_id in object_ids
-        ]
+            if str(obj_id[0]) in _COMMANDABLE_ASKED:
+                # an answer (even Null) means the property exists; an error means it doesn't
+                answer = props.get("relinquish_default")
+                point["commandable"] = answer is not None and not isinstance(answer, ErrorType)
+            for field in ("state_text", "active_text", "inactive_text", "min_pres_value", "max_pres_value", "cov_increment"):
+                value = raw_value(props.get(field))
+                if value is not None:
+                    point[field] = value
+            if str(obj_id) in views:
+                point["structured_views"] = views[str(obj_id)]
+            if device:
+                point["device"] = device
+            points.append(point)
         span.set_attribute("point_count", len(points))
         return points
+
+
+async def read_device_identity(app: Application, device_address: str, device_instance: int) -> dict:
+    """DEVICE_PROPERTIES of the device object, as {"instance", "name",
+    "vendor_name", "model_name", "location"} with only what the device
+    answered. Best effort: a device that won't answer this still has its
+    points learned, so any failure is just fewer keys."""
+    device_id = ObjectIdentifier(f"device,{device_instance}")
+    identity: dict = {"instance": device_instance}
+    try:
+        results = await asyncio.wait_for(
+            app.read_property_multiple(device_address, [device_id, DEVICE_PROPERTIES]), LEARN_TIMEOUT
+        )
+    except (Exception, ErrorRejectAbortNack) as exc:  # noqa: BLE001 - identity is extra evidence, not the learn
+        print(f"{device_address}: couldn't read device,{device_instance}'s identity: {exc!r}")
+        return identity
+    if not isinstance(results, list):
+        return identity
+    for _obj_id, prop_id, _array_index, value in results:
+        value = raw_value(value)
+        if value is None or value == "":
+            continue
+        field = str(prop_id).replace("-", "_")
+        identity["name" if field == "object_name" else field] = value
+    return identity
+
+
+def _structured_views(object_ids: list, by_object: dict) -> dict[str, list[str]]:
+    """{point object id: [names of the structured views listing it]}, for
+    members on this device (a reference without a device identifier, or
+    naming no other device). A view's name falls back to its identifier."""
+    member_of: dict[str, list[str]] = {}
+    for obj_id in object_ids:
+        if str(obj_id[0]) != STRUCTURED_VIEW:
+            continue
+        props = by_object.get(str(obj_id), {})
+        name = raw_value(props.get("object_name")) or str(obj_id)
+        for ref in raw_value(props.get("subordinate_list")) or []:
+            if not isinstance(ref, dict):
+                continue
+            member = ref["object_identifier"]
+            member_of.setdefault(member, [])
+            if name not in member_of[member]:
+                member_of[member].append(name)
+    return member_of

@@ -174,7 +174,7 @@ class HaystackSource:
             return False
         self._last[rid] = value
         p = self.points[rid]
-        mqtt_sink.publish_reading(self.mqtt, p["prefix"], p["label"], value)
+        mqtt_sink.publish_live(self.mqtt, p["prefix"], p["label"], value)
         return True
 
     def poll_once(self, lease_secs: float = 300.0) -> int:

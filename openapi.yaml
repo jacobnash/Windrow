@@ -1094,6 +1094,51 @@ components:
         units:
           type: ["string", "null"]
           example: degrees-fahrenheit
+        object_type:
+          type: string
+          description: The BACnet object type, on its own (Windrow#19). Raw evidence for classifying a badly named point.
+          example: analog-value
+        commandable:
+          type: boolean
+          description: >-
+            The object has a priority array (read as relinquish-default, which
+            the standard requires exactly when there is one). Only for the
+            types that can be commandable: outputs and values.
+        state_text:
+          type: array
+          items: { type: string }
+          description: A multi-state object's state-text, as the device gives it.
+          example: ["Off", "Low", "High"]
+        active_text:
+          type: string
+          description: A binary object's active-text.
+        inactive_text:
+          type: string
+          description: A binary object's inactive-text.
+        min_pres_value:
+          type: number
+        max_pres_value:
+          type: number
+        cov_increment:
+          type: number
+        structured_views:
+          type: array
+          items: { type: string }
+          description: Names of the device's structured-view objects whose subordinate-list includes this point - the integrator's equipment grouping, when they built one. Structured views themselves aren't listed as points.
+          example: ["AHU-1"]
+        device:
+          $ref: "#/components/schemas/LearnedDevice"
+    LearnedDevice:
+      type: object
+      description: >-
+        The device object's identity, read once per learn, best effort: only
+        what the device answered (Windrow#19).
+      properties:
+        instance: { type: integer, example: 3456 }
+        name: { type: string, description: The device's object-name. }
+        vendor_name: { type: string }
+        model_name: { type: string }
+        location: { type: string }
     PointRef:
       type: object
       required: [object_identifier, label]
@@ -1116,6 +1161,26 @@ components:
           type: string
           description: An explicit Haystack unit symbol for the point's `unit` tag, overriding `units` - for a device that reports none or the wrong one.
           example: "°F"
+        object_type:
+          $ref: "#/components/schemas/LearnedPoint/properties/object_type"
+        commandable:
+          $ref: "#/components/schemas/LearnedPoint/properties/commandable"
+        state_text:
+          $ref: "#/components/schemas/LearnedPoint/properties/state_text"
+        active_text:
+          $ref: "#/components/schemas/LearnedPoint/properties/active_text"
+        inactive_text:
+          $ref: "#/components/schemas/LearnedPoint/properties/inactive_text"
+        min_pres_value:
+          $ref: "#/components/schemas/LearnedPoint/properties/min_pres_value"
+        max_pres_value:
+          $ref: "#/components/schemas/LearnedPoint/properties/max_pres_value"
+        cov_increment:
+          $ref: "#/components/schemas/LearnedPoint/properties/cov_increment"
+        structured_views:
+          $ref: "#/components/schemas/LearnedPoint/properties/structured_views"
+        device:
+          $ref: "#/components/schemas/LearnedPoint/properties/device"
         poll_interval:
           type: number
           description: Seconds between reads of this specific point, overriding the connection-level default. Each point runs its own independent poll loop - a fast-changing point and a slow one on the same device don't have to share a cadence.
@@ -1319,6 +1384,21 @@ components:
             change publishes at once, even at an unchanged value. Read-only,
             one ReadPropertyMultiple per 8 commandable points; 0 turns it
             off, otherwise at least 5.
+        read_quality:
+          type: boolean
+          default: true
+          description: >-
+            Read each point's `status-flags` and `reliability` in the same
+            ReadPropertyMultiple as its present-value (and take the
+            status-flags a COV notification carries), and publish them as
+            the reading's `quality` (Windrow#20): `{"status_flags":
+            ["fault", ...], "reliability": "no-sensor"}`, BACnet's own
+            names, either key left out when there's nothing to say, and no
+            `quality` at all while every flag is clear and reliability is
+            no-fault-detected. A change of quality publishes even when the
+            value didn't change. A point read with single ReadProperty (a
+            device without RPM, or `read_multiple: false`) publishes no
+            quality. `false` asks for and publishes neither.
         cov_lifetime:
           type: integer
           minimum: 10
@@ -1726,6 +1806,8 @@ components:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/subscribe_cov"
         priority_interval:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/priority_interval"
+        read_quality:
+          $ref: "#/components/schemas/CreateConnectionRequest/properties/read_quality"
         cov_lifetime:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/cov_lifetime"
         cov_poll_interval:

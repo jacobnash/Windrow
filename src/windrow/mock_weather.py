@@ -82,7 +82,7 @@ def main() -> None:
     while True:
         now = time.time()
         for label in POINTS:
-            mqtt_sink.publish_reading(client, prefix, label, value_at(label, now, rng), ts=now)
+            mqtt_sink.publish_live(client, prefix, label, value_at(label, now, rng), ts=now)
         if args.once:
             time.sleep(1.0)  # let QoS 1 publishes flush
             client.loop_stop()
