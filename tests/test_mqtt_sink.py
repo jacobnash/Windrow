@@ -208,3 +208,17 @@ def test_tags_and_history_never_ride_a_batch(batch_mode):
     mqtt_sink.publish_reading(client, "fbf/s", "a/tags", "{}")
     mqtt_sink.publish_reading(client, "fbf/s", "a", 5, ts=1.0, retain=False)
     assert [p[0] for p in client.published] == ["fbf/s/a/tags", "fbf/s/a"]
+
+
+def test_a_reading_with_quality_goes_per_point_even_when_batching(batch_mode):
+    """Windrow#20 + Baler#234: the batch format carries no quality, so a
+    flagged reading is published on its own, quality and all."""
+    client = FakeClient()
+    q = {"status_flags": ["fault"], "reliability": "no-sensor"}
+    assert mqtt_sink.publish_live(client, "fbf/site-a/ahu-1", "sat", 55.0, ts=100.0, quality=q) == "fbf/site-a/ahu-1/sat"
+    mqtt_sink.publish_live(client, "fbf/site-a/ahu-1", "fan", "active", ts=100.0)
+    mqtt_sink.flush_batches()
+    assert client.published == [
+        ("fbf/site-a/ahu-1/sat", {"point": "sat", "value": 55.0, "ts": 100.0, "quality": q}, 1, True),
+        ("fbf/site-a/ahu-1/batch", {"ts": 100.0, "points": {"fan": "active"}}, 1, False),
+    ]
