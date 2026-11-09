@@ -15,6 +15,14 @@ repeatable recipe, not one-off work per protocol. This is that recipe.
 - Every bridge imports `windrow.mqtt_sink` (`connect()`, `publish_reading()`)
   for this — never re-derive the envelope/publish logic per bridge.
 
+A live reading (a poll or a COV notification) goes through
+`publish_live()`, which is `publish_reading()` unless the node runs the
+optional batched envelope (`WINDROW_MQTT_ENVELOPE=batch`, see
+[edge-nodes.md](edge-nodes.md#batched-envelope-optional-baler234)). With the
+batched envelope, a device's readings in one poll tick are one
+`{prefix}/batch` message. Tags, alarms and backfill always use
+`publish_reading()`.
+
 Nothing that consumes this cares which protocol produced it. That's what
 makes this a zero-coordination-cost pattern: adding a new source never
 requires touching a central registry, config, or any other bridge's code.
