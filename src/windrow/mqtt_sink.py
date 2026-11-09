@@ -161,7 +161,8 @@ def _flush_spool(client: mqtt.Client) -> None:
                 print(f"reconnect lost mid-flush, {len(records) - i} record(s) remain spooled")
                 return
             _publish(client, record["topic_prefix"], record["point"], record["value"], record["ts"],
-                     retain=record.get("retain", True), quality=record.get("quality"))
+                     retain=record.get("retain", True), quality=record.get("quality"),
+                     priority=record.get("priority"))
         os.remove(path)
         _spool_rows[path] = 0
         print(f"flushed {len(records)} spooled reading(s)")
@@ -230,10 +231,12 @@ def connect(
 
 
 def _publish(client: mqtt.Client, topic_prefix: str, point: str, value, ts: float, retain: bool = True,
-             quality: dict | None = None) -> str:
+             quality: dict | None = None, priority: dict | None = None) -> str:
     envelope = {"point": point, "value": value, "ts": ts}
     if quality:
         envelope["quality"] = quality
+    if priority is not None:
+        envelope["priority"] = priority
     payload = json.dumps(envelope)
     topic = f"{topic_prefix}/{point}"
     client.publish(topic, payload, qos=1, retain=retain)
@@ -324,20 +327,22 @@ def batch_stats() -> dict:
 
 
 def publish_live(client: mqtt.Client, topic_prefix: str, point: str, value, ts: float | None = None,
-                 quality: dict | None = None) -> str:
+                 quality: dict | None = None, priority: dict | None = None) -> str:
     """A live reading - a poll or a COV notification. With the per-point
     envelope (the default) this is publish_reading; with
     WINDROW_MQTT_ENVELOPE=batch it rides its prefix's next batch message
     (see _Batches) and the returned topic is the batch topic. Tags, alarms,
     write read-backs and backfill keep calling publish_reading.
 
-    A reading with `quality` (Windrow#20) always goes per point, batched
-    envelope or not: the batch format carries no quality, and Baler accepts
-    both envelopes on the same prefix."""
-    if ENVELOPE == "batch" and not quality:
+    A reading with `quality` (Windrow#20) or a `priority` array (Windrow#25)
+    always goes per point, batched envelope or not: the batch format carries
+    neither, and Baler accepts both envelopes on the same prefix."""
+    if ENVELOPE == "batch" and not quality and priority is None:
         _batches.add(client, topic_prefix, point, value, ts if ts is not None else time.time())
         return f"{topic_prefix}/{BATCH_TOPIC}"
     extra: dict = {"quality": quality} if quality else {}
+    if priority is not None:
+        extra["priority"] = priority
     if ts is not None:
         extra["ts"] = ts
     return publish_reading(client, topic_prefix, point, value, **extra)
@@ -345,7 +350,7 @@ def publish_live(client: mqtt.Client, topic_prefix: str, point: str, value, ts: 
 
 def publish_reading(
     client: mqtt.Client, topic_prefix: str, point: str, value, ts: float | None = None, retain: bool = True,
-    quality: dict | None = None,
+    quality: dict | None = None, priority: dict | None = None,
 ) -> str:
     """Publishes {"point", "value", "ts"} to f"{topic_prefix}/{point}",
     retained. This exact shape is the frozen wire contract every consumer
@@ -357,6 +362,11 @@ def publish_reading(
     words. Consumers that parse by name ignore it; Baler's quality.
     from_envelope stores it as the sample's flag. No `quality` means
     nothing reported, i.e. ok.
+
+    `priority` (Windrow#25) adds an optional key for a commandable point:
+    its priority array as {"active": 8, "levels": {"8": 72.0, "16": 68.0}}
+    (bacnet_values.priority_levels). Consumers that parse by name ignore
+    it.
 
     If the client isn't currently connected, the reading is spooled to
     disk instead of dropped, and replayed automatically once the
@@ -371,9 +381,11 @@ def publish_reading(
             record["retain"] = False
         if quality:
             record["quality"] = quality
+        if priority is not None:
+            record["priority"] = priority
         _spool_append(record)
         return f"{topic_prefix}/{point}"
-    return _publish(client, topic_prefix, point, value, ts, retain=retain, quality=quality)
+    return _publish(client, topic_prefix, point, value, ts, retain=retain, quality=quality, priority=priority)
 
 
 def clear_retained(client: mqtt.Client, topic_prefix: str, point: str) -> str:

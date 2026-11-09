@@ -10,7 +10,7 @@ repeatable recipe, not one-off work per protocol. This is that recipe.
   for the protocol (a BACnet object identifier, a Modbus register label,
   anything stable and human-legible).
 - **Payload** (JSON): `{"point": <str>, "value": <int|float|str|bool|null>, "ts": <unix epoch float>}`.
-  One optional key may follow: `"quality"`, only when the device says
+  An optional key may follow: `"quality"`, only when the device says
   something is wrong with the value (Windrow#20). For BACnet it's the
   object's own words, `{"status_flags": ["in-alarm"|"fault"|"overridden"|
   "out-of-service", ...], "reliability": "<BACnet reliability>"}`, either
@@ -19,6 +19,9 @@ repeatable recipe, not one-off work per protocol. This is that recipe.
   (`baler.quality.from_envelope`). No `quality` means nothing reported.
   Pass it as `publish_reading(..., quality=...)`, never build it into
   `value`.
+  A commandable BACnet point's reading may also carry
+  `"priority": {"active": <level|null>, "levels": {"<level>": <value>}}`,
+  its priority array (Windrow#25). Consumers that parse by name ignore it.
 - **`retain=True`** on every publish — a fresh subscriber immediately gets
   the last known value per point instead of waiting for the next poll.
 - Every bridge imports `windrow.mqtt_sink` (`connect()`, `publish_reading()`)
