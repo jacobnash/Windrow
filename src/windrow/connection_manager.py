@@ -24,6 +24,7 @@ from windrow import (
     bacnet_alarms,
     bacnet_batch,
     bacnet_cov,
+    bacnet_inventory,
     bacnet_network,
     bacnet_schedules,
     bacnet_tagger,
@@ -348,6 +349,9 @@ class ConnectionManager:
         # requests sent, by kind - how much the device is asked, not how many points
         self.stats: Counter = Counter()
         self._cov_live: set[int] = set()
+        # Device inventory (Windrow#24) by (device instance, address key):
+        # published on every connection's equip/tags for that device.
+        self.inventory: dict[tuple, dict] = {}
         # Trend-backed points' last reading time (unix s), by
         # "<connection id>/<label>", so a restart knows where to backfill from.
         base, _ext = os.path.splitext(state_file)
@@ -377,7 +381,9 @@ class ConnectionManager:
                 # pick up tags added since (e.g. `unit`). Baler's tag ingest
                 # is additive, so nothing a human added is lost.
                 self._tag_points(record["topic_prefix"], record["points"])
-                self._publish_equip_membership(record["topic_prefix"], record["points"])
+                self._publish_equip_membership(record["topic_prefix"], record["points"], record)
+            for address, instance in {(r["device_address"], r["device_instance"]) for r in records}:
+                self._background(self.refresh_inventory(address, instance))
             span.set_attribute("restored_count", len(records))
 
     async def discover(self, **kwargs) -> list[dict]:
@@ -436,13 +442,14 @@ class ConnectionManager:
             self._apply_batch_limit(device_address)
             self._save()
             self._tag_points(topic_prefix, points)
-            self._publish_equip_membership(topic_prefix, points)
+            self._publish_equip_membership(topic_prefix, points, record)
             self._start_poll_task(record)
+            self._background(self.refresh_inventory(device_address, device_instance))
             span.set_attribute("connection_id", record["id"])
             span.set_attribute("point_count", len(points))
             return record
 
-    def _publish_equip_membership(self, topic_prefix: str, points: list[dict]) -> None:
+    def _publish_equip_membership(self, topic_prefix: str, points: list[dict], record: dict | None = None) -> None:
         """One message per connection, {prefix}/equip/tags - equipment
         identity is the connection's own topic_prefix (Baler's
         ingest.topic_prefix_to_equip_uri), deliberately not the BACnet
@@ -462,6 +469,9 @@ class ConnectionManager:
             tags = {}
             if self.site_id:
                 tags = {"windrowSite": self.site_id, "windrowInstance": self.instance_id}
+            if record is not None:
+                # the controller behind this equipment (Windrow#24)
+                tags.update(bacnet_inventory.inventory_tags(self.inventory.get(_inventory_key(record))))
             payload = json.dumps({"tags": tags, "points": [p["label"] for p in points]})
             mqtt_sink.publish_reading(self.mqtt_client, topic_prefix, "equip/tags", payload)
 
@@ -562,6 +572,35 @@ class ConnectionManager:
                 mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], present)
             return {"topic": topic, "priority": priority, "value": value, "present_value": present}
 
+    async def refresh_inventory(self, device_address: str, device_instance: int, inventory: dict | None = None) -> dict | None:
+        """Read the device's inventory (or take one just read, from the
+        periodic rediscovery) and, when it's new or changed, republish
+        equip/tags on every connection to that device. Returns the
+        inventory, or None if the device didn't answer - a failed read
+        keeps the last one, never blanks it."""
+        if inventory is None:
+            if self.app is None:
+                return None
+            try:
+                async with self._slots():
+                    self.stats["read_inventory"] += 1
+                    inventory = await bacnet_inventory.read_inventory(self.app, device_address, device_instance)
+            except (Exception, ErrorRejectAbortNack) as exc:  # noqa: BLE001 - polling doesn't depend on it
+                print(f"couldn't read the inventory of {device_address} device,{device_instance}: {exc!r}")
+                return None
+        key = (device_instance, bacnet_network.address_key(device_address))
+        previous = self.inventory.get(key)
+        if previous == inventory:
+            return inventory
+        change = bacnet_inventory.compare(previous, inventory)
+        if change is not None:
+            print(f"device,{device_instance} at {device_address}: inventory {change['kind']}: {change['changed']}")
+        self.inventory[key] = inventory
+        for record in self.connections.values():
+            if _inventory_key(record) == key:
+                self._publish_equip_membership(record["topic_prefix"], record["points"], record)
+        return inventory
+
     async def delete_connection(self, connection_id: str) -> bool:
         with tracer.start_as_current_span("connection_manager.delete_connection") as span:
             span.set_attribute("connection_id", connection_id)
@@ -643,7 +682,7 @@ class ConnectionManager:
                 mqtt_sink.clear_retained(self.mqtt_client, old["topic_prefix"], f"{label}/tags")
 
             self._tag_points(record["topic_prefix"], record["points"])
-            self._publish_equip_membership(record["topic_prefix"], record["points"])
+            self._publish_equip_membership(record["topic_prefix"], record["points"], record)
             self._start_poll_task(record)
             span.set_attribute("found", True)
             span.set_attribute("cleared_count", len(removed))
@@ -1084,6 +1123,10 @@ class ConnectionManager:
         finally:
             self._cov_live.discard(id(state))
             subscription.close()
+
+
+def _inventory_key(record: dict) -> tuple:
+    return (record.get("device_instance"), bacnet_network.address_key(record["device_address"]))
 
 
 def _same_object(a: str, b: str) -> bool:

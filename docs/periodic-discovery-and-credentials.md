@@ -50,6 +50,38 @@ connection exists — flips automatically, no extra call needed once you
 `POST /connections` or `POST /modbus/connections` for it), or `ignored` (a
 human dismissed it via `PATCH /devices/{id}`, survives future rescans).
 
+### Device inventory (BACnet)
+
+Each scan also reads what every BACnet device it heard says it is
+(Windrow#24): one ReadPropertyMultiple of the device object (single reads
+for a device without RPM) for `object-name`, `vendor-name`,
+`vendor-identifier`, `model-name`, `firmware-revision`,
+`application-software-version`, `serial-number` (only on devices new enough
+to have it) and `location`. The record gets:
+
+```json
+"inventory": {"instance": 3456, "name": "AHU-1 Controller", "vendor_name": "Acme Controls", "vendor_id": 1234,
+              "model_name": "AC-500", "firmware_revision": "4.2.1", "application_software_version": "AHU v7",
+              "serial_number": "SN-0001", "location": "Mech Room 2"},
+"inventory_read_at": 1786888550.46,
+"inventory_history": [{"at": 1786974950.1, "kind": "replaced", "changed": {"serial_number": ["SN-0000", "SN-0001"]}}]
+```
+
+`inventory_history` keeps the last 20 changes: `replaced` when the vendor,
+model or serial number changed (someone swapped the controller), `software`
+when only firmware or application software did. A property the device
+stops answering isn't a change, and a device that doesn't answer keeps its
+last inventory.
+
+Every connection to the device publishes the inventory on its
+`{topic_prefix}/equip/tags` (`bacnetVendorName`, `bacnetModelName`,
+`bacnetFirmwareRevision`, `bacnetApplicationSoftwareVersion`,
+`bacnetSerialNumber`, `bacnetLocation`, `bacnetDeviceName`,
+`bacnetDeviceInstance`, `bacnetVendorId`), read once when the connection
+starts and republished whenever a rediscovery finds it changed. That's
+what Baler's asset registry keys on. Read-only: nothing is written to the
+device.
+
 ## 2. Set a credential, if the device needs one
 
 Neither BACnet nor Modbus has protocol-level auth — this is pure
