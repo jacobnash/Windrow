@@ -196,3 +196,47 @@ def provenance_tags(evidence: dict | None) -> dict:
     if evidence.get("tokens"):
         out["windrowTagTokens"] = list(evidence["tokens"])
     return out
+
+
+# Learned point field -> the tag it's published as (Windrow#19). Raw BACnet
+# evidence for Baler's classification ladder, not a conclusion: no Brick or
+# Haystack meaning is claimed, hence the `bacnet` prefix. Baler's memory
+# already reads `bacnetObjectType`.
+_RAW_TAGS = {
+    "object_type": "bacnetObjectType",
+    "state_text": "bacnetStateText",
+    "active_text": "bacnetActiveText",
+    "inactive_text": "bacnetInactiveText",
+    "min_pres_value": "bacnetMinPresValue",
+    "max_pres_value": "bacnetMaxPresValue",
+    "cov_increment": "bacnetCovIncrement",
+    "structured_views": "bacnetStructuredView",
+}
+_DEVICE_TAGS = {
+    "name": "bacnetDeviceName",
+    "vendor_name": "bacnetVendorName",
+    "model_name": "bacnetModelName",
+    "location": "bacnetLocation",
+}
+
+
+def raw_metadata_tags(point: dict) -> dict:
+    """The learned BACnet metadata on `point` as tags: values as the device
+    gave them, `bacnetCommandable` a marker when the object has a priority
+    array, the device's identity as bacnetDevice*/bacnetVendorName/... .
+    The object type comes from the identifier when /learn didn't say."""
+    tags: dict = {}
+    object_type = point.get("object_type") or str(point.get("object_identifier", "")).split(",", 1)[0].strip()
+    if object_type:
+        tags["bacnetObjectType"] = object_type
+    for field, tag in _RAW_TAGS.items():
+        if field != "object_type" and point.get(field) not in (None, "", []):
+            tags[tag] = point[field]
+    if point.get("commandable") is True:
+        tags["bacnetCommandable"] = True
+    device = point.get("device")
+    if isinstance(device, dict):
+        for field, tag in _DEVICE_TAGS.items():
+            if device.get(field) not in (None, ""):
+                tags[tag] = device[field]
+    return tags

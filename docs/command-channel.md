@@ -53,6 +53,8 @@ equivalent calls (the `handle_*` functions in `src/windrow/api.py`):
 | `connection_schedules` | `GET /connections/{id}/schedules` | `id` |
 | `modbus_discover` | `POST /modbus/discover` | `cidr`, optional `port`/`concurrency`/`timeout` |
 | `point_write` | `POST /write` | `topic`, `value` (`null` relinquishes), `priority` 1-17 (17 sets BACnet relinquish-default; it cannot be relinquished), optional `expires_at` (unix s). A topic a Modbus connection publishes goes to its writable holding register or coil - see below |
+| `write_schedule` | (command channel only) | `id` (connection), `object` (`schedule,N`), any of `weekly`/`exceptions`/`default`/`effective_period`, optional `expires_at`, `who`, `reason` - see [Schedule and calendar writes](#schedule-and-calendar-writes) |
+| `write_calendar` | (command channel only) | `id` (connection), `object` (`calendar,N`), `dates`, optional `expires_at`, `who`, `reason` |
 | `list_devices` | `GET /devices` | none |
 | `list_announced` | `GET /announced` | none |
 | `add_device` | `POST /devices` | `protocol: "bacnet"`, `device_address`, `device_instance` - or `protocol: "modbus"`, `host`, optional `port` (502) / `device_id` (1) |
@@ -86,13 +88,15 @@ The envelope fields - `action`, `id`, `request_id` and `expires_at` - are
 stripped before the action runs, for every action, so they never reach it as
 parameters. The exceptions are the ones that are parameters: a targeted
 action's `id` (below), and `point_write`'s `expires_at` (a write that arrives
-after it is refused, not applied late). `discover` takes only `low_limit`,
+after it is refused, not applied late; the same for `write_schedule` and
+`write_calendar`). `discover` takes only `low_limit`,
 `high_limit`, `address` and `timeout`; other fields are ignored.
 
 For the actions that act on one device or connection (`set_device_status`,
 `recheck_credentials`, `update_connection`, `delete_connection`, their
-`modbus_*` twins, `set_credential` and `get_job`), `id` is the id of that device or
-connection, so correlate those with `request_id`.
+`modbus_*` twins, `set_credential`, `get_job`, `write_schedule` and
+`write_calendar`), `id` is the id of that device or connection, so correlate
+those with `request_id`.
 
 Results are what the HTTP route returns: device and connection records
 with `credential` redacted to `{"username": ..., "password": null}`, exactly
@@ -156,6 +160,63 @@ publishes, on `cmd/hospital-a/ahu-bridge-1/result`:
             "points": [{"object_identifier": "analog-value,1", "label": "zone-temp"}],
             "credential": null}}
 ```
+
+### Schedule and calendar writes
+
+`write_schedule` and `write_calendar` change a BACnet Schedule or Calendar
+object on a connection's device (Windrow#26). They are the write side of
+`connection_schedules`: the same shapes, so what Baler reads it can change
+and send back, and its revert is the old object written back the same way.
+Baler's audited schedule writes (Baler#213) are the sender. Baler keeps the
+audit (who, why, the before-state, when it reverts), and Windrow applies the
+write.
+
+```json
+{"action": "write_schedule", "id": "<connection id>", "request_id": "…", "expires_at": 1762700030.0,
+ "who": "op:7f3c…", "reason": "Holiday hours for the 24th",
+ "object": "schedule,1",
+ "weekly": {"monday": [{"time": "06:30", "value": "active"}, {"time": "20:00", "value": "inactive"}],
+            "tuesday": […], "wednesday": […], "thursday": […], "friday": […], "saturday": [], "sunday": []},
+ "exceptions": [{"period": {"date": "2026-12-24"}, "priority": 3,
+                 "times": [{"time": "08:00", "value": "active"}, {"time": "12:00", "value": "inactive"}]}],
+ "default": "inactive",
+ "effective_period": ["2026-01-01", "2026-12-31"]}
+```
+
+```json
+{"action": "write_calendar", "id": "<connection id>", "request_id": "…", "expires_at": 1762700030.0,
+ "object": "calendar,1", "dates": [{"date": "2026-12-25"}, {"date_range": ["2026-12-28", "2026-12-31"]},
+                                    {"week_n_day": {"month": 11, "week": 4, "weekday": "thursday"}}]}
+```
+
+- **Fields:** keys left out aren't written. `weekly` has all seven days,
+  each up to 24 `{time, value}` entries. `exceptions` replaces the whole
+  exception schedule (up to 64), each `{period, priority (1-16, default 16),
+  times}`, with a period of `{date}`, `{date_range}`, `{week_n_day}` or
+  `{calendar: "calendar,N"}`. A calendar's `dates` (up to 128) take the same
+  periods except `calendar`. Dates are `YYYY-MM-DD` with `*` for any field
+  (and `odd`/`even` months, `last`/`odd`/`even` days); times are
+  `HH:MM[:SS[.hh]]`; `null` as a value relinquishes.
+- **Values** are encoded for what the schedule drives: `active`/`inactive`
+  for binary objects, a state number for multi-state, a number for analog.
+  With no controlled objects, the type follows the schedule's current default.
+- **Safeguards** (the same as `point_write`): refused after `expires_at`.
+  The object must exist: it's read first, which also tells Windrow how to
+  encode values. Every field is validated before anything is sent, so a bad
+  command writes nothing. Then one bounded WriteProperty per field, in the
+  order `effective_period`, `weekly`, `exceptions`, `default`. If the device
+  refuses one, the error names it and lists any fields already written
+  (`"… refused writing schedule,1 exception-schedule: …; already written:
+  effective-period, weekly-schedule"`). `who` and `reason` are optional and
+  only logged by Windrow; Baler keeps the audit record.
+- **Auth:** like every action, the sender needs the site's MQTT credentials
+  and mosquitto's ACL. There's deliberately no HTTP route.
+- **Result:** the object read back after the write, in
+  `connection_schedules`' format (one schedule or calendar, `controls`
+  labelled), so the caller sees what the device actually holds.
+- **Segmentation:** a long exception schedule may not fit one APDU on a
+  small controller. The device then refuses the write and nothing past
+  that field is written.
 
 ## Status heartbeat
 

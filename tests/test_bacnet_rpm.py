@@ -161,7 +161,7 @@ class Device:
             raise TimeoutError()
         return self.values.get(objid, 1.0)
 
-    async def read_many(self, app, address, objids):
+    async def read_many(self, app, address, objids, status=()):
         self.rpm_sizes.append(len(objids))
         if self.rpm == "reject":
             raise RPMUnsupported("rejected")
@@ -313,7 +313,7 @@ def test_read_multiple_false_keeps_one_read_per_point(tmp_path, monkeypatch):
 
 
 def test_one_bad_object_in_a_batch_publishes_nothing_for_it_and_its_siblings_publish(tmp_path, monkeypatch):
-    async def read_many(app, address, objids):
+    async def read_many(app, address, objids, status=()):
         return {o: (ErrorType(errorClass="object", errorCode="unknownObject") if o.endswith(",1") else 2.0) for o in objids}
 
     monkeypatch.setattr(cm, "read_present_values", read_many)
@@ -370,6 +370,7 @@ class CovApp:
         """What bacpypes3's do_UnconfirmedCOVNotificationRequest does."""
         for sub in list(self._cov_contexts.values()):
             await sub.put(types.SimpleNamespace(propertyIdentifier=PropertyIdentifier("present-value"), value=Any(Real(value))))
+        await asyncio.sleep(0)  # the value goes out once the whole notification is in
 
 
 def _cov_run(tmp_path, monkeypatch, app, seconds, record_extra=None, during=None):

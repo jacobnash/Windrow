@@ -99,6 +99,45 @@ isn't a bug either: that object genuinely has no `units` property, and a
 per-property read failure never hides the rest of the point's fields (see
 `discovery.py`'s `ErrorType` handling).
 
+### The evidence beyond the name
+
+Real sites have bad names, so learn also reads, in the same
+ReadPropertyMultiple, the properties that identify a point when its name
+doesn't (Windrow#19). They come back raw; Windrow decides nothing from
+them beyond its own deterministic pre-tag.
+
+| Field | From | For |
+|---|---|---|
+| `object_type` | the identifier | every point |
+| `commandable` | `relinquish-default` answered (the standard requires it exactly when there's a priority array) | outputs and values |
+| `state_text` | `state-text` | multi-state |
+| `active_text`, `inactive_text` | `active-text`, `inactive-text` | binary |
+| `min_pres_value`, `max_pres_value`, `cov_increment` | the same-named properties | analog |
+| `structured_views` | names of the `structured-view` objects whose `subordinate-list` includes the point | any point an integrator grouped |
+| `device` | the device object's `object-name` (`name`), `vendor-name`, `model-name`, `location`, plus `instance` | every point |
+
+A property the object doesn't have is left out rather than `null`.
+Structured views aren't returned as points. The device read is best
+effort: a device that won't answer it still has its points learned.
+
+```json
+{"object_identifier": "analog-value,1", "label": "zone-temp", "present_value": 68.0,
+ "units": "degrees-fahrenheit", "description": "Simulated zone temperature",
+ "object_type": "analog-value", "commandable": true, "cov_increment": 0.1,
+ "device": {"instance": 3456, "name": "mock", "vendor_name": "BACpypes", "model_name": "N/A"}}
+```
+
+Pass the learned point to create-a-connection as it came back: these
+fields are kept on the stored point and published with its tags
+(`{prefix}/{label}/tags`) as `bacnetObjectType`, `bacnetCommandable` (a
+marker, only when true), `bacnetStateText`, `bacnetActiveText`,
+`bacnetInactiveText`, `bacnetMinPresValue`, `bacnetMaxPresValue`,
+`bacnetCovIncrement`, `bacnetStructuredView`, `bacnetDeviceName`,
+`bacnetVendorName`, `bacnetModelName` and `bacnetLocation`, beside the
+pre-tag's markers. `bacnetObjectType` is published for every point, learned
+or not, since the identifier always says it. Baler's classification ladder
+reads them as evidence.
+
 ## 3. Create a connection
 
 Pick whichever learned points you want, optionally renaming `label` (it's
@@ -215,6 +254,87 @@ Requests sent so far, by kind, are in the command channel's status heartbeat
 as `bacnet_requests` (`read_property`, `read_property_multiple`,
 `subscribe_cov`, `cov_notifications`, and the live `cov_subscriptions`).
 
+### Reading quality: status-flags and reliability
+
+BACnet says when a value is bad. Each batched read also asks the object's
+`status-flags` and `reliability`, in the same ReadPropertyMultiple, and a
+COV notification carries the status-flags with the value. When anything is
+set, the reading's envelope gets a `quality` key (Windrow#20):
+
+```json
+{"point": "dat", "value": -40.0, "ts": 1762700000.0,
+ "quality": {"status_flags": ["fault"], "reliability": "no-sensor"}}
+```
+
+BACnet's own names, not a verdict: `in-alarm` alone is reported but Baler
+doesn't treat it as bad data. A healthy point's envelope has no `quality`
+and is exactly what it was before; an older listener just ignores the key.
+A change of quality publishes even when the value didn't move (a sensor
+failing at its last value), whatever `his_collect_cov` says.
+
+The extra properties take room in the answer, so a status-reading batch to
+a small-APDU device holds fewer objects (~13 for 480 bytes instead of ~23).
+Points read with single ReadProperty - `"read_multiple": false`, or a
+device without RPM - publish no quality: tripling their requests isn't
+worth it. `"read_quality": false` on a connection turns it off.
+
+### Priority arrays: who is holding a point
+
+Every `priority_interval` seconds (default 60, `WINDROW_PRIORITY_INTERVAL`;
+`0` turns it off) Windrow reads the `priority-array` of each commandable
+point (outputs and values), one ReadPropertyMultiple per 8 points, and the
+point's readings carry it (Windrow#25):
+
+```json
+{"point": "zone-temp-sp", "value": 75.0, "ts": 1762700000.0,
+ "priority": {"active": 8, "levels": {"8": 75.0, "16": 72.0}}}
+```
+
+`levels` holds only the levels someone holds; `active` is the lowest of
+them, the one in control (`null` when every level is empty and
+relinquish-default is). Windrow doesn't know who wrote a level. Baler does
+for its own writes (`point_write_levels`), so anything else it sees held is
+someone else's: a human override at the panel or another BMS. That's what
+Baler's passive override tests (Baler#212) start from.
+
+A change in the array publishes straight away, even when the value didn't
+move and `his_collect_cov` would hold it back. A Windrow write
+(`write_point`) re-reads the array at once. A device without RPM is asked
+point by point; an object that answers it has no priority-array isn't
+asked again. Points that aren't commandable, and connections with
+`priority_interval: 0`, publish exactly the envelope they did before. Reads
+only: nothing is written to the device.
+
+
+### Sampling profiles: fast data for control loops
+
+Hunting, such as a valve oscillating with a 4-minute period, is invisible at a
+15-minute poll. `"sampling": "loop"` on a point (or on the connection, as
+the default for its points) samples it for loop analysis (Windrow#27):
+
+- SubscribeCOV where the device supports it, so every change over the
+  object's COV increment publishes as it happens. The point's own
+  `"subscribe_cov": false` still opts it out.
+- Where COV isn't available, a poll at most every 15 s
+  (`WINDROW_LOOP_POLL_INTERVAL`), whatever `poll_interval` says.
+- Under a live subscription, the safety-net poll is at most every 60 s
+  instead of `cov_poll_interval`.
+
+`"sampling": "auto"` on a connection is `loop` for output objects (commands
+and positions: analog, binary and multi-state outputs) and `standard` for
+the rest. A controlled variable, such as a discharge temperature, can't be told
+from its object type, so mark it `"sampling": "loop"` on the point; Baler
+can do that with `PATCH /connections/{id}` from its loop model. Standard
+points are sampled exactly as before.
+
+```json
+{"device_address": "10.0.4.20", "device_instance": 4020, "topic_prefix": "fbf/ahu-3",
+ "poll_interval": 900, "sampling": "auto",
+ "points": [{"object_identifier": "analog-output,3", "label": "chw-vlv"},
+            {"object_identifier": "analog-input,1", "label": "dat", "sampling": "loop"},
+            {"object_identifier": "analog-input,7", "label": "oat"}]}
+```
+
 ## 3d. Backfilling gaps from the controller's trend logs
 
 A controller keeps logging while Windrow is down or can't reach it. Give a
@@ -276,6 +396,11 @@ same as `read_schedules` and `connection_schedules`.
 `python -m windrow.mock_device --schedules` adds `schedule,1` (weekdays 07:00-18:00, a holiday
 calendar exception and an early close on the fourth Thursday of November) driving the first binary
 object, and `calendar,1`.
+
+Writing them back (Windrow#26) goes over the command channel only, as
+`write_schedule` / `write_calendar` in this same format, with `expires_at`
+and a read-back result. See `docs/command-channel.md`, "Schedule and
+calendar writes".
 
 ## 3f. Alarms (intrinsic reporting)
 

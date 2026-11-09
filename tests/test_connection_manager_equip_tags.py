@@ -49,10 +49,11 @@ def test_tag_points_publishes_one_tags_message_per_point(tmp_path):
 
     payload = dict(client.published)["fbf/ahu-3/zone-temp/tags"]
     tags = json.loads(json.loads(payload)["value"])
-    # plus where the tags came from (Windrow#21): the rule and the tokens it matched
+    # plus where the tags came from (Windrow#21): the rule and the tokens it matched,
+    # and bacnetObjectType: raw evidence from the identifier itself (Windrow#19)
     assert tags == {"zone": True, "air": True, "temp": True, "sensor": True,
                     "windrowTagEngine": "windrow-local", "windrowTagRule": "local:zone+temp",
-                    "windrowTagTokens": ["zone", "temp"]}
+                    "windrowTagTokens": ["zone", "temp"], "bacnetObjectType": "analog-value"}
 
 
 def test_tag_points_publishes_empty_dict_for_no_match(tmp_path):
@@ -61,7 +62,7 @@ def test_tag_points_publishes_empty_dict_for_no_match(tmp_path):
 
     payload = dict(client.published)["fbf/ahu-3/NetworkPort-1/tags"]
     tags = json.loads(json.loads(payload)["value"])
-    assert tags == {}
+    assert tags == {"bacnetObjectType": "network-port"}  # no tagger match: only the raw type
 
 
 def test_publish_equip_membership_lists_every_point_label(tmp_path):

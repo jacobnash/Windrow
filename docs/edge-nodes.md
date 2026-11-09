@@ -134,6 +134,35 @@ than that, the oldest readings go first, and each trim is logged with how
 many readings of how many points were dropped and the time span lost. The
 status heartbeat's `spool` shows `rows`, `capacity` and `dropped`.
 
+## Batched envelope (optional, Baler#234)
+
+By default every reading is its own retained MQTT message on
+`{prefix}/{label}`. A node polling thousands of points can instead send one
+message per device per poll tick:
+
+```bash
+WINDROW_MQTT_ENVELOPE=batch      # default: point
+WINDROW_MQTT_BATCH_MS=250        # how long a device's readings wait for their batch
+WINDROW_MQTT_BATCH_MAX_POINTS=1000
+```
+
+Live readings (BACnet polls and COV, Modbus polls, Haystack curVals) then go
+to `{prefix}/batch` as `{"ts": t, "points": {"<label>": value, ...}}`, or
+`{"points": [{"point", "value", "ts"}, ...]}` when the timestamps differ.
+These messages are QoS 1 and **not retained**. Modbus sends its batch at the
+end of each poll tick. BACnet's per-point loops share the batch window. Tags
+(`/tags`, `equip/tags`), controller alarms, write read-backs and trend-log
+backfill stay per point. Point identity doesn't change: Baler stores a batch
+reading under the same `urn:point:{prefix}/{label}` as the per-point topic.
+
+Use it only with a Baler whose `mqtt_listener` accepts batches (Baler#234).
+Haxall's MQTT bridge and other per-point consumers read the per-point
+topics. There are no retained values in this mode, so a brand-new subscriber
+gets each point's value at its next poll, not from the broker. If the uplink
+is down when a batch is due, its readings are spooled one per point and
+replayed per point, which Baler also accepts. The status heartbeat's
+`envelope` shows the mode and the batches and readings sent.
+
 ## Checking
 
 ```bash

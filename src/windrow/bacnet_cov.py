@@ -13,6 +13,13 @@ Notifications still arrive through bacpypes3's ChangeOfValueServices: it
 looks up app._cov_contexts[(source address, subscriber process id)] and
 awaits .put(property_value) on whatever it finds, which is all a
 Subscription implements.
+
+A notification carries the object's status-flags beside its present-value
+(Windrow#20). bacpypes3 hands them to put() one property at a time, in one
+uninterrupted loop, so put() only collects; the value goes to on_value(value,
+quality) from a call_soon callback, which runs once the whole notification
+has been put. Reliability isn't in a COV notification, so a notified
+reading's quality is its status-flags alone.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ from collections.abc import Callable
 from typing import Any
 
 from windrow.bacnet_read import READ_TIMEOUT, cast_value, enum_name, request
+from windrow.bacnet_values import quality_of
 
 # Subscriber process ids are per subscriber, 22 bits. Start somewhere random
 # so a restart doesn't reuse the last run's ids while the device still holds
@@ -46,7 +54,7 @@ _UNSUPPORTED_CODES = {
 
 
 class Subscription:
-    def __init__(self, app, address: str, objid: str, on_value: Callable[[Any], None]):
+    def __init__(self, app, address: str, objid: str, on_value: Callable[[Any, dict | None], None]):
         self.app = app
         self.address = address
         self.objid = objid
@@ -56,6 +64,10 @@ class Subscription:
         self._objid = None
         self._vendor_info = None
         self._registered = False
+        # the notification being put(): its present-value and status-flags
+        self._pending_value = None
+        self._pending_flags = None
+        self._emit_scheduled = False
 
     async def _resolve(self) -> None:
         from bacpypes3.pdu import Address
@@ -98,15 +110,34 @@ class Subscription:
 
     async def put(self, property_value) -> None:
         """Called by bacpypes3 for each value in a COV notification."""
-        if str(property_value.propertyIdentifier) != "present-value":
-            return  # status-flags etc.; only present-value is a reading
+        prop = str(property_value.propertyIdentifier)
+        if prop not in ("present-value", "status-flags"):
+            return
         try:
             value = cast_value(self._vendor_info, self._objid, property_value.propertyIdentifier, property_value.value)
         except Exception as exc:  # noqa: BLE001 - a bad notification mustn't break bacpypes3's receive path
-            print(f"COV notification from {self.address} for {self.objid} didn't decode: {exc!r}")
+            print(f"COV notification from {self.address} for {self.objid} didn't decode {prop}: {exc!r}")
             return
-        if value is not None:
-            self.on_value(value)
+        if prop == "status-flags":
+            self._pending_flags = value
+        elif value is not None:
+            self._pending_value = value
+        # scheduled either way, so flags from a notification without a value
+        # are dropped with it rather than pinned on the next one's value
+        if not self._emit_scheduled:
+            self._emit_scheduled = True
+            asyncio.get_running_loop().call_soon(self._emit)
+
+    def _emit(self) -> None:
+        value, flags = self._pending_value, self._pending_flags
+        self._pending_value = self._pending_flags = None
+        self._emit_scheduled = False
+        if value is None:
+            return
+        try:
+            self.on_value(value, quality_of(flags))
+        except Exception as exc:  # noqa: BLE001 - a callback in call_soon has nobody to raise to
+            print(f"COV notification from {self.address} for {self.objid} wasn't handled: {exc!r}")
 
     def close(self) -> None:
         """Stop taking notifications and, best effort, cancel the

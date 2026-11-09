@@ -388,6 +388,17 @@ def test_every_action_tolerates_the_full_command_envelope(harness, monkeypatch):
     monkeypatch.setattr(harness.manager, "discover", fake_discover)
     monkeypatch.setattr(harness.manager, "learn", fake_learn)
     monkeypatch.setattr(harness.manager, "write_point", fake_write)
+
+    async def fake_write_schedule(connection_id, body, expires_at=None, who=None, reason=None):
+        calls["write_schedule"] = (connection_id, body, expires_at)
+        return {"object": body["object"]}
+
+    async def fake_write_calendar(connection_id, body, expires_at=None, who=None, reason=None):
+        calls["write_calendar"] = (connection_id, body, expires_at)
+        return {"object": body["object"]}
+
+    monkeypatch.setattr(harness.manager, "write_schedule", fake_write_schedule)
+    monkeypatch.setattr(harness.manager, "write_calendar", fake_write_calendar)
     monkeypatch.setattr(harness.modbus_manager, "test_read", fake_test_read)
     monkeypatch.setattr(api.modbus_discovery, "sweep", fake_sweep)
     monkeypatch.setattr(connection_manager.ConnectionManager, "_tag_points", lambda *a: None)
@@ -422,6 +433,8 @@ def test_every_action_tolerates_the_full_command_envelope(harness, monkeypatch):
         "learn": {"device_address": "10.0.0.5", "device_instance": 5},
         "modbus_discover": {"cidr": "10.0.0.0/30"},
         "point_write": {"topic": "fbf/ahu-1/zone-temp", "value": 1, "priority": 8},
+        "write_schedule": {"id": bacnet["id"], "object": "schedule,1", "default": "inactive"},
+        "write_calendar": {"id": bacnet["id"], "object": "calendar,1", "dates": []},
         "list_devices": {},
         "list_announced": {},
         "set_device_status": {"id": device["id"], "status": "ignored"},
@@ -459,7 +472,9 @@ def test_every_action_tolerates_the_full_command_envelope(harness, monkeypatch):
     assert calls["discover_routers"] == (5, 1)
     assert [c[:2] for c in calls["schedules"]] == [("10.0.0.5", 5), (BACNET_CONN["device_address"], BACNET_CONN["device_instance"])]
     assert calls["connection_alarms"] == bacnet["id"]
-    assert calls["point_write"] == expires_at  # the one action that takes it
+    assert calls["point_write"] == expires_at  # the writes take it: refused after it
+    assert calls["write_schedule"] == (bacnet["id"], {"object": "schedule,1", "default": "inactive"}, expires_at)
+    assert calls["write_calendar"] == (bacnet["id"], {"object": "calendar,1", "dates": []}, expires_at)
 
 
 def test_command_body_strips_the_envelope():

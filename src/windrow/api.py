@@ -141,6 +141,29 @@ async def handle_connection_schedules(manager: ConnectionManager, body: dict) ->
     return result
 
 
+async def handle_write_schedule(manager: ConnectionManager, body: dict) -> dict:
+    """{id: connection id, object: "schedule,N", weekly?, exceptions?,
+    default?, effective_period?, expires_at?, who?, reason?} -> the
+    schedule read back (Windrow#26). Command channel only."""
+    return await _schedule_write(manager.write_schedule, body)
+
+
+async def handle_write_calendar(manager: ConnectionManager, body: dict) -> dict:
+    """{id, object: "calendar,N", dates, expires_at?, who?, reason?} -> the calendar read back."""
+    return await _schedule_write(manager.write_calendar, body)
+
+
+async def _schedule_write(write, body: dict) -> dict:
+    connection_id = _target_id(body)
+    fields = {k: v for k, v in body.items() if k not in ("id", "expires_at", "who", "reason")}
+    who, reason = body.get("who"), body.get("reason")
+    result = await write(connection_id, fields, expires_at=body.get("expires_at"),
+                         who=who if isinstance(who, str) else None, reason=reason if isinstance(reason, str) else None)
+    if result is None:
+        raise NotFound("no connection with that id")
+    return result
+
+
 async def handle_point_write(
     manager: ConnectionManager, body: dict, modbus_manager: ModbusConnectionManager | None = None
 ) -> dict:
@@ -711,7 +734,7 @@ def make_handler(
 TARGETED_ACTIONS = {
     "set_device_status", "recheck_credentials", "update_connection", "delete_connection",
     "modbus_update_connection", "modbus_delete_connection", "set_credential", "get_job", "connection_alarms",
-    "connection_schedules",
+    "connection_schedules", "write_schedule", "write_calendar",
 }
 
 
@@ -721,7 +744,7 @@ TARGETED_ACTIONS = {
 # a targeted action's `id` names its device/connection/job, and point_write
 # refuses a command that arrives after its `expires_at`.
 ENVELOPE_FIELDS = ("action", "id", "request_id", "expires_at")
-ENVELOPE_PARAMS = {"point_write": {"expires_at"}}
+ENVELOPE_PARAMS = {"point_write": {"expires_at"}, "write_schedule": {"expires_at"}, "write_calendar": {"expires_at"}}
 
 
 def command_body(action, payload: dict) -> dict:
@@ -767,6 +790,8 @@ def _make_on_command(
         "connection_schedules": lambda body: handle_connection_schedules(manager, body),
         "modbus_discover": lambda body: handle_modbus_discover(body),
         "point_write": lambda body: handle_point_write(manager, body, modbus_manager),
+        "write_schedule": lambda body: handle_write_schedule(manager, body),
+        "write_calendar": lambda body: handle_write_calendar(manager, body),
         "list_devices": lambda body: handle_list_devices(device_registry, body),
         "list_announced": lambda body: handle_list_announced(announce_registry, body),
         "set_device_status": lambda body: handle_set_device_status(device_registry, body),
@@ -906,6 +931,7 @@ def build_status(
         "bacnet_requests": manager.read_stats(),
         "modbus_connections": len(modbus_manager.connections),
         "spool": mqtt_sink.spool_stats(),
+        "envelope": mqtt_sink.batch_stats(),
         "devices": len(devices),
         "pending_devices": sum(1 for d in devices if d.get("status") == "pending"),
         "networks": list(networks or []),
