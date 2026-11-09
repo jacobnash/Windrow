@@ -22,6 +22,12 @@ Falling back, in order of how sure we are the device can't do better:
   wait out the timeout is what Baler#47's slot cap exists to stop.
 - Anything else (a mismatched or undecodable answer): read this batch
   singly; the single read has its own checks.
+
+A read asked with status=True (Windrow#20: the point's connection publishes
+reading quality) also asks the object's status-flags and reliability in the
+same RPM, and resolves to a bacnet_read.Sample. A single ReadProperty
+fallback reads present-value only - tripling the requests to a device that
+can't batch isn't worth it - so it resolves to the bare value, as before.
 """
 
 from __future__ import annotations
@@ -45,20 +51,27 @@ MAX_RPM_POINTS = int(os.environ.get("WINDROW_RPM_MAX_POINTS", "50"))
 # id (5) + property id (2) + an opening/closing tag pair per level (4) + the
 # value (up to 5 for a Real) + slack for a Null/enumeration/status choice.
 _BYTES_PER_RESULT = 20
+# What status-flags (property id + tags + a 4-bit bitstring, ~7) and
+# reliability (an enumeration ~6, or an error ~8) add per object, rounded up.
+_STATUS_BYTES = 16
 _APDU_OVERHEAD = 8
 
 
-def points_per_request(max_apdu: int | None, cap: int = MAX_RPM_POINTS) -> int:
+def points_per_request(max_apdu: int | None, cap: int = MAX_RPM_POINTS, status: bool = False) -> int:
     """How many present-values fit one unsegmented answer from a device
     that accepts `max_apdu` bytes (from its I-Am; MS/TP devices are often
-    480, BACnet/IP 1476). Unknown: just the cap."""
+    480, BACnet/IP 1476). Unknown: just the cap. `status`: each object's
+    status-flags and reliability come back too."""
     if not max_apdu:
         return cap
-    return max(1, min(cap, (int(max_apdu) - _APDU_OVERHEAD) // _BYTES_PER_RESULT))
+    per = _BYTES_PER_RESULT + (_STATUS_BYTES if status else 0)
+    return max(1, min(cap, (int(max_apdu) - _APDU_OVERHEAD) // per))
 
 
 ReadOne = Callable[[Any, str, str], Awaitable[Any]]
-ReadMany = Callable[[Any, str, list[str]], Awaitable[dict[str, Any]]]
+# read_many(app, address, objids) or, when some reads want quality,
+# read_many(app, address, objids, status=[objids among them])
+ReadMany = Callable[..., Awaitable[dict[str, Any]]]
 
 
 class ReadBatcher:
@@ -82,15 +95,15 @@ class ReadBatcher:
         self.max_points = max(1, max_points)
         self.window = COALESCE_WINDOW if window is None else window
         self.rpm_supported = True
-        self._pending: list[tuple[str, asyncio.Future]] = []
+        self._pending: list[tuple[str, asyncio.Future, bool]] = []
         self._timer: asyncio.TimerHandle | None = None
         self._running: set[asyncio.Task] = set()
         self._lock: asyncio.Lock | None = None
 
-    async def read(self, objid: str) -> Any:
+    async def read(self, objid: str, status: bool = False) -> Any:
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        self._pending.append((objid, future))
+        self._pending.append((objid, future, status))
         if self._timer is None:
             self._timer = loop.call_later(self.window, self._flush)
         return await future
@@ -106,7 +119,7 @@ class ReadBatcher:
         self._running.add(task)
         task.add_done_callback(self._running.discard)
 
-    async def _run(self, batch: list[tuple[str, asyncio.Future]]) -> None:
+    async def _run(self, batch: list[tuple[str, asyncio.Future, bool]]) -> None:
         # One flush at a time per device, its chunks one after another: a
         # controller answers one RPM at a time anyway, and a dead one then
         # costs one timeout per flush, not one per chunk.
@@ -115,12 +128,15 @@ class ReadBatcher:
         async with self._lock:
             await self._run_locked(batch)
 
-    async def _run_locked(self, batch: list[tuple[str, asyncio.Future]]) -> None:
+    async def _run_locked(self, batch: list[tuple[str, asyncio.Future, bool]]) -> None:
         # Two connections can poll the same object; ask once, answer both.
         waiters: dict[str, list[asyncio.Future]] = {}
-        for objid, future in batch:
+        want_status: set[str] = set()
+        for objid, future, status in batch:
             if not future.done():  # its point task was cancelled meanwhile
                 waiters.setdefault(objid, []).append(future)
+                if status:
+                    want_status.add(objid)
         objids = list(waiters)
         try:
             if not self.rpm_supported or len(objids) == 1:
@@ -134,7 +150,11 @@ class ReadBatcher:
                 try:
                     async with self._slots():
                         self.stats["read_property_multiple"] += 1
-                        results = await self._read_many(self.app, self.address, chunk)
+                        status = [objid for objid in chunk if objid in want_status]
+                        if status:
+                            results = await self._read_many(self.app, self.address, chunk, status=status)
+                        else:
+                            results = await self._read_many(self.app, self.address, chunk)
                 except RPMUnsupported as exc:
                     if exc.too_big and self.max_points > 1:
                         self.max_points = max(1, len(chunk) // 2)
