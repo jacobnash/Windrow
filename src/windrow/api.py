@@ -906,6 +906,7 @@ def build_status(
         "bacnet_requests": manager.read_stats(),
         "modbus_connections": len(modbus_manager.connections),
         "spool": mqtt_sink.spool_stats(),
+        "envelope": mqtt_sink.batch_stats(),
         "devices": len(devices),
         "pending_devices": sum(1 for d in devices if d.get("status") == "pending"),
         "networks": list(networks or []),

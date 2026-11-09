@@ -882,7 +882,7 @@ class ConnectionManager:
             his_collect_interval=point.get("his_collect_interval"),
         )
         if publish:
-            mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value)
+            mqtt_sink.publish_live(self.mqtt_client, record["topic_prefix"], point["label"], value)
             state.last_value = value
             state.last_published_at = now
         self.status.success(record.get("id"), point["label"], published=publish)
