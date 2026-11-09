@@ -23,7 +23,10 @@ from __future__ import annotations
 import asyncio
 import time
 
+from bacpypes3.apdu import ErrorRejectAbortNack
+
 from windrow import (
+    bacnet_inventory,
     bacnet_network,
     connection_store,
     default_credential_check,
@@ -39,6 +42,8 @@ tracer = tracing.get_tracer(__name__)
 DIRECTED_WHO_IS_TIMEOUT = 3.0
 
 DEVICE_STATUSES = ("pending", "provisioned", "ignored")
+# Inventory changes kept per device record, newest last (Windrow#24).
+INVENTORY_HISTORY = 20
 BACNET_PORT = 47808
 MAX_BACNET_INSTANCE = 4194302  # 2^22 - 2; 4194303 is the "unconfigured" wildcard
 
@@ -356,11 +361,50 @@ class DeviceRegistry:
         print(f"bacnet scan: {len(found)} device(s) ({directed} via directed Who-Is to {len(targets)} known address(es))")
         return found
 
+    async def refresh_inventories(self, app, devices: list[dict], connection_manager=None) -> None:
+        """Re-read every device this scan heard (Windrow#24): store the
+        inventory on its record, append to `inventory_history` when the
+        hardware (a swap) or software (a re-flash) changed, and hand it to
+        the connection manager to republish on that device's equip/tags.
+        One device at a time, each bounded; one that doesn't answer keeps
+        its last inventory."""
+        for device in devices:
+            key = (device["device_instance"], bacnet_network.address_key(device["address"]))
+            record = self._find("bacnet", key)
+            if record is None:
+                continue
+            try:
+                inventory = await bacnet_inventory.read_inventory(app, device["address"], device["device_instance"])
+            except (Exception, ErrorRejectAbortNack) as exc:  # noqa: BLE001 - one silent device mustn't stop the rest
+                print(f"bacnet scan: no inventory from {device['address']} device,{device['device_instance']}: {exc!r}")
+                continue
+            self.record_inventory(record, inventory)
+            if connection_manager is not None and record.get("connection_id"):
+                address = connection_manager.connections.get(record["connection_id"], {}).get("device_address", device["address"])
+                await connection_manager.refresh_inventory(address, device["device_instance"], inventory)
+        self._save()
+
+    def record_inventory(self, record: dict, inventory: dict, now: float | None = None) -> dict | None:
+        """Store `inventory` on a device record; returns the change (see
+        bacnet_inventory.compare) if there was one, also kept in the
+        record's inventory_history."""
+        now = time.time() if now is None else now
+        change = bacnet_inventory.compare(record.get("inventory"), inventory)
+        if change is not None:
+            history = record.setdefault("inventory_history", [])
+            history.append({"at": now, **change})
+            del history[:-INVENTORY_HISTORY]
+            print(f"device {record['id']} (device,{record.get('device_instance')}): inventory {change['kind']}: {change['changed']}")
+        record["inventory"] = inventory
+        record["inventory_read_at"] = now
+        return change
+
     async def run_periodic_bacnet_scan(self, app, connection_manager, interval: float) -> None:
         while True:
             connections = list(connection_manager.connections.values())
             devices = await self.scan_bacnet(app, connections)
             await self.reconcile_bacnet(devices, connections)
+            await self.refresh_inventories(app, devices, connection_manager)
             await asyncio.sleep(interval)
 
     async def run_periodic_modbus_scan(self, cidr: str, connection_manager, interval: float) -> None:

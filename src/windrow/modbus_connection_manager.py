@@ -603,8 +603,11 @@ class ModbusConnectionManager:
                         self.status.failure(record.get("id"), label,
                                             f"register {point['register']}: the device refused it or sent no usable value")
                         continue
-                    mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], label, value)
+                    mqtt_sink.publish_live(self.mqtt_client, record["topic_prefix"], label, value)
                     self.status.success(record.get("id"), label, published=True)
+            # The tick is over: its readings go now as one batch message
+            # (WINDROW_MQTT_ENVELOPE=batch), not at the window's end.
+            mqtt_sink.flush_batches(record["topic_prefix"])
             if record["points"] and raised == len(record["points"]):
                 client.close()  # every read raised: next cycle reconnects
             await asyncio.sleep(record["poll_interval"])

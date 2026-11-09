@@ -101,6 +101,56 @@ def _name(rec: dict) -> str:
     return rid.rsplit(".", 1)[-1]
 
 
+# Pages a paged read may take before discovery gives up rather than loop
+# forever on a server that keeps answering the same cursor.
+MAX_READ_PAGES = 10_000
+
+
+def read_all(client, filter: str) -> list[dict]:
+    """Every record matching `filter`, following the server's read paging.
+
+    Baler pages reads (1,000 records by default, Baler#280): a short page's
+    meta carries `after`, the cursor to send back for the next one, and a
+    plain `Client.read` from an openhay without paging stopped at the first
+    page - discovery silently found only 1,000 points. This follows `after`
+    to the end: with openhay's `Client.read_page` when it has one, else with
+    `call("read")` and an `after` in the request grid. A server that doesn't
+    page (Haxall, SkySpark, nhaystack) never sets `after`, so it's one plain
+    read, exactly as before. Records are de-duplicated by id. A client with
+    neither (only `read`) gets that one read."""
+    if not hasattr(client, "read_page") and not hasattr(client, "call"):
+        return list(client.read(filter))
+    recs: list[dict] = []
+    seen: set = set()
+    after = None
+    cursors: set = set()
+    for _ in range(MAX_READ_PAGES):
+        if hasattr(client, "read_page"):
+            page = client.read_page(filter, after=after)
+        else:
+            row = {"filter": filter}
+            if after is not None:
+                row["after"] = after
+            page = client.call("read", oh.Grid.from_rows([row]))
+        for rec in page.rows:
+            rid = rec["id"].id if isinstance(rec.get("id"), oh.Ref) else None
+            if rid is not None:
+                if rid in seen:
+                    continue
+                seen.add(rid)
+            recs.append(rec)
+        after = (page.meta or {}).get("after")
+        if after is None or not page.rows:
+            return recs
+        key = after.id if isinstance(after, oh.Ref) else str(after)
+        if key in cursors:  # a server handing back a cursor it already gave: stop, don't spin
+            print(f"haystack read of {filter!r}: the server repeated cursor {key}; stopping at {len(recs)} records")
+            return recs
+        cursors.add(key)
+    print(f"haystack read of {filter!r}: stopped after {MAX_READ_PAGES} pages ({len(recs)} records)")
+    return recs
+
+
 class HaystackSource:
     def __init__(self, client: oh.Client, mqtt_client, source_id: str, filter: str = "point",
                  site_id: str | None = None, instance_id: str | None = None):
@@ -122,7 +172,7 @@ class HaystackSource:
 
     def discover(self) -> int:
         with tracer.start_as_current_span("haystack_source.discover") as span, self._lock:
-            recs = [r for r in self.client.read(self.filter) if isinstance(r.get("id"), oh.Ref)]
+            recs = [r for r in read_all(self.client, self.filter) if isinstance(r.get("id"), oh.Ref)]
             equip_ids = sorted({r["equipRef"].id for r in recs if isinstance(r.get("equipRef"), oh.Ref)})
             equips = dict(zip(equip_ids, self.client.read_ids(equip_ids))) if equip_ids else {}
         self.points.clear()
@@ -174,7 +224,7 @@ class HaystackSource:
             return False
         self._last[rid] = value
         p = self.points[rid]
-        mqtt_sink.publish_reading(self.mqtt, p["prefix"], p["label"], value)
+        mqtt_sink.publish_live(self.mqtt, p["prefix"], p["label"], value)
         return True
 
     def poll_once(self, lease_secs: float = 300.0) -> int:

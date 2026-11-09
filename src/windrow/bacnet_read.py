@@ -32,6 +32,13 @@ can't do RPM (Reject unrecognized-service, a services-class Error) or can't
 fit the answer in one APDU (Abort buffer-overflow/segmentation-not-supported/
 apdu-too-long) raises RPMUnsupported, so the caller can shrink the batch or
 fall back to single reads.
+
+With `status`, read_present_values also asks those objects' status-flags
+and reliability in the same request (Windrow#20), and answers each of them
+with a Sample: the value plus the reading's `quality` field
+(bacnet_values.quality_of). A device that has no reliability property on an
+object answers that one property with an error inside the result, which
+just leaves it out of the quality; it never fails the value.
 """
 
 from __future__ import annotations
@@ -40,10 +47,32 @@ import asyncio
 import os
 from typing import Any
 
+from windrow.bacnet_values import quality_of
+
 # Seconds one ReadProperty may take before it counts as failed. Above
 # bacpypes3's own APDU timeout x retries (3 s x 3), so a slow device that
 # does answer isn't cut off.
 READ_TIMEOUT = float(os.environ.get("WINDROW_READ_TIMEOUT", "10"))
+
+# Asked alongside present-value for a reading's quality (Windrow#20).
+STATUS_PROPERTIES = ("status-flags", "reliability")
+
+
+class Sample:
+    """A present-value with its quality (bacnet_values.quality_of: None
+    when the device reports nothing wrong)."""
+
+    __slots__ = ("quality", "value")
+
+    def __init__(self, value, quality: dict | None = None):
+        self.value = value
+        self.quality = quality
+
+    def __eq__(self, other):
+        return isinstance(other, Sample) and (self.value, self.quality) == (other.value, other.quality)
+
+    def __repr__(self):
+        return f"Sample({self.value!r}, {self.quality!r})"
 
 
 async def request(app, apdu, timeout: float | None = None):
@@ -128,11 +157,15 @@ async def read_present_value(app, address, objid, prop: str = "present-value", t
 
 
 async def read_present_values(
-    app, address, objids: list[str], prop: str = "present-value", timeout: float | None = None
+    app, address, objids: list[str], prop: str = "present-value", timeout: float | None = None,
+    status=(),
 ) -> dict[str, Any]:
     """One ReadPropertyMultiple for `prop` of every object in `objids`.
 
-    Returns {objid as given: value}. A per-object failure the device reports
+    Returns {objid as given: value}. An object also in `status` gets its
+    status-flags and reliability asked too, and its value comes back as a
+    Sample(value, quality) - unless the value itself failed, which comes
+    back as the ErrorType like any other object's. A per-object failure the device reports
     inside the answer (unknown-object, say) comes back as that object's
     bacpypes3 ErrorType, and an object missing from the answer is left out,
     so the caller counts both as failed reads without failing its siblings.
@@ -155,18 +188,25 @@ async def read_present_values(
     vendor_info = await app.get_vendor_info(device_address=address)
     prop_ref = await app.parse_property_reference(prop, vendor_info=vendor_info)
     prop_id = prop_ref.propertyIdentifier
+    status = set(status or ())
+    status_ids = []
+    if status:
+        for name in STATUS_PROPERTIES:
+            status_ids.append((await app.parse_property_reference(name, vendor_info=vendor_info)).propertyIdentifier)
 
     asked: dict = {}  # parsed ObjectIdentifier -> the caller's string
+    with_status: set = set()  # parsed ObjectIdentifiers whose status was asked too
     specs = []
     for objid in objids:
         parsed = await app.parse_object_identifier(objid, vendor_info=vendor_info) if isinstance(objid, str) else objid
         if parsed in asked:
             continue
         asked[parsed] = objid
-        specs.append(ReadAccessSpecification(
-            objectIdentifier=parsed,
-            listOfPropertyReferences=[PropertyReference(propertyIdentifier=prop_id)],
-        ))
+        refs = [PropertyReference(propertyIdentifier=prop_id)]
+        if objid in status:
+            with_status.add(parsed)
+            refs += [PropertyReference(propertyIdentifier=sid) for sid in status_ids]
+        specs.append(ReadAccessSpecification(objectIdentifier=parsed, listOfPropertyReferences=refs))
 
     response = await request(
         app, ReadPropertyMultipleRequest(listOfReadAccessSpecs=SequenceOf(ReadAccessSpecification)(specs), destination=address),
@@ -187,18 +227,49 @@ async def read_present_values(
         raise ReadError(f"{address} answered ReadPropertyMultiple with {response!r}")
 
     results: dict[str, Any] = {}
+    statuses: dict = {}  # parsed ObjectIdentifier -> {status property: value}
     for access_result in response.listOfReadAccessResults:
         objid = access_result.objectIdentifier
         if objid not in asked:
             raise MismatchedResponse(f"asked {address} for {len(asked)} objects, got an answer for {objid}")
         for element in access_result.listOfResults:
-            if element.propertyIdentifier != prop_id:
-                raise MismatchedResponse(f"asked {address} for {objid} {prop_id}, got {element.propertyIdentifier}")
+            pid = element.propertyIdentifier
+            if pid != prop_id:
+                if objid in with_status and pid in status_ids:
+                    if element.readResult.propertyAccessError is None:
+                        statuses.setdefault(objid, {})[str(pid)] = _cast_status(
+                            vendor_info, objid, pid, element.readResult.propertyValue
+                        )
+                    continue
+                raise MismatchedResponse(f"asked {address} for {objid} {prop_id}, got {pid}")
             if element.readResult.propertyAccessError is not None:
                 results[asked[objid]] = element.readResult.propertyAccessError
             else:
                 results[asked[objid]] = cast_value(vendor_info, objid, prop_id, element.readResult.propertyValue)
+    for objid in with_status:
+        key = asked[objid]
+        value = results.get(key)
+        if key not in results or _is_error(value):
+            continue
+        found = statuses.get(objid, {})
+        results[key] = Sample(value, quality_of(found.get("status-flags"), found.get("reliability")))
     return results
+
+
+def _cast_status(vendor_info, objid, prop_id, value_any):
+    """status-flags/reliability, or None if this object type (a vendor's
+    proprietary one, say) doesn't declare the property - a reading without
+    quality, never a failed reading."""
+    try:
+        return cast_value(vendor_info, objid, prop_id, value_any)
+    except Exception:  # noqa: BLE001 - an undecodable status is no status
+        return None
+
+
+def _is_error(value) -> bool:
+    from bacpypes3.basetypes import ErrorType
+
+    return isinstance(value, ErrorType)
 
 
 class ReadError(RuntimeError):

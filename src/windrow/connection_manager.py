@@ -24,6 +24,7 @@ from windrow import (
     bacnet_alarms,
     bacnet_batch,
     bacnet_cov,
+    bacnet_inventory,
     bacnet_network,
     bacnet_schedules,
     bacnet_tagger,
@@ -33,8 +34,14 @@ from windrow import (
     mqtt_sink,
     tracing,
 )
-from windrow.bacnet_read import READ_TIMEOUT, read_present_value, read_present_values
-from windrow.bacnet_values import normalize_value
+from windrow.bacnet_read import (
+    READ_TIMEOUT,
+    RPMUnsupported,
+    Sample,
+    read_present_value,
+    read_present_values,
+)
+from windrow.bacnet_values import normalize_value, priority_levels
 from windrow.poll_status import PollStatus
 
 tracer = tracing.get_tracer(__name__)
@@ -113,6 +120,9 @@ POINT_FIELDS = {
     "object_identifier", "label", "units", "description", "poll_interval",
     "his_collect_cov", "his_collect_cov_rate_limit", "his_collect_interval",
     "subscribe_cov", "trend_log", "sampling",
+    # raw BACnet metadata from /learn (Windrow#19), published with the tags
+    "object_type", "commandable", "state_text", "active_text", "inactive_text",
+    "min_pres_value", "max_pres_value", "cov_increment", "structured_views", "device",
 }
 # How a connection reads its device (Baler#127). All optional; a record
 # without them reads with ReadPropertyMultiple and doesn't subscribe.
@@ -128,15 +138,28 @@ POINT_FIELDS = {
 #   forward_alarms     register as a recipient in the device's notification
 #                      classes and publish its alarms (Baler#164) - off by
 #                      default: it changes the controller's configuration
+#   priority_interval  seconds between reads of every commandable point's
+#                      priority-array, published as the reading's
+#                      `priority` (Windrow#25); 0 turns it off
+#   read_quality       read each point's status-flags and reliability with
+#                      its present-value and publish them as the reading's
+#                      `quality` (Windrow#20) - on by default; batched reads
+#                      and COV notifications only, a single ReadProperty
+#                      reads the value alone
 #   sampling           the default sampling profile for the connection's
 #                      points (Windrow#27): "standard", "loop", or "auto"
 #                      (loop for outputs); a point's own `sampling` wins
 READ_OPTION_FIELDS = {
     "read_multiple", "read_multiple_max", "subscribe_cov", "cov_lifetime", "cov_poll_interval", "backfill_window",
-    "forward_alarms", "sampling",
+    "forward_alarms", "priority_interval", "read_quality", "sampling",
 }
 UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "device_address", "device_name"} | READ_OPTION_FIELDS
 DEFAULT_COV_LIFETIME = 300
+# Priority arrays (Windrow#25): read every minute by default - an override
+# shows up within a minute, at one RPM per PRIORITY_BATCH commandable points.
+DEFAULT_PRIORITY_INTERVAL = float(os.environ.get("WINDROW_PRIORITY_INTERVAL", "60"))
+# Objects per priority-array RPM: a full array of Reals is ~100 bytes.
+PRIORITY_BATCH = 8
 # Sampling profiles (Windrow#27). A control-loop point - a command, a
 # position, a controlled variable - hunting with a 4-minute period is
 # invisible at a 15-minute poll. "loop" subscribes COV where the device
@@ -176,7 +199,7 @@ def validate_read_options(options: dict) -> dict:
     """The READ_OPTION_FIELDS present in `options`, type-checked. ValueError
     (a 400) for a wrong type, same as every other connection field."""
     cleaned = {}
-    for key in ("read_multiple", "subscribe_cov", "forward_alarms"):
+    for key in ("read_multiple", "subscribe_cov", "forward_alarms", "read_quality"):
         if key in options:
             if not isinstance(options[key], bool):
                 raise ValueError(f"{key} must be true or false, got {options[key]!r}")
@@ -190,6 +213,11 @@ def validate_read_options(options: dict) -> dict:
         cleaned["cov_poll_interval"] = connection_store.check_number("cov_poll_interval", options["cov_poll_interval"])
     if "backfill_window" in options:
         cleaned["backfill_window"] = check_backfill_window(options["backfill_window"])
+    if "priority_interval" in options:
+        value = options["priority_interval"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or 0 < value < 5:
+            raise ValueError(f"priority_interval must be 0 (off) or a number of seconds >= 5, got {value!r}")
+        cleaned["priority_interval"] = value
     if "sampling" in options:
         if options["sampling"] not in (*SAMPLING_PROFILES, "auto"):
             raise ValueError(f"sampling must be standard, loop or auto, got {options['sampling']!r}")
@@ -230,6 +258,7 @@ def validate_points(points) -> list[dict]:
             raise ValueError(f"subscribe_cov must be true or false, got {point['subscribe_cov']!r}")
         if "sampling" in point and point["sampling"] not in SAMPLING_PROFILES:
             raise ValueError(f"a point's sampling must be standard or loop, got {point['sampling']!r}")
+        _check_learned_metadata(point)
         cov = point.get("his_collect_cov")
         if cov is not None and not isinstance(cov, (bool, int, float)):
             raise ValueError(f"his_collect_cov must be true/false or a number, got {cov!r}")
@@ -238,6 +267,28 @@ def validate_points(points) -> list[dict]:
                 connection_store.check_number(key, point[key])
         cleaned.append({k: v for k, v in point.items() if k in POINT_FIELDS})
     return cleaned
+
+
+def _check_learned_metadata(point: dict) -> None:
+    """The /learn metadata fields are stored and republished as given, so
+    only their shapes are checked: a wrong type is a 400, not a tag nobody
+    can read."""
+    for key in ("object_type", "active_text", "inactive_text"):
+        if point.get(key) is not None and not isinstance(point[key], str):
+            raise ValueError(f"{key} must be a string, got {point[key]!r}")
+    for key in ("min_pres_value", "max_pres_value", "cov_increment"):
+        value = point.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+            raise ValueError(f"{key} must be a number, got {value!r}")
+    if point.get("commandable") is not None and not isinstance(point["commandable"], bool):
+        raise ValueError(f"commandable must be true or false, got {point['commandable']!r}")
+    for key in ("state_text", "structured_views"):
+        value = point.get(key)
+        if value is not None and not (isinstance(value, list) and all(isinstance(v, str) for v in value)):
+            raise ValueError(f"{key} must be a list of strings, got {value!r}")
+    device = point.get("device")
+    if device is not None and not isinstance(device, dict):
+        raise ValueError(f"device must be an object, got {device!r}")
 
 
 async def stop_task(task: asyncio.Task | None) -> None:
@@ -266,8 +317,13 @@ class _PointState:
 
     def __init__(self):
         self.last_value = None
+        self.last_quality: dict | None = None
         self.last_published_at: float | None = None
         self.cov_active = False
+        # the point's priority array as last read (bacnet_values.priority_levels)
+        # and as last published, for commandable points (Windrow#25)
+        self.priority: dict | None = None
+        self.last_priority: dict | None = None
         self.wake = asyncio.Event()  # poll now: the subscription went away
         self.resubscribe = asyncio.Event()  # subscribe now: the device came back
 
@@ -278,7 +334,9 @@ async def _read_one(app, address, objid):
     return await read_present_value(app, address, objid)
 
 
-async def _read_many(app, address, objids):
+async def _read_many(app, address, objids, status=()):
+    if status:
+        return await read_present_values(app, address, objids, status=status)
     return await read_present_values(app, address, objids)
 
 
@@ -343,6 +401,11 @@ class ConnectionManager:
         # requests sent, by kind - how much the device is asked, not how many points
         self.stats: Counter = Counter()
         self._cov_live: set[int] = set()
+        # per connection: set to re-read its priority arrays now (after a write)
+        self._priority_wake: dict[str, asyncio.Event] = {}
+        # Device inventory (Windrow#24) by (device instance, address key):
+        # published on every connection's equip/tags for that device.
+        self.inventory: dict[tuple, dict] = {}
         # Trend-backed points' last reading time (unix s), by
         # "<connection id>/<label>", so a restart knows where to backfill from.
         base, _ext = os.path.splitext(state_file)
@@ -372,7 +435,9 @@ class ConnectionManager:
                 # pick up tags added since (e.g. `unit`). Baler's tag ingest
                 # is additive, so nothing a human added is lost.
                 self._tag_points(record["topic_prefix"], record["points"])
-                self._publish_equip_membership(record["topic_prefix"], record["points"])
+                self._publish_equip_membership(record["topic_prefix"], record["points"], record)
+            for address, instance in {(r["device_address"], r["device_instance"]) for r in records}:
+                self._background(self.refresh_inventory(address, instance))
             span.set_attribute("restored_count", len(records))
 
     async def discover(self, **kwargs) -> list[dict]:
@@ -431,13 +496,14 @@ class ConnectionManager:
             self._apply_batch_limit(device_address)
             self._save()
             self._tag_points(topic_prefix, points)
-            self._publish_equip_membership(topic_prefix, points)
+            self._publish_equip_membership(topic_prefix, points, record)
             self._start_poll_task(record)
+            self._background(self.refresh_inventory(device_address, device_instance))
             span.set_attribute("connection_id", record["id"])
             span.set_attribute("point_count", len(points))
             return record
 
-    def _publish_equip_membership(self, topic_prefix: str, points: list[dict]) -> None:
+    def _publish_equip_membership(self, topic_prefix: str, points: list[dict], record: dict | None = None) -> None:
         """One message per connection, {prefix}/equip/tags - equipment
         identity is the connection's own topic_prefix (Baler's
         ingest.topic_prefix_to_equip_uri), deliberately not the BACnet
@@ -457,6 +523,9 @@ class ConnectionManager:
             tags = {}
             if self.site_id:
                 tags = {"windrowSite": self.site_id, "windrowInstance": self.instance_id}
+            if record is not None:
+                # the controller behind this equipment (Windrow#24)
+                tags.update(bacnet_inventory.inventory_tags(self.inventory.get(_inventory_key(record))))
             payload = json.dumps({"tags": tags, "points": [p["label"] for p in points]})
             mqtt_sink.publish_reading(self.mqtt_client, topic_prefix, "equip/tags", payload)
 
@@ -487,6 +556,9 @@ class ConnectionManager:
                 # or the wrong one (Baler#82).
                 unit = point.get("unit") or bacnet_tagger.haystack_unit(point.get("units"))
                 tag_payload: dict = dict(tags)
+                # the raw evidence /learn captured, for Baler to judge (Windrow#19)
+                for tag, value in bacnet_tagger.raw_metadata_tags(point).items():
+                    tag_payload.setdefault(tag, value)
                 if unit:
                     tag_payload["unit"] = unit
                 mqtt_sink.publish_reading(self.mqtt_client, topic_prefix, f"{point['label']}/tags", json.dumps(tag_payload))
@@ -550,9 +622,40 @@ class ConnectionManager:
                 span.set_attribute("readback_error", repr(exc))
                 raw = None
             present = None if raw is None or isinstance(raw, (ErrorRejectAbortNack, ErrorType)) else normalize_value(raw)
+            if record.get("id") in self._priority_wake:
+                self._priority_wake[record["id"]].set()  # the array just changed: show it
             if present is not None:
                 mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], present)
             return {"topic": topic, "priority": priority, "value": value, "present_value": present}
+
+    async def refresh_inventory(self, device_address: str, device_instance: int, inventory: dict | None = None) -> dict | None:
+        """Read the device's inventory (or take one just read, from the
+        periodic rediscovery) and, when it's new or changed, republish
+        equip/tags on every connection to that device. Returns the
+        inventory, or None if the device didn't answer - a failed read
+        keeps the last one, never blanks it."""
+        if inventory is None:
+            if self.app is None:
+                return None
+            try:
+                async with self._slots():
+                    self.stats["read_inventory"] += 1
+                    inventory = await bacnet_inventory.read_inventory(self.app, device_address, device_instance)
+            except (Exception, ErrorRejectAbortNack) as exc:  # noqa: BLE001 - polling doesn't depend on it
+                print(f"couldn't read the inventory of {device_address} device,{device_instance}: {exc!r}")
+                return None
+        key = (device_instance, bacnet_network.address_key(device_address))
+        previous = self.inventory.get(key)
+        if previous == inventory:
+            return inventory
+        change = bacnet_inventory.compare(previous, inventory)
+        if change is not None:
+            print(f"device,{device_instance} at {device_address}: inventory {change['kind']}: {change['changed']}")
+        self.inventory[key] = inventory
+        for record in self.connections.values():
+            if _inventory_key(record) == key:
+                self._publish_equip_membership(record["topic_prefix"], record["points"], record)
+        return inventory
 
     async def delete_connection(self, connection_id: str) -> bool:
         with tracer.start_as_current_span("connection_manager.delete_connection") as span:
@@ -635,7 +738,7 @@ class ConnectionManager:
                 mqtt_sink.clear_retained(self.mqtt_client, old["topic_prefix"], f"{label}/tags")
 
             self._tag_points(record["topic_prefix"], record["points"])
-            self._publish_equip_membership(record["topic_prefix"], record["points"])
+            self._publish_equip_membership(record["topic_prefix"], record["points"], record)
             self._start_poll_task(record)
             span.set_attribute("found", True)
             span.set_attribute("cleared_count", len(removed))
@@ -729,7 +832,11 @@ class ConnectionManager:
         return getattr(info, "max_apdu_length_accepted", None)
 
     def _batch_limit(self, address: str) -> int:
-        limit = bacnet_batch.points_per_request(self._device_max_apdu(address))
+        status = any(
+            record["device_address"] == address and record.get("read_quality", True)
+            for record in self.connections.values()
+        )
+        limit = bacnet_batch.points_per_request(self._device_max_apdu(address), status=status)
         for record in self.connections.values():
             if record["device_address"] == address and "read_multiple_max" in record:
                 limit = min(limit, record["read_multiple_max"])
@@ -793,9 +900,17 @@ class ConnectionManager:
         explicitly cancel the per-point sub-tasks too: asyncio.gather()
         does NOT auto-cancel its children just because the task awaiting
         it was cancelled - confirmed, not assumed."""
-        point_tasks = [asyncio.get_event_loop().create_task(self._poll_point(record, point)) for point in record["points"]]
+        states = {point["label"]: _PointState() for point in record["points"]}
+        point_tasks = [
+            asyncio.get_event_loop().create_task(self._poll_point(record, point, states[point["label"]]))
+            for point in record["points"]
+        ]
         if record.get("forward_alarms"):
             point_tasks.append(asyncio.get_event_loop().create_task(self._keep_alarms(record)))
+        if record.get("priority_interval", DEFAULT_PRIORITY_INTERVAL) and any(
+            _object_type(p["object_identifier"]) in COMMANDABLE_TYPES for p in record["points"]
+        ):
+            point_tasks.append(asyncio.get_event_loop().create_task(self._keep_priorities(record, states)))
         try:
             await asyncio.gather(*point_tasks)
         except asyncio.CancelledError:
@@ -803,7 +918,7 @@ class ConnectionManager:
                 point_task.cancel()
             raise
 
-    async def _poll_point(self, record: dict, point: dict) -> None:
+    async def _poll_point(self, record: dict, point: dict, state: "_PointState | None" = None) -> None:
         """Deliberately a small, separate near-duplicate of bridge.py's
         poll_forever rather than a forced shared abstraction: it iterates
         a dynamic list-of-dicts from a stored record instead of a static
@@ -827,10 +942,11 @@ class ConnectionManager:
         if loop:
             interval = min(interval, LOOP_POLL_INTERVAL)
         batched = record.get("read_multiple", True)
+        with_quality = record.get("read_quality", True)
         cov_poll_interval = record.get("cov_poll_interval", DEFAULT_COV_POLL_INTERVAL)
         if loop:
             cov_poll_interval = min(cov_poll_interval, LOOP_COV_POLL_INTERVAL)
-        state = _PointState()
+        state = state if state is not None else _PointState()
         trended = "trend_log" in point
         last_ok: float | None = self._marks.get(f"{record.get('id')}/{point['label']}") if trended else None
         backfills: set[asyncio.Task] = set()
@@ -866,11 +982,14 @@ class ConnectionManager:
             while True:
                 try:
                     if batched:
-                        raw = await self._batcher(address).read(point["object_identifier"])
+                        raw = await self._batcher(address).read(point["object_identifier"], status=with_quality)
                     else:
                         async with self._slots():
                             self.stats["read_property"] += 1
                             raw = await read_present_value(self.app, address, point["object_identifier"])
+                    quality = None
+                    if isinstance(raw, Sample):
+                        raw, quality = raw.value, (raw.quality if with_quality else None)
                     if raw is None or isinstance(raw, (ErrorRejectAbortNack, ErrorType)):
                         raise ReadFailed(f"device answered {raw!r}")
                     value = normalize_value(raw)
@@ -899,7 +1018,7 @@ class ConnectionManager:
                 last_ok = read_at
                 failures = 0
 
-                self._offer(record, point, state, value)
+                self._offer(record, point, state, value, quality)
                 await wait_next(cov_poll_interval if state.cov_active else interval, 0)
         finally:
             if cov_task is not None:
@@ -907,12 +1026,15 @@ class ConnectionManager:
             for task in backfills:
                 task.cancel()
 
-    def _offer(self, record: dict, point: dict, state: _PointState, value) -> None:
+    def _offer(self, record: dict, point: dict, state: _PointState, value, quality: dict | None = None) -> None:
         """A fresh value, from a poll or a COV notification: publish it if the
-        point's hisCollect policy says so. Either way it counts as a good
-        read in the connection's poll status (Baler#110)."""
+        point's hisCollect policy says so, or if its quality changed (a
+        sensor failing at the same value is news). Either way it counts as a
+        good read in the connection's poll status (Baler#110)."""
         now = time.monotonic()
-        publish = should_publish(
+        # a change in who holds the point (Windrow#25), or in its quality, is
+        # news even at the same value
+        publish = state.priority != state.last_priority or quality != state.last_quality or should_publish(
             value,
             state.last_value,
             state.last_published_at,
@@ -922,11 +1044,83 @@ class ConnectionManager:
             his_collect_interval=point.get("his_collect_interval"),
         )
         if publish:
-            mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value)
+            # `quality` only when there is some, `priority` only for a point
+            # whose array has been read: every other call (and envelope) is
+            # exactly what it was before Windrow#20/#25
+            extra: dict = {"quality": quality} if quality else {}
+            if state.priority is not None:
+                extra["priority"] = state.priority
+            mqtt_sink.publish_live(self.mqtt_client, record["topic_prefix"], point["label"], value, **extra)
             state.last_value = value
+            state.last_quality = quality
+            state.last_priority = state.priority
             state.last_published_at = now
         self.status.success(record.get("id"), point["label"], published=publish)
         self._mark(record, point, time.time())
+
+    # --- priority arrays (Windrow#25) ---
+
+    async def _keep_priorities(self, record: dict, states: dict) -> None:
+        """Read every commandable point's priority-array each
+        priority_interval and, when it changed, wake the point's poll so
+        its next reading carries the new `priority`. One RPM per
+        PRIORITY_BATCH points (halved on an answer too big; single reads
+        for a device without RPM). A point whose device says it has no
+        priority-array isn't asked again. Read-only, and never ends the
+        poll loop it runs in."""
+        address = record["device_address"]
+        interval = record.get("priority_interval", DEFAULT_PRIORITY_INTERVAL)
+        asking = {p["object_identifier"]: p["label"] for p in record["points"]
+                  if _object_type(p["object_identifier"]) in COMMANDABLE_TYPES}
+        wake = self._priority_wake.setdefault(record["id"], asyncio.Event())
+        batch = PRIORITY_BATCH
+        rpm = record.get("read_multiple", True)
+        failures = 0
+        await asyncio.sleep(random.uniform(0, min(interval, 5.0)))
+        while asking:
+            try:
+                arrays: dict = {}
+                objids = list(asking)
+                for start in range(0, len(objids), batch):
+                    chunk = objids[start:start + batch]
+                    try:
+                        if not rpm or len(chunk) == 1:
+                            raise RPMUnsupported("single reads")
+                        async with self._slots():
+                            self.stats["read_priority_array"] += 1
+                            arrays.update(await read_present_values(self.app, address, chunk, prop="priority-array"))
+                    except RPMUnsupported as exc:
+                        if exc.too_big and batch > 1:
+                            batch = max(1, batch // 2)
+                        elif str(exc) != "single reads":
+                            rpm = False
+                        for objid in chunk:
+                            async with self._slots():
+                                self.stats["read_priority_array"] += 1
+                                arrays[objid] = await read_present_value(self.app, address, objid, prop="priority-array")
+                for objid, raw in arrays.items():
+                    if isinstance(raw, (ErrorRejectAbortNack, ErrorType)):
+                        # unknown-property: this object has no priority array
+                        print(f"{address} {objid} has no priority-array ({raw}); not asking again")
+                        asking.pop(objid, None)
+                        continue
+                    levels = priority_levels(raw)
+                    state = states.get(asking.get(objid))
+                    if levels is not None and state is not None and levels != state.priority:
+                        state.priority = levels
+                        state.wake.set()  # publish it with a fresh value now
+                if failures:
+                    print(f"priority-array reads on {address} recovered after {failures} failures")
+                failures = 0
+                delay = interval
+            except Exception as exc:  # noqa: BLE001 - retried with back-off; polling carries on
+                failures += 1
+                if failures in (1, 5) or failures % 50 == 0:
+                    print(f"priority-array read on {address} failed ({failures}x): {exc!r}")
+                delay = failure_backoff(interval, failures)
+            wake.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(wake.wait(), delay)
 
     # --- alarms (Baler#164) ---
 
@@ -1034,9 +1228,9 @@ class ConnectionManager:
         objid = point["object_identifier"]
         lifetime = record.get("cov_lifetime", DEFAULT_COV_LIFETIME)
 
-        def on_value(raw) -> None:
+        def on_value(raw, quality=None) -> None:
             self.stats["cov_notifications"] += 1
-            self._offer(record, point, state, normalize_value(raw))
+            self._offer(record, point, state, normalize_value(raw), quality if record.get("read_quality", True) else None)
 
         subscription = bacnet_cov.Subscription(self.app, record["device_address"], objid, on_value)
         failures = 0
@@ -1069,6 +1263,10 @@ class ConnectionManager:
         finally:
             self._cov_live.discard(id(state))
             subscription.close()
+
+
+def _inventory_key(record: dict) -> tuple:
+    return (record.get("device_instance"), bacnet_network.address_key(record["device_address"]))
 
 
 def _same_object(a: str, b: str) -> bool:

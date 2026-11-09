@@ -10,10 +10,30 @@ repeatable recipe, not one-off work per protocol. This is that recipe.
   for the protocol (a BACnet object identifier, a Modbus register label,
   anything stable and human-legible).
 - **Payload** (JSON): `{"point": <str>, "value": <int|float|str|bool|null>, "ts": <unix epoch float>}`.
+  An optional key may follow: `"quality"`, only when the device says
+  something is wrong with the value (Windrow#20). For BACnet it's the
+  object's own words, `{"status_flags": ["in-alarm"|"fault"|"overridden"|
+  "out-of-service", ...], "reliability": "<BACnet reliability>"}`, either
+  key absent when it has nothing to say. Consumers that parse by name
+  ignore it; Baler stores it as the sample's quality flag
+  (`baler.quality.from_envelope`). No `quality` means nothing reported.
+  Pass it as `publish_reading(..., quality=...)`, never build it into
+  `value`.
+  A commandable BACnet point's reading may also carry
+  `"priority": {"active": <level|null>, "levels": {"<level>": <value>}}`,
+  its priority array (Windrow#25). Consumers that parse by name ignore it.
 - **`retain=True`** on every publish — a fresh subscriber immediately gets
   the last known value per point instead of waiting for the next poll.
 - Every bridge imports `windrow.mqtt_sink` (`connect()`, `publish_reading()`)
   for this — never re-derive the envelope/publish logic per bridge.
+
+A live reading (a poll or a COV notification) goes through
+`publish_live()`, which is `publish_reading()` unless the node runs the
+optional batched envelope (`WINDROW_MQTT_ENVELOPE=batch`, see
+[edge-nodes.md](edge-nodes.md#batched-envelope-optional-baler234)). With the
+batched envelope, a device's readings in one poll tick are one
+`{prefix}/batch` message. Tags, alarms and backfill always use
+`publish_reading()`.
 
 Nothing that consumes this cares which protocol produced it. That's what
 makes this a zero-coordination-cost pattern: adding a new source never
