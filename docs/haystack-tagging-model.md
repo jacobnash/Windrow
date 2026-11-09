@@ -46,3 +46,36 @@ are already present on the rec before committing only what's missing.
 Verified by rerunning the whole script twice against a live Haxall instance
 and by `test_tagging_model_is_idempotent_and_filterable` in
 `tests/test_haxall_provision.py`.
+
+
+## Pre-tagging with openhay-tag (Windrow#21, depends on openhay#7)
+
+Windrow's pre-tag is moving to openhay's shared tagger (openhay#7): a
+tokenizer that splits camelCase and digits (`CHWSupTmp3`), a BAS
+abbreviation lexicon (`SAT`, `ZN-T`, `stpt`, `fdbk`), units as evidence,
+and a subset/most-specific rule matcher. `bacnet_tagger` uses it whenever
+the installed openhay has `openhay.tag`, and otherwise keeps using the local
+rules (`rules/bacnet_to_haystack_tags.yaml`), unchanged. If openhay-tag
+raises, Windrow falls back to the local rules for the rest of the run.
+`WINDROW_TAGGER=local|openhay|auto` (default `auto`) forces an engine;
+`openhay` with no `openhay.tag` is an error rather than a silent fallback.
+
+The binding Windrow calls, which openhay#7 is asked to match:
+
+```python
+openhay.tag.tag_point(label=..., description=..., units=..., object_type=...)
+# -> {"tags": {name: True | value} or [marker, ...], "rule": "<rule id>" or None,
+#     "tokens": ["<matched token>", ...]}
+openhay.tag.haystack_unit(bacnet_units)  # optional -> "°F" or None
+```
+
+Every published tag set that a rule produced now carries its provenance,
+so Baler can tell rule-tagged points from guessed ones:
+`windrowTagEngine` (`openhay-tag` or `windrow-local`), `windrowTagRule`
+(the rule id; locally `local:<match tokens>`), and `windrowTagTokens` (the
+tokens it matched). A point no rule matched gets no provenance, as before.
+
+On the mock hospital, the local rules tag 1 of the 203 AHU/VAV points
+named in the cryptic (`SUP-AIR-TEM-12`) and camelCase (`SupplyAirTemp`)
+styles. `tests/test_openhay_tag.py` checks for at least 80% once
+openhay-tag is installed, and skips until then.
