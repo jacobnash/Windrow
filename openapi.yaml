@@ -1305,6 +1305,20 @@ components:
             lost; if the subscription fails it's polled at its normal
             interval and re-subscribed with back-off, and an object the
             device won't do COV for is just polled.
+        priority_interval:
+          type: number
+          minimum: 0
+          default: 60
+          description: >-
+            Seconds between reads of every commandable point's
+            `priority-array` (Windrow#25; WINDROW_PRIORITY_INTERVAL sets the
+            default). Each reading of such a point then carries `priority`:
+            `{"active": 8, "levels": {"8": 72.0, "16": 68.0}}` - the levels
+            someone holds, keyed by level, and `active`, the lowest held
+            level (the one in control; null when relinquish-default is). A
+            change publishes at once, even at an unchanged value. Read-only,
+            one ReadPropertyMultiple per 8 commandable points; 0 turns it
+            off, otherwise at least 5.
         cov_lifetime:
           type: integer
           minimum: 10
@@ -1710,6 +1724,8 @@ components:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/read_multiple_max"
         subscribe_cov:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/subscribe_cov"
+        priority_interval:
+          $ref: "#/components/schemas/CreateConnectionRequest/properties/priority_interval"
         cov_lifetime:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/cov_lifetime"
         cov_poll_interval:

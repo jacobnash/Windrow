@@ -16,3 +16,30 @@ def normalize_value(value):
     if isinstance(value, (int, float, str, bool)) or value is None:
         return value
     return str(value)
+
+
+def priority_levels(priority_array) -> dict | None:
+    """A commandable object's priority-array as {"active": level or None,
+    "levels": {"<level>": value}} (Windrow#25): only the levels someone
+    holds, keyed by level number as text (JSON object keys), values
+    normalized like present-value. `active` is the lowest-numbered held
+    level - the one in control - or None when every level is empty and
+    relinquish-default is in control. None for anything that isn't a
+    16-slot array."""
+    try:
+        slots = list(priority_array)
+    except TypeError:
+        return None
+    if len(slots) != 16:
+        return None
+    levels: dict = {}
+    for level, slot in enumerate(slots, start=1):
+        choice = getattr(slot, "_choice", None)
+        if choice is None or choice == "null":
+            continue
+        value = getattr(slot, choice, None)
+        if value is None:
+            continue
+        levels[str(level)] = normalize_value(value)
+    active = min((int(k) for k in levels), default=None)
+    return {"active": active, "levels": levels}

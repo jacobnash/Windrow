@@ -33,8 +33,13 @@ from windrow import (
     mqtt_sink,
     tracing,
 )
-from windrow.bacnet_read import READ_TIMEOUT, read_present_value, read_present_values
-from windrow.bacnet_values import normalize_value
+from windrow.bacnet_read import (
+    READ_TIMEOUT,
+    RPMUnsupported,
+    read_present_value,
+    read_present_values,
+)
+from windrow.bacnet_values import normalize_value, priority_levels
 from windrow.poll_status import PollStatus
 
 tracer = tracing.get_tracer(__name__)
@@ -128,12 +133,20 @@ POINT_FIELDS = {
 #   forward_alarms     register as a recipient in the device's notification
 #                      classes and publish its alarms (Baler#164) - off by
 #                      default: it changes the controller's configuration
+#   priority_interval  seconds between reads of every commandable point's
+#                      priority-array, published as the reading's
+#                      `priority` (Windrow#25); 0 turns it off
 READ_OPTION_FIELDS = {
     "read_multiple", "read_multiple_max", "subscribe_cov", "cov_lifetime", "cov_poll_interval", "backfill_window",
-    "forward_alarms",
+    "forward_alarms", "priority_interval",
 }
 UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "device_address", "device_name"} | READ_OPTION_FIELDS
 DEFAULT_COV_LIFETIME = 300
+# Priority arrays (Windrow#25): read every minute by default - an override
+# shows up within a minute, at one RPM per PRIORITY_BATCH commandable points.
+DEFAULT_PRIORITY_INTERVAL = float(os.environ.get("WINDROW_PRIORITY_INTERVAL", "60"))
+# Objects per priority-array RPM: a full array of Reals is ~100 bytes.
+PRIORITY_BATCH = 8
 DEFAULT_COV_POLL_INTERVAL = 300.0
 # How often a forward_alarms connection re-checks its recipient entries (a
 # controller restored from a backup loses them) and re-reads active alarms.
@@ -173,6 +186,11 @@ def validate_read_options(options: dict) -> dict:
         cleaned["cov_poll_interval"] = connection_store.check_number("cov_poll_interval", options["cov_poll_interval"])
     if "backfill_window" in options:
         cleaned["backfill_window"] = check_backfill_window(options["backfill_window"])
+    if "priority_interval" in options:
+        value = options["priority_interval"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or 0 < value < 5:
+            raise ValueError(f"priority_interval must be 0 (off) or a number of seconds >= 5, got {value!r}")
+        cleaned["priority_interval"] = value
     return cleaned
 
 
@@ -234,6 +252,10 @@ class _PointState:
         self.last_value = None
         self.last_published_at: float | None = None
         self.cov_active = False
+        # the point's priority array as last read (bacnet_values.priority_levels)
+        # and as last published, for commandable points (Windrow#25)
+        self.priority: dict | None = None
+        self.last_priority: dict | None = None
         self.wake = asyncio.Event()  # poll now: the subscription went away
         self.resubscribe = asyncio.Event()  # subscribe now: the device came back
 
@@ -309,6 +331,8 @@ class ConnectionManager:
         # requests sent, by kind - how much the device is asked, not how many points
         self.stats: Counter = Counter()
         self._cov_live: set[int] = set()
+        # per connection: set to re-read its priority arrays now (after a write)
+        self._priority_wake: dict[str, asyncio.Event] = {}
         # Trend-backed points' last reading time (unix s), by
         # "<connection id>/<label>", so a restart knows where to backfill from.
         base, _ext = os.path.splitext(state_file)
@@ -516,6 +540,8 @@ class ConnectionManager:
                 span.set_attribute("readback_error", repr(exc))
                 raw = None
             present = None if raw is None or isinstance(raw, (ErrorRejectAbortNack, ErrorType)) else normalize_value(raw)
+            if record.get("id") in self._priority_wake:
+                self._priority_wake[record["id"]].set()  # the array just changed: show it
             if present is not None:
                 mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], present)
             return {"topic": topic, "priority": priority, "value": value, "present_value": present}
@@ -759,9 +785,17 @@ class ConnectionManager:
         explicitly cancel the per-point sub-tasks too: asyncio.gather()
         does NOT auto-cancel its children just because the task awaiting
         it was cancelled - confirmed, not assumed."""
-        point_tasks = [asyncio.get_event_loop().create_task(self._poll_point(record, point)) for point in record["points"]]
+        states = {point["label"]: _PointState() for point in record["points"]}
+        point_tasks = [
+            asyncio.get_event_loop().create_task(self._poll_point(record, point, states[point["label"]]))
+            for point in record["points"]
+        ]
         if record.get("forward_alarms"):
             point_tasks.append(asyncio.get_event_loop().create_task(self._keep_alarms(record)))
+        if record.get("priority_interval", DEFAULT_PRIORITY_INTERVAL) and any(
+            _object_type(p["object_identifier"]) in COMMANDABLE_TYPES for p in record["points"]
+        ):
+            point_tasks.append(asyncio.get_event_loop().create_task(self._keep_priorities(record, states)))
         try:
             await asyncio.gather(*point_tasks)
         except asyncio.CancelledError:
@@ -769,7 +803,7 @@ class ConnectionManager:
                 point_task.cancel()
             raise
 
-    async def _poll_point(self, record: dict, point: dict) -> None:
+    async def _poll_point(self, record: dict, point: dict, state: "_PointState | None" = None) -> None:
         """Deliberately a small, separate near-duplicate of bridge.py's
         poll_forever rather than a forced shared abstraction: it iterates
         a dynamic list-of-dicts from a stored record instead of a static
@@ -791,7 +825,7 @@ class ConnectionManager:
         interval = point.get("poll_interval", record["poll_interval"])
         batched = record.get("read_multiple", True)
         cov_poll_interval = record.get("cov_poll_interval", DEFAULT_COV_POLL_INTERVAL)
-        state = _PointState()
+        state = state if state is not None else _PointState()
         trended = "trend_log" in point
         last_ok: float | None = self._marks.get(f"{record.get('id')}/{point['label']}") if trended else None
         backfills: set[asyncio.Task] = set()
@@ -872,7 +906,8 @@ class ConnectionManager:
         point's hisCollect policy says so. Either way it counts as a good
         read in the connection's poll status (Baler#110)."""
         now = time.monotonic()
-        publish = should_publish(
+        # a change in who holds the point is news even at the same value (Windrow#25)
+        publish = state.priority != state.last_priority or should_publish(
             value,
             state.last_value,
             state.last_published_at,
@@ -882,11 +917,79 @@ class ConnectionManager:
             his_collect_interval=point.get("his_collect_interval"),
         )
         if publish:
-            mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value)
+            # `priority` only for a point whose array has been read: every
+            # other call (and envelope) is exactly what it was before
+            extra = {"priority": state.priority} if state.priority is not None else {}
+            mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value, **extra)
             state.last_value = value
+            state.last_priority = state.priority
             state.last_published_at = now
         self.status.success(record.get("id"), point["label"], published=publish)
         self._mark(record, point, time.time())
+
+    # --- priority arrays (Windrow#25) ---
+
+    async def _keep_priorities(self, record: dict, states: dict) -> None:
+        """Read every commandable point's priority-array each
+        priority_interval and, when it changed, wake the point's poll so
+        its next reading carries the new `priority`. One RPM per
+        PRIORITY_BATCH points (halved on an answer too big; single reads
+        for a device without RPM). A point whose device says it has no
+        priority-array isn't asked again. Read-only, and never ends the
+        poll loop it runs in."""
+        address = record["device_address"]
+        interval = record.get("priority_interval", DEFAULT_PRIORITY_INTERVAL)
+        asking = {p["object_identifier"]: p["label"] for p in record["points"]
+                  if _object_type(p["object_identifier"]) in COMMANDABLE_TYPES}
+        wake = self._priority_wake.setdefault(record["id"], asyncio.Event())
+        batch = PRIORITY_BATCH
+        rpm = record.get("read_multiple", True)
+        failures = 0
+        await asyncio.sleep(random.uniform(0, min(interval, 5.0)))
+        while asking:
+            try:
+                arrays: dict = {}
+                objids = list(asking)
+                for start in range(0, len(objids), batch):
+                    chunk = objids[start:start + batch]
+                    try:
+                        if not rpm or len(chunk) == 1:
+                            raise RPMUnsupported("single reads")
+                        async with self._slots():
+                            self.stats["read_priority_array"] += 1
+                            arrays.update(await read_present_values(self.app, address, chunk, prop="priority-array"))
+                    except RPMUnsupported as exc:
+                        if exc.too_big and batch > 1:
+                            batch = max(1, batch // 2)
+                        elif str(exc) != "single reads":
+                            rpm = False
+                        for objid in chunk:
+                            async with self._slots():
+                                self.stats["read_priority_array"] += 1
+                                arrays[objid] = await read_present_value(self.app, address, objid, prop="priority-array")
+                for objid, raw in arrays.items():
+                    if isinstance(raw, (ErrorRejectAbortNack, ErrorType)):
+                        # unknown-property: this object has no priority array
+                        print(f"{address} {objid} has no priority-array ({raw}); not asking again")
+                        asking.pop(objid, None)
+                        continue
+                    levels = priority_levels(raw)
+                    state = states.get(asking.get(objid))
+                    if levels is not None and state is not None and levels != state.priority:
+                        state.priority = levels
+                        state.wake.set()  # publish it with a fresh value now
+                if failures:
+                    print(f"priority-array reads on {address} recovered after {failures} failures")
+                failures = 0
+                delay = interval
+            except Exception as exc:  # noqa: BLE001 - retried with back-off; polling carries on
+                failures += 1
+                if failures in (1, 5) or failures % 50 == 0:
+                    print(f"priority-array read on {address} failed ({failures}x): {exc!r}")
+                delay = failure_backoff(interval, failures)
+            wake.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(wake.wait(), delay)
 
     # --- alarms (Baler#164) ---
 
