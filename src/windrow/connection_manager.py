@@ -33,7 +33,12 @@ from windrow import (
     mqtt_sink,
     tracing,
 )
-from windrow.bacnet_read import READ_TIMEOUT, read_present_value, read_present_values
+from windrow.bacnet_read import (
+    READ_TIMEOUT,
+    Sample,
+    read_present_value,
+    read_present_values,
+)
 from windrow.bacnet_values import normalize_value
 from windrow.poll_status import PollStatus
 
@@ -128,9 +133,14 @@ POINT_FIELDS = {
 #   forward_alarms     register as a recipient in the device's notification
 #                      classes and publish its alarms (Baler#164) - off by
 #                      default: it changes the controller's configuration
+#   read_quality       read each point's status-flags and reliability with
+#                      its present-value and publish them as the reading's
+#                      `quality` (Windrow#20) - on by default; batched reads
+#                      and COV notifications only, a single ReadProperty
+#                      reads the value alone
 READ_OPTION_FIELDS = {
     "read_multiple", "read_multiple_max", "subscribe_cov", "cov_lifetime", "cov_poll_interval", "backfill_window",
-    "forward_alarms",
+    "forward_alarms", "read_quality",
 }
 UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "device_address", "device_name"} | READ_OPTION_FIELDS
 DEFAULT_COV_LIFETIME = 300
@@ -159,7 +169,7 @@ def validate_read_options(options: dict) -> dict:
     """The READ_OPTION_FIELDS present in `options`, type-checked. ValueError
     (a 400) for a wrong type, same as every other connection field."""
     cleaned = {}
-    for key in ("read_multiple", "subscribe_cov", "forward_alarms"):
+    for key in ("read_multiple", "subscribe_cov", "forward_alarms", "read_quality"):
         if key in options:
             if not isinstance(options[key], bool):
                 raise ValueError(f"{key} must be true or false, got {options[key]!r}")
@@ -232,6 +242,7 @@ class _PointState:
 
     def __init__(self):
         self.last_value = None
+        self.last_quality: dict | None = None
         self.last_published_at: float | None = None
         self.cov_active = False
         self.wake = asyncio.Event()  # poll now: the subscription went away
@@ -244,7 +255,9 @@ async def _read_one(app, address, objid):
     return await read_present_value(app, address, objid)
 
 
-async def _read_many(app, address, objids):
+async def _read_many(app, address, objids, status=()):
+    if status:
+        return await read_present_values(app, address, objids, status=status)
     return await read_present_values(app, address, objids)
 
 
@@ -695,7 +708,11 @@ class ConnectionManager:
         return getattr(info, "max_apdu_length_accepted", None)
 
     def _batch_limit(self, address: str) -> int:
-        limit = bacnet_batch.points_per_request(self._device_max_apdu(address))
+        status = any(
+            record["device_address"] == address and record.get("read_quality", True)
+            for record in self.connections.values()
+        )
+        limit = bacnet_batch.points_per_request(self._device_max_apdu(address), status=status)
         for record in self.connections.values():
             if record["device_address"] == address and "read_multiple_max" in record:
                 limit = min(limit, record["read_multiple_max"])
@@ -790,6 +807,7 @@ class ConnectionManager:
         address = record["device_address"]
         interval = point.get("poll_interval", record["poll_interval"])
         batched = record.get("read_multiple", True)
+        with_quality = record.get("read_quality", True)
         cov_poll_interval = record.get("cov_poll_interval", DEFAULT_COV_POLL_INTERVAL)
         state = _PointState()
         trended = "trend_log" in point
@@ -826,11 +844,14 @@ class ConnectionManager:
             while True:
                 try:
                     if batched:
-                        raw = await self._batcher(address).read(point["object_identifier"])
+                        raw = await self._batcher(address).read(point["object_identifier"], status=with_quality)
                     else:
                         async with self._slots():
                             self.stats["read_property"] += 1
                             raw = await read_present_value(self.app, address, point["object_identifier"])
+                    quality = None
+                    if isinstance(raw, Sample):
+                        raw, quality = raw.value, (raw.quality if with_quality else None)
                     if raw is None or isinstance(raw, (ErrorRejectAbortNack, ErrorType)):
                         raise ReadFailed(f"device answered {raw!r}")
                     value = normalize_value(raw)
@@ -859,7 +880,7 @@ class ConnectionManager:
                 last_ok = read_at
                 failures = 0
 
-                self._offer(record, point, state, value)
+                self._offer(record, point, state, value, quality)
                 await wait_next(cov_poll_interval if state.cov_active else interval, 0)
         finally:
             if cov_task is not None:
@@ -867,12 +888,13 @@ class ConnectionManager:
             for task in backfills:
                 task.cancel()
 
-    def _offer(self, record: dict, point: dict, state: _PointState, value) -> None:
+    def _offer(self, record: dict, point: dict, state: _PointState, value, quality: dict | None = None) -> None:
         """A fresh value, from a poll or a COV notification: publish it if the
-        point's hisCollect policy says so. Either way it counts as a good
-        read in the connection's poll status (Baler#110)."""
+        point's hisCollect policy says so, or if its quality changed (a
+        sensor failing at the same value is news). Either way it counts as a
+        good read in the connection's poll status (Baler#110)."""
         now = time.monotonic()
-        publish = should_publish(
+        publish = quality != state.last_quality or should_publish(
             value,
             state.last_value,
             state.last_published_at,
@@ -882,8 +904,12 @@ class ConnectionManager:
             his_collect_interval=point.get("his_collect_interval"),
         )
         if publish:
-            mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value)
+            # quality only when there is some: a healthy point's call (and
+            # envelope) is exactly what it was before Windrow#20
+            extra = {"quality": quality} if quality else {}
+            mqtt_sink.publish_reading(self.mqtt_client, record["topic_prefix"], point["label"], value, **extra)
             state.last_value = value
+            state.last_quality = quality
             state.last_published_at = now
         self.status.success(record.get("id"), point["label"], published=publish)
         self._mark(record, point, time.time())
@@ -994,9 +1020,9 @@ class ConnectionManager:
         objid = point["object_identifier"]
         lifetime = record.get("cov_lifetime", DEFAULT_COV_LIFETIME)
 
-        def on_value(raw) -> None:
+        def on_value(raw, quality=None) -> None:
             self.stats["cov_notifications"] += 1
-            self._offer(record, point, state, normalize_value(raw))
+            self._offer(record, point, state, normalize_value(raw), quality if record.get("read_quality", True) else None)
 
         subscription = bacnet_cov.Subscription(self.app, record["device_address"], objid, on_value)
         failures = 0

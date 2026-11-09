@@ -147,7 +147,7 @@ def _flush_spool(client: mqtt.Client) -> None:
                 print(f"reconnect lost mid-flush, {len(records) - i} record(s) remain spooled")
                 return
             _publish(client, record["topic_prefix"], record["point"], record["value"], record["ts"],
-                     retain=record.get("retain", True))
+                     retain=record.get("retain", True), quality=record.get("quality"))
         os.remove(path)
         _spool_rows[path] = 0
         print(f"flushed {len(records)} spooled reading(s)")
@@ -215,19 +215,31 @@ def connect(
     return client
 
 
-def _publish(client: mqtt.Client, topic_prefix: str, point: str, value, ts: float, retain: bool = True) -> str:
-    payload = json.dumps({"point": point, "value": value, "ts": ts})
+def _publish(client: mqtt.Client, topic_prefix: str, point: str, value, ts: float, retain: bool = True,
+             quality: dict | None = None) -> str:
+    envelope = {"point": point, "value": value, "ts": ts}
+    if quality:
+        envelope["quality"] = quality
+    payload = json.dumps(envelope)
     topic = f"{topic_prefix}/{point}"
     client.publish(topic, payload, qos=1, retain=retain)
     return topic
 
 
 def publish_reading(
-    client: mqtt.Client, topic_prefix: str, point: str, value, ts: float | None = None, retain: bool = True
+    client: mqtt.Client, topic_prefix: str, point: str, value, ts: float | None = None, retain: bool = True,
+    quality: dict | None = None,
 ) -> str:
     """Publishes {"point", "value", "ts"} to f"{topic_prefix}/{point}",
     retained. This exact shape is the frozen wire contract every consumer
     (Haxall's task engine, Baler's mqtt_listener) parses by name.
+
+    `quality` (Windrow#20) adds an optional fourth key, only when the
+    device reports something: {"status_flags": ["fault", ...],
+    "reliability": "no-sensor"} (either key may be absent), BACnet's own
+    words. Consumers that parse by name ignore it; Baler's quality.
+    from_envelope stores it as the sample's flag. No `quality` means
+    nothing reported, i.e. ok.
 
     If the client isn't currently connected, the reading is spooled to
     disk instead of dropped, and replayed automatically once the
@@ -240,9 +252,11 @@ def publish_reading(
         record = {"topic_prefix": topic_prefix, "point": point, "value": value, "ts": ts}
         if not retain:
             record["retain"] = False
+        if quality:
+            record["quality"] = quality
         _spool_append(record)
         return f"{topic_prefix}/{point}"
-    return _publish(client, topic_prefix, point, value, ts, retain=retain)
+    return _publish(client, topic_prefix, point, value, ts, retain=retain, quality=quality)
 
 
 def clear_retained(client: mqtt.Client, topic_prefix: str, point: str) -> str:
