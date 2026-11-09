@@ -119,6 +119,9 @@ POINT_FIELDS = {
     "object_identifier", "label", "units", "description", "poll_interval",
     "his_collect_cov", "his_collect_cov_rate_limit", "his_collect_interval",
     "subscribe_cov", "trend_log",
+    # raw BACnet metadata from /learn (Windrow#19), published with the tags
+    "object_type", "commandable", "state_text", "active_text", "inactive_text",
+    "min_pres_value", "max_pres_value", "cov_increment", "structured_views", "device",
 }
 # How a connection reads its device (Baler#127). All optional; a record
 # without them reads with ReadPropertyMultiple and doesn't subscribe.
@@ -207,6 +210,7 @@ def validate_points(points) -> list[dict]:
             connection_store.check_text("trend_log", point["trend_log"])
         if "subscribe_cov" in point and not isinstance(point["subscribe_cov"], bool):
             raise ValueError(f"subscribe_cov must be true or false, got {point['subscribe_cov']!r}")
+        _check_learned_metadata(point)
         cov = point.get("his_collect_cov")
         if cov is not None and not isinstance(cov, (bool, int, float)):
             raise ValueError(f"his_collect_cov must be true/false or a number, got {cov!r}")
@@ -215,6 +219,28 @@ def validate_points(points) -> list[dict]:
                 connection_store.check_number(key, point[key])
         cleaned.append({k: v for k, v in point.items() if k in POINT_FIELDS})
     return cleaned
+
+
+def _check_learned_metadata(point: dict) -> None:
+    """The /learn metadata fields are stored and republished as given, so
+    only their shapes are checked: a wrong type is a 400, not a tag nobody
+    can read."""
+    for key in ("object_type", "active_text", "inactive_text"):
+        if point.get(key) is not None and not isinstance(point[key], str):
+            raise ValueError(f"{key} must be a string, got {point[key]!r}")
+    for key in ("min_pres_value", "max_pres_value", "cov_increment"):
+        value = point.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+            raise ValueError(f"{key} must be a number, got {value!r}")
+    if point.get("commandable") is not None and not isinstance(point["commandable"], bool):
+        raise ValueError(f"commandable must be true or false, got {point['commandable']!r}")
+    for key in ("state_text", "structured_views"):
+        value = point.get(key)
+        if value is not None and not (isinstance(value, list) and all(isinstance(v, str) for v in value)):
+            raise ValueError(f"{key} must be a list of strings, got {value!r}")
+    device = point.get("device")
+    if device is not None and not isinstance(device, dict):
+        raise ValueError(f"device must be an object, got {device!r}")
 
 
 async def stop_task(task: asyncio.Task | None) -> None:
@@ -476,6 +502,9 @@ class ConnectionManager:
                 # or the wrong one (Baler#82).
                 unit = point.get("unit") or bacnet_tagger.haystack_unit(point.get("units"))
                 tag_payload: dict = dict(tags)
+                # the raw evidence /learn captured, for Baler to judge (Windrow#19)
+                for tag, value in bacnet_tagger.raw_metadata_tags(point).items():
+                    tag_payload.setdefault(tag, value)
                 if unit:
                     tag_payload["unit"] = unit
                 mqtt_sink.publish_reading(self.mqtt_client, topic_prefix, f"{point['label']}/tags", json.dumps(tag_payload))
