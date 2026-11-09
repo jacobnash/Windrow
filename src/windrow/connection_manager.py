@@ -440,7 +440,8 @@ class ConnectionManager:
         with tracer.start_as_current_span("connection_manager.tag_points") as span:
             span.set_attribute("point_count", len(points))
             for point in points:
-                tags = bacnet_tagger.tag_point(point, _TAGGER_RULES)
+                tags, evidence = bacnet_tagger.tag_point_with_evidence(point, _TAGGER_RULES)
+                tags = dict(tags)
                 # Commandable object, and not a sensor: BACnet will often
                 # accept a write to a sensor-ish analog-value, but Haystack's
                 # `writable` is for setpoints and commands.
@@ -453,6 +454,8 @@ class ConnectionManager:
                 # or the wrong one (Baler#82).
                 unit = point.get("unit") or bacnet_tagger.haystack_unit(point.get("units"))
                 tag_payload: dict = dict(tags)
+                # which rule tagged it, on which tokens (Windrow#21)
+                tag_payload.update(bacnet_tagger.provenance_tags(evidence))
                 if unit:
                     tag_payload["unit"] = unit
                 mqtt_sink.publish_reading(self.mqtt_client, topic_prefix, f"{point['label']}/tags", json.dumps(tag_payload))

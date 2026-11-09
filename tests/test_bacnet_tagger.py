@@ -3,7 +3,16 @@ bacnet_tagger.py in isolation - no live BACnet device or MQTT needed, just
 token matching over plain dicts shaped like discovery.learn_points' output.
 """
 
+import pytest
+
 from windrow.bacnet_tagger import load_rules, tag_point
+
+
+@pytest.fixture(autouse=True)
+def _local_tagger(monkeypatch):
+    """These pin the local rules' output; openhay-tag (Windrow#21) has its own tests."""
+    monkeypatch.setenv("WINDROW_TAGGER", "local")
+
 
 RULES_PATH = "rules/bacnet_to_haystack_tags.yaml"
 RULES = load_rules(RULES_PATH)

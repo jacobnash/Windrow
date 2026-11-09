@@ -7,7 +7,15 @@ pure-function testing of should_publish).
 
 import json
 
+import pytest
+
 from windrow.connection_manager import ConnectionManager
+
+
+@pytest.fixture(autouse=True)
+def _local_tagger(monkeypatch):
+    """These pin the local rules' output; openhay-tag (Windrow#21) has its own tests."""
+    monkeypatch.setenv("WINDROW_TAGGER", "local")
 
 
 class FakeMqttClient:
@@ -41,7 +49,10 @@ def test_tag_points_publishes_one_tags_message_per_point(tmp_path):
 
     payload = dict(client.published)["fbf/ahu-3/zone-temp/tags"]
     tags = json.loads(json.loads(payload)["value"])
-    assert tags == {"zone": True, "air": True, "temp": True, "sensor": True}
+    # plus where the tags came from (Windrow#21): the rule and the tokens it matched
+    assert tags == {"zone": True, "air": True, "temp": True, "sensor": True,
+                    "windrowTagEngine": "windrow-local", "windrowTagRule": "local:zone+temp",
+                    "windrowTagTokens": ["zone", "temp"]}
 
 
 def test_tag_points_publishes_empty_dict_for_no_match(tmp_path):
