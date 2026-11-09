@@ -99,6 +99,45 @@ isn't a bug either: that object genuinely has no `units` property, and a
 per-property read failure never hides the rest of the point's fields (see
 `discovery.py`'s `ErrorType` handling).
 
+### The evidence beyond the name
+
+Real sites have bad names, so learn also reads, in the same
+ReadPropertyMultiple, the properties that identify a point when its name
+doesn't (Windrow#19). They come back raw; Windrow decides nothing from
+them beyond its own deterministic pre-tag.
+
+| Field | From | For |
+|---|---|---|
+| `object_type` | the identifier | every point |
+| `commandable` | `relinquish-default` answered (the standard requires it exactly when there's a priority array) | outputs and values |
+| `state_text` | `state-text` | multi-state |
+| `active_text`, `inactive_text` | `active-text`, `inactive-text` | binary |
+| `min_pres_value`, `max_pres_value`, `cov_increment` | the same-named properties | analog |
+| `structured_views` | names of the `structured-view` objects whose `subordinate-list` includes the point | any point an integrator grouped |
+| `device` | the device object's `object-name` (`name`), `vendor-name`, `model-name`, `location`, plus `instance` | every point |
+
+A property the object doesn't have is left out rather than `null`.
+Structured views aren't returned as points. The device read is best
+effort: a device that won't answer it still has its points learned.
+
+```json
+{"object_identifier": "analog-value,1", "label": "zone-temp", "present_value": 68.0,
+ "units": "degrees-fahrenheit", "description": "Simulated zone temperature",
+ "object_type": "analog-value", "commandable": true, "cov_increment": 0.1,
+ "device": {"instance": 3456, "name": "mock", "vendor_name": "BACpypes", "model_name": "N/A"}}
+```
+
+Pass the learned point to create-a-connection as it came back: these
+fields are kept on the stored point and published with its tags
+(`{prefix}/{label}/tags`) as `bacnetObjectType`, `bacnetCommandable` (a
+marker, only when true), `bacnetStateText`, `bacnetActiveText`,
+`bacnetInactiveText`, `bacnetMinPresValue`, `bacnetMaxPresValue`,
+`bacnetCovIncrement`, `bacnetStructuredView`, `bacnetDeviceName`,
+`bacnetVendorName`, `bacnetModelName` and `bacnetLocation`, beside the
+pre-tag's markers. `bacnetObjectType` is published for every point, learned
+or not, since the identifier always says it. Baler's classification ladder
+reads them as evidence.
+
 ## 3. Create a connection
 
 Pick whichever learned points you want, optionally renaming `label` (it's
