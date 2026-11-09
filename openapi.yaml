@@ -1203,6 +1203,10 @@ components:
           type: number
           description: Alternative to his_collect_cov - publish at most this often regardless of whether the value changed, independent of poll_interval (matches Haystack's hisCollectInterval).
           example: 300.0
+        sampling:
+          type: string
+          enum: [standard, loop]
+          description: This point's sampling profile, overriding the connection's `sampling` (see there). `loop` for a control-loop point.
         subscribe_cov:
           type: boolean
           description: >-
@@ -1370,6 +1374,22 @@ components:
             lost; if the subscription fails it's polled at its normal
             interval and re-subscribed with back-off, and an object the
             device won't do COV for is just polled.
+        sampling:
+          type: string
+          enum: [standard, loop, auto]
+          default: standard
+          description: >-
+            Default sampling profile for the connection's points
+            (Windrow#27). `loop` is for control-loop points (commands,
+            positions, controlled variables), whose hunting a slow poll
+            can't see: SubscribeCOV where the device supports it (unless the
+            point sets `subscribe_cov: false`), else a poll at most every
+            WINDROW_LOOP_POLL_INTERVAL seconds (15) whatever
+            `poll_interval` says, and a safety-net poll under a live
+            subscription at most every 60 s. `auto` is `loop` for output
+            objects (analog/binary/multi-state-output) and `standard` for
+            the rest; a controlled variable can't be told from its object
+            type, so mark it on the point. A point's own `sampling` wins.
         priority_interval:
           type: number
           minimum: 0
@@ -1804,6 +1824,8 @@ components:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/read_multiple_max"
         subscribe_cov:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/subscribe_cov"
+        sampling:
+          $ref: "#/components/schemas/CreateConnectionRequest/properties/sampling"
         priority_interval:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/priority_interval"
         read_quality:

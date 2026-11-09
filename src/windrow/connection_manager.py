@@ -119,7 +119,7 @@ COMMANDABLE_TYPES = {
 POINT_FIELDS = {
     "object_identifier", "label", "units", "description", "poll_interval",
     "his_collect_cov", "his_collect_cov_rate_limit", "his_collect_interval",
-    "subscribe_cov", "trend_log",
+    "subscribe_cov", "trend_log", "sampling",
     # raw BACnet metadata from /learn (Windrow#19), published with the tags
     "object_type", "commandable", "state_text", "active_text", "inactive_text",
     "min_pres_value", "max_pres_value", "cov_increment", "structured_views", "device",
@@ -146,9 +146,12 @@ POINT_FIELDS = {
 #                      `quality` (Windrow#20) - on by default; batched reads
 #                      and COV notifications only, a single ReadProperty
 #                      reads the value alone
+#   sampling           the default sampling profile for the connection's
+#                      points (Windrow#27): "standard", "loop", or "auto"
+#                      (loop for outputs); a point's own `sampling` wins
 READ_OPTION_FIELDS = {
     "read_multiple", "read_multiple_max", "subscribe_cov", "cov_lifetime", "cov_poll_interval", "backfill_window",
-    "forward_alarms", "priority_interval", "read_quality",
+    "forward_alarms", "priority_interval", "read_quality", "sampling",
 }
 UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "device_address", "device_name"} | READ_OPTION_FIELDS
 DEFAULT_COV_LIFETIME = 300
@@ -157,6 +160,20 @@ DEFAULT_COV_LIFETIME = 300
 DEFAULT_PRIORITY_INTERVAL = float(os.environ.get("WINDROW_PRIORITY_INTERVAL", "60"))
 # Objects per priority-array RPM: a full array of Reals is ~100 bytes.
 PRIORITY_BATCH = 8
+# Sampling profiles (Windrow#27). A control-loop point - a command, a
+# position, a controlled variable - hunting with a 4-minute period is
+# invisible at a 15-minute poll. "loop" subscribes COV where the device
+# supports it and otherwise polls at most every LOOP_POLL_INTERVAL; while
+# the subscription is live the safety-net poll is at most
+# LOOP_COV_POLL_INTERVAL. "auto" (connection level only) means loop for
+# output objects - commands and positions - and standard for the rest; a
+# controlled variable (a discharge temperature) can't be told from its
+# object type, so mark it `sampling: "loop"` (Baler can, via
+# update_connection, from its loop model).
+SAMPLING_PROFILES = ("standard", "loop")
+LOOP_POLL_INTERVAL = float(os.environ.get("WINDROW_LOOP_POLL_INTERVAL", "15"))
+LOOP_COV_POLL_INTERVAL = 60.0
+LOOP_OUTPUT_TYPES = {"analog-output", "binary-output", "multi-state-output"}
 DEFAULT_COV_POLL_INTERVAL = 300.0
 # How often a forward_alarms connection re-checks its recipient entries (a
 # controller restored from a backup loses them) and re-reads active alarms.
@@ -201,7 +218,22 @@ def validate_read_options(options: dict) -> dict:
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or 0 < value < 5:
             raise ValueError(f"priority_interval must be 0 (off) or a number of seconds >= 5, got {value!r}")
         cleaned["priority_interval"] = value
+    if "sampling" in options:
+        if options["sampling"] not in (*SAMPLING_PROFILES, "auto"):
+            raise ValueError(f"sampling must be standard, loop or auto, got {options['sampling']!r}")
+        cleaned["sampling"] = options["sampling"]
     return cleaned
+
+
+def sampling_profile(record: dict, point: dict) -> str:
+    """The point's sampling profile: its own `sampling`, else the
+    connection's ("auto": loop for outputs), else standard."""
+    if point.get("sampling") in SAMPLING_PROFILES:
+        return point["sampling"]
+    default = record.get("sampling", "standard")
+    if default == "auto":
+        return "loop" if _object_type(point.get("object_identifier", "")) in LOOP_OUTPUT_TYPES else "standard"
+    return default if default in SAMPLING_PROFILES else "standard"
 
 
 def validate_points(points) -> list[dict]:
@@ -224,6 +256,8 @@ def validate_points(points) -> list[dict]:
             connection_store.check_text("trend_log", point["trend_log"])
         if "subscribe_cov" in point and not isinstance(point["subscribe_cov"], bool):
             raise ValueError(f"subscribe_cov must be true or false, got {point['subscribe_cov']!r}")
+        if "sampling" in point and point["sampling"] not in SAMPLING_PROFILES:
+            raise ValueError(f"a point's sampling must be standard or loop, got {point['sampling']!r}")
         _check_learned_metadata(point)
         cov = point.get("his_collect_cov")
         if cov is not None and not isinstance(cov, (bool, int, float)):
@@ -904,15 +938,21 @@ class ConnectionManager:
         read before them."""
         address = record["device_address"]
         interval = point.get("poll_interval", record["poll_interval"])
+        loop = sampling_profile(record, point) == "loop"
+        if loop:
+            interval = min(interval, LOOP_POLL_INTERVAL)
         batched = record.get("read_multiple", True)
         with_quality = record.get("read_quality", True)
         cov_poll_interval = record.get("cov_poll_interval", DEFAULT_COV_POLL_INTERVAL)
+        if loop:
+            cov_poll_interval = min(cov_poll_interval, LOOP_COV_POLL_INTERVAL)
         state = state if state is not None else _PointState()
         trended = "trend_log" in point
         last_ok: float | None = self._marks.get(f"{record.get('id')}/{point['label']}") if trended else None
         backfills: set[asyncio.Task] = set()
         cov_task = None
-        if point.get("subscribe_cov", record.get("subscribe_cov", False)):
+        # a point's own subscribe_cov wins; a loop point subscribes otherwise
+        if point.get("subscribe_cov", True if loop else record.get("subscribe_cov", False)):
             cov_task = asyncio.get_running_loop().create_task(self._keep_cov(record, point, state, interval))
 
         async def wait_next(every: float, failures: int) -> None:
