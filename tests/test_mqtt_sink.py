@@ -127,3 +127,98 @@ def test_tls_on_for_8883_or_when_asked(monkeypatch):
     assert use_tls(1883) is True
     monkeypatch.setenv("MQTT_TLS", "0")
     assert use_tls(8883) is False
+
+
+# --- the batched envelope (Baler#234) ----------------------------------------
+
+
+@pytest.fixture
+def batch_mode(monkeypatch):
+    monkeypatch.setattr(mqtt_sink, "ENVELOPE", "batch")
+    monkeypatch.setattr(mqtt_sink, "BATCH_WINDOW_S", 60.0)  # flushed explicitly in these tests
+    monkeypatch.setattr(mqtt_sink, "_batches", mqtt_sink._Batches())
+    yield
+    mqtt_sink._batches.flush()
+
+
+def test_the_per_point_envelope_is_the_default():
+    assert mqtt_sink.ENVELOPE == "point"
+    client = FakeClient()
+    assert mqtt_sink.publish_live(client, "fbf/site-a", "zone-temp", 72.5, ts=100.0) == "fbf/site-a/zone-temp"
+    assert client.published == [("fbf/site-a/zone-temp", {"point": "zone-temp", "value": 72.5, "ts": 100.0}, 1, True)]
+
+
+def test_a_poll_tick_is_one_message_not_retained(batch_mode):
+    client = FakeClient()
+    for label, value in (("zone-temp", 72.5), ("damper-pos", 40), ("fan", "active")):
+        assert mqtt_sink.publish_live(client, "fbf/site-a/ahu-1", label, value, ts=100.0) == "fbf/site-a/ahu-1/batch"
+    mqtt_sink.publish_live(client, "fbf/site-a/ahu-2", "zone-temp", 70.0, ts=100.0)
+    assert client.published == []  # waiting for the window or the tick's end
+    assert mqtt_sink.flush_batches("fbf/site-a/ahu-1") == 1
+    assert client.published == [("fbf/site-a/ahu-1/batch",
+                                 {"ts": 100.0, "points": {"zone-temp": 72.5, "damper-pos": 40, "fan": "active"}}, 1, False)]
+    mqtt_sink.flush_batches()
+    assert client.published[-1] == ("fbf/site-a/ahu-2/batch", {"ts": 100.0, "points": {"zone-temp": 70.0}}, 1, False)
+    assert mqtt_sink.batch_stats()["messages"] == 2 and mqtt_sink.batch_stats()["readings"] == 4
+
+
+def test_differing_timestamps_and_repeats_use_the_list_form(batch_mode):
+    client = FakeClient()
+    mqtt_sink.publish_live(client, "fbf/s", "a", 1, ts=100.0)
+    mqtt_sink.publish_live(client, "fbf/s", "b", 2, ts=100.5)
+    mqtt_sink.publish_live(client, "fbf/s", "a", 3, ts=100.5)  # COV: the same point twice in one window
+    mqtt_sink.flush_batches()
+    assert client.published == [("fbf/s/batch", {"points": [
+        {"point": "a", "value": 1, "ts": 100.0}, {"point": "b", "value": 2, "ts": 100.5},
+        {"point": "a", "value": 3, "ts": 100.5}]}, 1, False)]
+
+
+def test_the_window_publishes_on_its_own(batch_mode, monkeypatch):
+    import time as _time
+
+    monkeypatch.setattr(mqtt_sink, "BATCH_WINDOW_S", 0.05)
+    client = FakeClient()
+    mqtt_sink.publish_live(client, "fbf/s", "a", 1, ts=1.0)
+    deadline = _time.time() + 5
+    while not client.published and _time.time() < deadline:
+        _time.sleep(0.01)
+    assert client.published == [("fbf/s/batch", {"ts": 1.0, "points": {"a": 1}}, 1, False)]
+
+
+def test_a_full_batch_goes_at_once(batch_mode, monkeypatch):
+    monkeypatch.setattr(mqtt_sink, "BATCH_MAX_POINTS", 2)
+    client = FakeClient()
+    mqtt_sink.publish_live(client, "fbf/s", "a", 1, ts=1.0)
+    mqtt_sink.publish_live(client, "fbf/s", "b", 2, ts=1.0)
+    assert len(client.published) == 1 and client.published[0][1]["points"] == {"a": 1, "b": 2}
+
+
+def test_offline_at_publish_time_spools_each_reading_per_point(batch_mode, spool_file):
+    client = FakeClient(connected=False)
+    mqtt_sink.publish_live(client, "fbf/s", "a", 1, ts=1.0)
+    mqtt_sink.publish_live(client, "fbf/s", "b", 2, ts=1.0)
+    mqtt_sink.flush_batches()
+    assert client.published == []
+    assert mqtt_sink._read_spool(spool_file) == [{"topic_prefix": "fbf/s", "point": "a", "value": 1, "ts": 1.0},
+                                                 {"topic_prefix": "fbf/s", "point": "b", "value": 2, "ts": 1.0}]
+
+
+def test_tags_and_history_never_ride_a_batch(batch_mode):
+    client = FakeClient()
+    mqtt_sink.publish_reading(client, "fbf/s", "a/tags", "{}")
+    mqtt_sink.publish_reading(client, "fbf/s", "a", 5, ts=1.0, retain=False)
+    assert [p[0] for p in client.published] == ["fbf/s/a/tags", "fbf/s/a"]
+
+
+def test_a_reading_with_quality_goes_per_point_even_when_batching(batch_mode):
+    """Windrow#20 + Baler#234: the batch format carries no quality, so a
+    flagged reading is published on its own, quality and all."""
+    client = FakeClient()
+    q = {"status_flags": ["fault"], "reliability": "no-sensor"}
+    assert mqtt_sink.publish_live(client, "fbf/site-a/ahu-1", "sat", 55.0, ts=100.0, quality=q) == "fbf/site-a/ahu-1/sat"
+    mqtt_sink.publish_live(client, "fbf/site-a/ahu-1", "fan", "active", ts=100.0)
+    mqtt_sink.flush_batches()
+    assert client.published == [
+        ("fbf/site-a/ahu-1/sat", {"point": "sat", "value": 55.0, "ts": 100.0, "quality": q}, 1, True),
+        ("fbf/site-a/ahu-1/batch", {"ts": 100.0, "points": {"fan": "active"}}, 1, False),
+    ]
