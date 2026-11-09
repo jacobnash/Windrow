@@ -215,6 +215,35 @@ Requests sent so far, by kind, are in the command channel's status heartbeat
 as `bacnet_requests` (`read_property`, `read_property_multiple`,
 `subscribe_cov`, `cov_notifications`, and the live `cov_subscriptions`).
 
+### Sampling profiles: fast data for control loops
+
+Hunting, such as a valve oscillating with a 4-minute period, is invisible at a
+15-minute poll. `"sampling": "loop"` on a point (or on the connection, as
+the default for its points) samples it for loop analysis (Windrow#27):
+
+- SubscribeCOV where the device supports it, so every change over the
+  object's COV increment publishes as it happens. The point's own
+  `"subscribe_cov": false` still opts it out.
+- Where COV isn't available, a poll at most every 15 s
+  (`WINDROW_LOOP_POLL_INTERVAL`), whatever `poll_interval` says.
+- Under a live subscription, the safety-net poll is at most every 60 s
+  instead of `cov_poll_interval`.
+
+`"sampling": "auto"` on a connection is `loop` for output objects (commands
+and positions: analog, binary and multi-state outputs) and `standard` for
+the rest. A controlled variable, such as a discharge temperature, can't be told
+from its object type, so mark it `"sampling": "loop"` on the point; Baler
+can do that with `PATCH /connections/{id}` from its loop model. Standard
+points are sampled exactly as before.
+
+```json
+{"device_address": "10.0.4.20", "device_instance": 4020, "topic_prefix": "fbf/ahu-3",
+ "poll_interval": 900, "sampling": "auto",
+ "points": [{"object_identifier": "analog-output,3", "label": "chw-vlv"},
+            {"object_identifier": "analog-input,1", "label": "dat", "sampling": "loop"},
+            {"object_identifier": "analog-input,7", "label": "oat"}]}
+```
+
 ## 3d. Backfilling gaps from the controller's trend logs
 
 A controller keeps logging while Windrow is down or can't reach it. Give a

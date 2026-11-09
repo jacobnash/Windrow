@@ -112,7 +112,7 @@ COMMANDABLE_TYPES = {
 POINT_FIELDS = {
     "object_identifier", "label", "units", "description", "poll_interval",
     "his_collect_cov", "his_collect_cov_rate_limit", "his_collect_interval",
-    "subscribe_cov", "trend_log",
+    "subscribe_cov", "trend_log", "sampling",
 }
 # How a connection reads its device (Baler#127). All optional; a record
 # without them reads with ReadPropertyMultiple and doesn't subscribe.
@@ -128,12 +128,29 @@ POINT_FIELDS = {
 #   forward_alarms     register as a recipient in the device's notification
 #                      classes and publish its alarms (Baler#164) - off by
 #                      default: it changes the controller's configuration
+#   sampling           the default sampling profile for the connection's
+#                      points (Windrow#27): "standard", "loop", or "auto"
+#                      (loop for outputs); a point's own `sampling` wins
 READ_OPTION_FIELDS = {
     "read_multiple", "read_multiple_max", "subscribe_cov", "cov_lifetime", "cov_poll_interval", "backfill_window",
-    "forward_alarms",
+    "forward_alarms", "sampling",
 }
 UPDATABLE_FIELDS = {"points", "poll_interval", "topic_prefix", "device_address", "device_name"} | READ_OPTION_FIELDS
 DEFAULT_COV_LIFETIME = 300
+# Sampling profiles (Windrow#27). A control-loop point - a command, a
+# position, a controlled variable - hunting with a 4-minute period is
+# invisible at a 15-minute poll. "loop" subscribes COV where the device
+# supports it and otherwise polls at most every LOOP_POLL_INTERVAL; while
+# the subscription is live the safety-net poll is at most
+# LOOP_COV_POLL_INTERVAL. "auto" (connection level only) means loop for
+# output objects - commands and positions - and standard for the rest; a
+# controlled variable (a discharge temperature) can't be told from its
+# object type, so mark it `sampling: "loop"` (Baler can, via
+# update_connection, from its loop model).
+SAMPLING_PROFILES = ("standard", "loop")
+LOOP_POLL_INTERVAL = float(os.environ.get("WINDROW_LOOP_POLL_INTERVAL", "15"))
+LOOP_COV_POLL_INTERVAL = 60.0
+LOOP_OUTPUT_TYPES = {"analog-output", "binary-output", "multi-state-output"}
 DEFAULT_COV_POLL_INTERVAL = 300.0
 # How often a forward_alarms connection re-checks its recipient entries (a
 # controller restored from a backup loses them) and re-reads active alarms.
@@ -173,7 +190,22 @@ def validate_read_options(options: dict) -> dict:
         cleaned["cov_poll_interval"] = connection_store.check_number("cov_poll_interval", options["cov_poll_interval"])
     if "backfill_window" in options:
         cleaned["backfill_window"] = check_backfill_window(options["backfill_window"])
+    if "sampling" in options:
+        if options["sampling"] not in (*SAMPLING_PROFILES, "auto"):
+            raise ValueError(f"sampling must be standard, loop or auto, got {options['sampling']!r}")
+        cleaned["sampling"] = options["sampling"]
     return cleaned
+
+
+def sampling_profile(record: dict, point: dict) -> str:
+    """The point's sampling profile: its own `sampling`, else the
+    connection's ("auto": loop for outputs), else standard."""
+    if point.get("sampling") in SAMPLING_PROFILES:
+        return point["sampling"]
+    default = record.get("sampling", "standard")
+    if default == "auto":
+        return "loop" if _object_type(point.get("object_identifier", "")) in LOOP_OUTPUT_TYPES else "standard"
+    return default if default in SAMPLING_PROFILES else "standard"
 
 
 def validate_points(points) -> list[dict]:
@@ -196,6 +228,8 @@ def validate_points(points) -> list[dict]:
             connection_store.check_text("trend_log", point["trend_log"])
         if "subscribe_cov" in point and not isinstance(point["subscribe_cov"], bool):
             raise ValueError(f"subscribe_cov must be true or false, got {point['subscribe_cov']!r}")
+        if "sampling" in point and point["sampling"] not in SAMPLING_PROFILES:
+            raise ValueError(f"a point's sampling must be standard or loop, got {point['sampling']!r}")
         cov = point.get("his_collect_cov")
         if cov is not None and not isinstance(cov, (bool, int, float)):
             raise ValueError(f"his_collect_cov must be true/false or a number, got {cov!r}")
@@ -789,14 +823,20 @@ class ConnectionManager:
         read before them."""
         address = record["device_address"]
         interval = point.get("poll_interval", record["poll_interval"])
+        loop = sampling_profile(record, point) == "loop"
+        if loop:
+            interval = min(interval, LOOP_POLL_INTERVAL)
         batched = record.get("read_multiple", True)
         cov_poll_interval = record.get("cov_poll_interval", DEFAULT_COV_POLL_INTERVAL)
+        if loop:
+            cov_poll_interval = min(cov_poll_interval, LOOP_COV_POLL_INTERVAL)
         state = _PointState()
         trended = "trend_log" in point
         last_ok: float | None = self._marks.get(f"{record.get('id')}/{point['label']}") if trended else None
         backfills: set[asyncio.Task] = set()
         cov_task = None
-        if point.get("subscribe_cov", record.get("subscribe_cov", False)):
+        # a point's own subscribe_cov wins; a loop point subscribes otherwise
+        if point.get("subscribe_cov", True if loop else record.get("subscribe_cov", False)):
             cov_task = asyncio.get_running_loop().create_task(self._keep_cov(record, point, state, interval))
 
         async def wait_next(every: float, failures: int) -> None:
