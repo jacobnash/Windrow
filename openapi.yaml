@@ -1370,6 +1370,21 @@ components:
             lost; if the subscription fails it's polled at its normal
             interval and re-subscribed with back-off, and an object the
             device won't do COV for is just polled.
+        read_quality:
+          type: boolean
+          default: true
+          description: >-
+            Read each point's `status-flags` and `reliability` in the same
+            ReadPropertyMultiple as its present-value (and take the
+            status-flags a COV notification carries), and publish them as
+            the reading's `quality` (Windrow#20): `{"status_flags":
+            ["fault", ...], "reliability": "no-sensor"}`, BACnet's own
+            names, either key left out when there's nothing to say, and no
+            `quality` at all while every flag is clear and reliability is
+            no-fault-detected. A change of quality publishes even when the
+            value didn't change. A point read with single ReadProperty (a
+            device without RPM, or `read_multiple: false`) publishes no
+            quality. `false` asks for and publishes neither.
         cov_lifetime:
           type: integer
           minimum: 10
@@ -1775,6 +1790,8 @@ components:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/read_multiple_max"
         subscribe_cov:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/subscribe_cov"
+        read_quality:
+          $ref: "#/components/schemas/CreateConnectionRequest/properties/read_quality"
         cov_lifetime:
           $ref: "#/components/schemas/CreateConnectionRequest/properties/cov_lifetime"
         cov_poll_interval:

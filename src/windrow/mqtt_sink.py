@@ -30,6 +30,20 @@ SPOOL_OUTAGE_HOURS = float(legacy.env("WINDROW_SPOOL_OUTAGE_HOURS") or 24)
 MAX_SPOOL_ROWS = int(legacy.env("WINDROW_SPOOL_MAX_ROWS") or 5_000_000)
 MIN_SPOOL_ROWS = 10_000
 
+# The batched envelope (Baler#234), off by default. With
+# WINDROW_MQTT_ENVELOPE=batch, live readings (publish_live: polls and COV,
+# not tags, alarms, write read-backs or backfill) are gathered per topic prefix - one device or connection - for
+# up to WINDROW_MQTT_BATCH_MS and published as one message on
+# f"{prefix}/batch": a poll tick of a 50-point device is one MQTT message,
+# not 50. The broker, and Baler's listener, pay per message. Only for a
+# Baler that accepts it (mqtt_listener, Baler#234); Haxall's MQTT bridge
+# and other per-point consumers read the per-point topics, so keep "point"
+# for them.
+ENVELOPE = (legacy.env("WINDROW_MQTT_ENVELOPE") or "point").strip().lower()
+BATCH_WINDOW_S = float(legacy.env("WINDROW_MQTT_BATCH_MS") or 250) / 1000
+BATCH_MAX_POINTS = int(legacy.env("WINDROW_MQTT_BATCH_MAX_POINTS") or 1000)
+BATCH_TOPIC = "batch"
+
 _spool_lock = threading.Lock()
 _reading_rate = None  # () -> readings per second, from the connection managers
 _spool_rows: dict[str, int] = {}  # path -> rows in it, so an append doesn't re-read the file
@@ -147,7 +161,7 @@ def _flush_spool(client: mqtt.Client) -> None:
                 print(f"reconnect lost mid-flush, {len(records) - i} record(s) remain spooled")
                 return
             _publish(client, record["topic_prefix"], record["point"], record["value"], record["ts"],
-                     retain=record.get("retain", True))
+                     retain=record.get("retain", True), quality=record.get("quality"))
         os.remove(path)
         _spool_rows[path] = 0
         print(f"flushed {len(records)} spooled reading(s)")
@@ -215,19 +229,134 @@ def connect(
     return client
 
 
-def _publish(client: mqtt.Client, topic_prefix: str, point: str, value, ts: float, retain: bool = True) -> str:
-    payload = json.dumps({"point": point, "value": value, "ts": ts})
+def _publish(client: mqtt.Client, topic_prefix: str, point: str, value, ts: float, retain: bool = True,
+             quality: dict | None = None) -> str:
+    envelope = {"point": point, "value": value, "ts": ts}
+    if quality:
+        envelope["quality"] = quality
+    payload = json.dumps(envelope)
     topic = f"{topic_prefix}/{point}"
     client.publish(topic, payload, qos=1, retain=retain)
     return topic
 
 
+def batch_payload(readings: list[tuple[str, object, float]]) -> dict:
+    """The batched envelope for one prefix's readings (label, value, ts):
+    {"ts": t, "points": {label: value}} when they share a timestamp (a poll
+    tick), else {"points": [{"point", "value", "ts"}, ...]}. A label read
+    twice in one window keeps every reading in the list form, so nothing
+    is lost (Baler stores each, keyed on (point, ts))."""
+    labels = [r[0] for r in readings]
+    if len({r[2] for r in readings}) == 1 and len(set(labels)) == len(labels):
+        return {"ts": readings[0][2], "points": {label: value for label, value, _ in readings}}
+    return {"points": [{"point": label, "value": value, "ts": ts} for label, value, ts in readings]}
+
+
+class _Batches:
+    """Live readings waiting for their prefix's batch: published when the
+    window closes (a timer per prefix, started by its first reading), when
+    BATCH_MAX_POINTS are waiting, or on flush(prefix) at the end of a poll
+    tick. QoS 1 and NOT retained: a retained batch would hand every new
+    subscriber one stale snapshot of a device. If the client is offline at
+    publish time, each reading goes to the spool on its own, as if it had
+    been published per point (Baler accepts both)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: dict[str, list[tuple[str, object, float]]] = {}
+        self._timers: dict[str, threading.Timer] = {}
+        self._client: dict[str, mqtt.Client] = {}
+        self.messages = 0
+        self.readings = 0
+
+    def add(self, client: mqtt.Client, topic_prefix: str, point: str, value, ts: float) -> None:
+        with self._lock:
+            items = self._pending.setdefault(topic_prefix, [])
+            items.append((point, value, ts))
+            self._client[topic_prefix] = client
+            full = len(items) >= BATCH_MAX_POINTS
+            if not full and topic_prefix not in self._timers:
+                t = threading.Timer(BATCH_WINDOW_S, self.flush, args=(topic_prefix,))
+                t.daemon = True
+                self._timers[topic_prefix] = t
+                t.start()
+        if full:
+            self.flush(topic_prefix)
+
+    def flush(self, topic_prefix: str | None = None) -> int:
+        """Publish what's waiting for one prefix (or every prefix): the
+        number of messages sent."""
+        with self._lock:
+            prefixes = [topic_prefix] if topic_prefix is not None else list(self._pending)
+            work = []
+            for p in prefixes:
+                timer = self._timers.pop(p, None)
+                if timer is not None:
+                    timer.cancel()
+                items = self._pending.pop(p, None)
+                if items:
+                    work.append((p, items, self._client.get(p)))
+        sent = 0
+        for p, items, client in work:
+            if client is not None and client.is_connected():
+                client.publish(f"{p}/{BATCH_TOPIC}", json.dumps(batch_payload(items)), qos=1, retain=False)
+                self.messages += 1
+                self.readings += len(items)
+                sent += 1
+            else:
+                for label, value, ts in items:
+                    _spool_append({"topic_prefix": p, "point": label, "value": value, "ts": ts})
+        return sent
+
+
+_batches = _Batches()
+
+
+def flush_batches(topic_prefix: str | None = None) -> int:
+    """End of a poll tick: send the prefix's batch now instead of at the
+    window's end. A no-op with the per-point envelope."""
+    return _batches.flush(topic_prefix)
+
+
+def batch_stats() -> dict:
+    return {"envelope": ENVELOPE, "window_ms": round(BATCH_WINDOW_S * 1000), "messages": _batches.messages,
+            "readings": _batches.readings}
+
+
+def publish_live(client: mqtt.Client, topic_prefix: str, point: str, value, ts: float | None = None,
+                 quality: dict | None = None) -> str:
+    """A live reading - a poll or a COV notification. With the per-point
+    envelope (the default) this is publish_reading; with
+    WINDROW_MQTT_ENVELOPE=batch it rides its prefix's next batch message
+    (see _Batches) and the returned topic is the batch topic. Tags, alarms,
+    write read-backs and backfill keep calling publish_reading.
+
+    A reading with `quality` (Windrow#20) always goes per point, batched
+    envelope or not: the batch format carries no quality, and Baler accepts
+    both envelopes on the same prefix."""
+    if ENVELOPE == "batch" and not quality:
+        _batches.add(client, topic_prefix, point, value, ts if ts is not None else time.time())
+        return f"{topic_prefix}/{BATCH_TOPIC}"
+    extra: dict = {"quality": quality} if quality else {}
+    if ts is not None:
+        extra["ts"] = ts
+    return publish_reading(client, topic_prefix, point, value, **extra)
+
+
 def publish_reading(
-    client: mqtt.Client, topic_prefix: str, point: str, value, ts: float | None = None, retain: bool = True
+    client: mqtt.Client, topic_prefix: str, point: str, value, ts: float | None = None, retain: bool = True,
+    quality: dict | None = None,
 ) -> str:
     """Publishes {"point", "value", "ts"} to f"{topic_prefix}/{point}",
     retained. This exact shape is the frozen wire contract every consumer
     (Haxall's task engine, Baler's mqtt_listener) parses by name.
+
+    `quality` (Windrow#20) adds an optional fourth key, only when the
+    device reports something: {"status_flags": ["fault", ...],
+    "reliability": "no-sensor"} (either key may be absent), BACnet's own
+    words. Consumers that parse by name ignore it; Baler's quality.
+    from_envelope stores it as the sample's flag. No `quality` means
+    nothing reported, i.e. ok.
 
     If the client isn't currently connected, the reading is spooled to
     disk instead of dropped, and replayed automatically once the
@@ -240,9 +369,11 @@ def publish_reading(
         record = {"topic_prefix": topic_prefix, "point": point, "value": value, "ts": ts}
         if not retain:
             record["retain"] = False
+        if quality:
+            record["quality"] = quality
         _spool_append(record)
         return f"{topic_prefix}/{point}"
-    return _publish(client, topic_prefix, point, value, ts, retain=retain)
+    return _publish(client, topic_prefix, point, value, ts, retain=retain, quality=quality)
 
 
 def clear_retained(client: mqtt.Client, topic_prefix: str, point: str) -> str:

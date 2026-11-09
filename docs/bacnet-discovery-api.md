@@ -254,6 +254,30 @@ Requests sent so far, by kind, are in the command channel's status heartbeat
 as `bacnet_requests` (`read_property`, `read_property_multiple`,
 `subscribe_cov`, `cov_notifications`, and the live `cov_subscriptions`).
 
+### Reading quality: status-flags and reliability
+
+BACnet says when a value is bad. Each batched read also asks the object's
+`status-flags` and `reliability`, in the same ReadPropertyMultiple, and a
+COV notification carries the status-flags with the value. When anything is
+set, the reading's envelope gets a `quality` key (Windrow#20):
+
+```json
+{"point": "dat", "value": -40.0, "ts": 1762700000.0,
+ "quality": {"status_flags": ["fault"], "reliability": "no-sensor"}}
+```
+
+BACnet's own names, not a verdict: `in-alarm` alone is reported but Baler
+doesn't treat it as bad data. A healthy point's envelope has no `quality`
+and is exactly what it was before; an older listener just ignores the key.
+A change of quality publishes even when the value didn't move (a sensor
+failing at its last value), whatever `his_collect_cov` says.
+
+The extra properties take room in the answer, so a status-reading batch to
+a small-APDU device holds fewer objects (~13 for 480 bytes instead of ~23).
+Points read with single ReadProperty - `"read_multiple": false`, or a
+device without RPM - publish no quality: tripling their requests isn't
+worth it. `"read_quality": false` on a connection turns it off.
+
 ## 3d. Backfilling gaps from the controller's trend logs
 
 A controller keeps logging while Windrow is down or can't reach it. Give a
