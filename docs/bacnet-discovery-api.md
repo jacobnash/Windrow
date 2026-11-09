@@ -278,6 +278,33 @@ Points read with single ReadProperty - `"read_multiple": false`, or a
 device without RPM - publish no quality: tripling their requests isn't
 worth it. `"read_quality": false` on a connection turns it off.
 
+### Priority arrays: who is holding a point
+
+Every `priority_interval` seconds (default 60, `WINDROW_PRIORITY_INTERVAL`;
+`0` turns it off) Windrow reads the `priority-array` of each commandable
+point (outputs and values), one ReadPropertyMultiple per 8 points, and the
+point's readings carry it (Windrow#25):
+
+```json
+{"point": "zone-temp-sp", "value": 75.0, "ts": 1762700000.0,
+ "priority": {"active": 8, "levels": {"8": 75.0, "16": 72.0}}}
+```
+
+`levels` holds only the levels someone holds; `active` is the lowest of
+them, the one in control (`null` when every level is empty and
+relinquish-default is). Windrow doesn't know who wrote a level. Baler does
+for its own writes (`point_write_levels`), so anything else it sees held is
+someone else's: a human override at the panel or another BMS. That's what
+Baler's passive override tests (Baler#212) start from.
+
+A change in the array publishes straight away, even when the value didn't
+move and `his_collect_cov` would hold it back. A Windrow write
+(`write_point`) re-reads the array at once. A device without RPM is asked
+point by point; an object that answers it has no priority-array isn't
+asked again. Points that aren't commandable, and connections with
+`priority_interval: 0`, publish exactly the envelope they did before. Reads
+only: nothing is written to the device.
+
 ## 3d. Backfilling gaps from the controller's trend logs
 
 A controller keeps logging while Windrow is down or can't reach it. Give a
